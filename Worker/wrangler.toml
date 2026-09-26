@@ -1,0 +1,17 @@
+name = "keepsake-worker"
+main = "worker.js"
+compatibility_date = "2026-09-01"
+
+# Created with: wrangler kv namespace create NOTES_KV
+# Paste the id it prints below.
+kv_namespaces = [
+  { binding = "NOTES_KV", id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID" }
+]
+
+# Created with: wrangler r2 bucket create keepsake-notes
+[[r2_buckets]]
+binding = "NOTES_BUCKET"
+bucket_name = "keepsake-notes"
+
+# Set with: wrangler secret put API_TOKEN
+# (not defined here — secrets never go in this file)
