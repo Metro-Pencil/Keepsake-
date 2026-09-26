@@ -1,0 +1,699 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Keepsake</title>
+<meta name="theme-color" content="#21423A">
+<meta name="description" content="A private notebook with per-note quick locks and time locks.">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --pine: #21423A;
+    --pine-light: #2F5D50;
+    --paper: #EDEAE2;
+    --card: #FBF9F4;
+    --card-2: #F3EFE6;
+    --ink: #23241F;
+    --ink-soft: #6B6A60;
+    --ink-faint: #97958A;
+    --amber: #A9762F;
+    --amber-bg: #F6ECDA;
+    --violet: #5B4B8A;
+    --violet-bg: #ECE8F5;
+    --brick: #A23B3B;
+    --line: #DEDACD;
+    --shadow: 0 1px 2px rgba(35,36,31,0.06), 0 4px 14px rgba(35,36,31,0.06);
+    --font-display: 'Source Serif 4', Georgia, serif;
+    --font-body: 'Inter', system-ui, -apple-system, sans-serif;
+    --radius: 14px;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--font-body);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  body { padding-bottom: 64px; }
+
+  a, button, input, textarea { font-family: inherit; }
+
+  button {
+    cursor: pointer;
+    border: none;
+    background: none;
+    color: inherit;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--pine-light);
+    outline-offset: 2px;
+  }
+
+  .visually-hidden {
+    position: absolute;
+    width: 1px; height: 1px;
+    overflow: hidden;
+    clip: rect(0,0,0,0);
+  }
+
+  /* ---------- Header ---------- */
+
+  header.top {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    background: var(--paper);
+    border-bottom: 1px solid var(--line);
+  }
+
+  .top-inner {
+    max-width: 980px;
+    margin: 0 auto;
+    padding: 14px 20px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .brand {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin-right: auto;
+  }
+
+  .brand-mark {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 22px;
+    color: var(--pine);
+    letter-spacing: 0.2px;
+  }
+
+  .version-badge {
+    font-family: var(--font-body);
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--pine);
+    background: var(--card-2);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 2px 9px;
+    line-height: 1.6;
+  }
+
+  .tabbar {
+    display: flex;
+    background: var(--card-2);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 3px;
+    gap: 2px;
+  }
+
+  .tabbar button {
+    padding: 7px 14px;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--ink-soft);
+  }
+
+  .tabbar button[aria-selected="true"] {
+    background: var(--card);
+    color: var(--ink);
+    box-shadow: var(--shadow);
+  }
+
+  .icon-btn {
+    width: 38px;
+    height: 38px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 10px;
+    color: var(--ink-soft);
+  }
+
+  .icon-btn:hover { background: var(--card-2); color: var(--ink); }
+
+  .icon-btn svg { width: 19px; height: 19px; }
+
+  /* ---------- Composer ---------- */
+
+  main {
+    max-width: 980px;
+    margin: 0 auto;
+    padding: 24px 20px 60px;
+  }
+
+  .composer {
+    max-width: 620px;
+    margin: 0 auto 32px;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 14px 18px;
+    color: var(--ink-faint);
+    font-size: 15px;
+  }
+
+  .composer:hover { border-color: #cfc9b6; }
+
+  /* ---------- Grid ---------- */
+
+  .grid {
+    column-width: 260px;
+    column-gap: 16px;
+  }
+
+  .grid.hidden { display: none; }
+
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-left: 4px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 16px 16px 12px;
+    margin-bottom: 16px;
+    break-inside: avoid;
+    display: block;
+    width: 100%;
+    text-align: left;
+  }
+
+  .card.type-quick { border-left-color: var(--violet); }
+  .card.type-time { border-left-color: var(--amber); }
+
+  .card-title {
+    font-family: var(--font-display);
+    font-size: 17px;
+    font-weight: 600;
+    margin: 0 0 6px;
+    color: var(--ink);
+  }
+
+  .card-snippet {
+    font-size: 14px;
+    color: var(--ink-soft);
+    line-height: 1.5;
+    margin: 0 0 10px;
+    display: -webkit-box;
+    -webkit-line-clamp: 6;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  .card-thumbs {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 10px;
+    flex-wrap: wrap;
+  }
+
+  .card-thumbs img {
+    width: 52px; height: 52px;
+    object-fit: cover;
+    border-radius: 8px;
+    border: 1px solid var(--line);
+  }
+
+  .lock-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 3px 9px;
+    border-radius: 999px;
+    margin-bottom: 10px;
+  }
+
+  .lock-pill.quick { background: var(--violet-bg); color: var(--violet); }
+  .lock-pill.time { background: var(--amber-bg); color: var(--amber); }
+  .lock-pill svg { width: 11px; height: 11px; }
+
+  .card-meta {
+    font-size: 12px;
+    color: var(--ink-faint);
+    margin-bottom: 10px;
+  }
+
+  .card-actions {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    border-top: 1px solid var(--line);
+    padding-top: 8px;
+    margin-top: 4px;
+  }
+
+  .card-actions .icon-btn { width: 32px; height: 32px; }
+  .card-actions .icon-btn svg { width: 16px; height: 16px; }
+  .card-actions .spacer { margin-left: auto; }
+
+  .empty-state {
+    text-align: center;
+    padding: 60px 20px;
+    color: var(--ink-faint);
+  }
+
+  .empty-state h2 {
+    font-family: var(--font-display);
+    font-weight: 600;
+    color: var(--ink-soft);
+    font-size: 19px;
+    margin-bottom: 6px;
+  }
+
+  /* ---------- Modals ---------- */
+
+  .overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(35,36,31,0.42);
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 6vh 16px;
+    z-index: 100;
+    overflow-y: auto;
+  }
+
+  .overlay.hidden { display: none; }
+
+  .modal {
+    background: var(--card);
+    border-radius: 18px;
+    width: 100%;
+    max-width: 560px;
+    box-shadow: 0 20px 60px rgba(35,36,31,0.25);
+    max-height: 88vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .modal.narrow { max-width: 420px; }
+
+  .modal-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 18px 20px 4px;
+  }
+
+  .modal-head h2 {
+    font-family: var(--font-display);
+    font-size: 19px;
+    font-weight: 600;
+    margin: 0;
+    flex: 1;
+  }
+
+  .modal-body {
+    padding: 12px 20px 20px;
+    overflow-y: auto;
+  }
+
+  .field { margin-bottom: 14px; }
+
+  .field label {
+    display: block;
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--ink-soft);
+    margin-bottom: 6px;
+  }
+
+  .field input[type="text"],
+  .field input[type="password"],
+  .field input[type="datetime-local"],
+  .field input[type="url"],
+  .field textarea {
+    width: 100%;
+    border: 1px solid var(--line);
+    background: var(--card-2);
+    border-radius: 10px;
+    padding: 10px 12px;
+    font-size: 15px;
+    color: var(--ink);
+  }
+
+  .field textarea {
+    min-height: 220px;
+    resize: vertical;
+    line-height: 1.6;
+    font-family: var(--font-display);
+  }
+
+  .field .hint {
+    font-size: 12.5px;
+    color: var(--ink-faint);
+    margin-top: 5px;
+    line-height: 1.5;
+  }
+
+  .field .error {
+    font-size: 12.5px;
+    color: var(--brick);
+    margin-top: 5px;
+  }
+
+  .title-input {
+    width: 100%;
+    border: none;
+    background: none;
+    font-family: var(--font-display);
+    font-size: 20px;
+    font-weight: 600;
+    color: var(--ink);
+    margin-bottom: 8px;
+    padding: 0;
+  }
+
+  .thumb-row {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin: 10px 0;
+  }
+
+  .thumb-row .thumb {
+    position: relative;
+    width: 64px; height: 64px;
+  }
+
+  .thumb-row img {
+    width: 100%; height: 100%;
+    object-fit: cover;
+    border-radius: 8px;
+    border: 1px solid var(--line);
+  }
+
+  .thumb-remove {
+    position: absolute;
+    top: -6px; right: -6px;
+    width: 20px; height: 20px;
+    background: var(--brick);
+    color: white;
+    border-radius: 50%;
+    font-size: 13px;
+    line-height: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .btn-row {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+  }
+
+  .btn {
+    padding: 10px 16px;
+    border-radius: 10px;
+    font-size: 14px;
+    font-weight: 600;
+  }
+
+  .btn-primary { background: var(--pine); color: var(--card); }
+  .btn-primary:hover { background: var(--pine-light); }
+  .btn-primary:disabled { opacity: 0.55; cursor: default; }
+
+  .btn-ghost { background: var(--card-2); color: var(--ink); }
+  .btn-ghost:hover { background: var(--line); }
+
+  .btn-danger { background: none; color: var(--brick); }
+  .btn-danger:hover { background: #F5E7E7; }
+
+  .btn-text { color: var(--ink-soft); font-size: 13.5px; font-weight: 500; padding: 6px 4px; }
+  .btn-text:hover { color: var(--ink); }
+
+  .lock-choice-row {
+    display: flex;
+    gap: 10px;
+    margin: 4px 0 16px;
+  }
+
+  .lock-choice {
+    flex: 1;
+    border: 1.5px solid var(--line);
+    border-radius: 12px;
+    padding: 14px;
+    text-align: left;
+  }
+
+  .lock-choice:hover { border-color: var(--pine-light); }
+  .lock-choice.selected { border-color: var(--pine); background: var(--card-2); }
+
+  .lock-choice-title {
+    font-weight: 600;
+    font-size: 14px;
+    margin-bottom: 3px;
+  }
+
+  .lock-choice-desc {
+    font-size: 12.5px;
+    color: var(--ink-soft);
+    line-height: 1.4;
+  }
+
+  .countdown-box {
+    background: var(--amber-bg);
+    color: var(--amber);
+    border-radius: 12px;
+    padding: 14px;
+    font-size: 14px;
+    margin-bottom: 14px;
+    line-height: 1.5;
+  }
+
+  .countdown-box strong { display: block; font-size: 16px; margin-bottom: 2px; }
+
+  .divider-link {
+    font-size: 13px;
+    color: var(--pine);
+    font-weight: 600;
+    margin: 4px 0 14px;
+    display: inline-block;
+  }
+
+  .toast {
+    position: fixed;
+    bottom: 22px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--ink);
+    color: var(--card);
+    padding: 10px 18px;
+    border-radius: 999px;
+    font-size: 13.5px;
+    box-shadow: var(--shadow);
+    z-index: 200;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s ease, transform 0.2s ease;
+  }
+
+  .toast.show {
+    opacity: 1;
+    transform: translateX(-50%) translateY(-4px);
+  }
+
+  @media (max-width: 560px) {
+    .top-inner { flex-wrap: wrap; }
+    .grid { column-width: 100%; }
+    .modal { border-radius: 16px 16px 0 0; margin-top: auto; }
+    .overlay { align-items: flex-end; padding: 0; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; animation: none !important; }
+  }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="top-inner">
+    <div class="brand">
+      <span class="brand-mark">Keepsake</span>
+      <span class="version-badge" id="version-badge">v1.0.0</span>
+    </div>
+    <div class="tabbar" role="tablist" aria-label="Note views">
+      <button role="tab" id="tab-notes" aria-selected="true">Notes</button>
+      <button role="tab" id="tab-locked" aria-selected="false">Locked</button>
+    </div>
+    <button class="icon-btn" id="btn-settings" title="Settings" aria-label="Settings">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V21a2 2 0 1 1-4 0v-.2a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.6-1H3a2 2 0 1 1 0-4h.2a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.6V3a2 2 0 1 1 4 0v.2a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.6 1H21a2 2 0 1 1 0 4h-.2a1.7 1.7 0 0 0-1.5 1z"/></svg>
+    </button>
+  </div>
+</header>
+
+<main>
+  <button class="composer" id="btn-new-note">Write something…</button>
+
+  <section class="grid" id="grid-notes" aria-label="Notes"></section>
+  <section class="grid hidden" id="grid-locked" aria-label="Locked notes"></section>
+</main>
+
+<!-- Editor modal -->
+<div class="overlay hidden" id="overlay-editor">
+  <div class="modal">
+    <div class="modal-head">
+      <h2 id="editor-heading">New note</h2>
+      <button class="icon-btn" data-close="overlay-editor" aria-label="Close">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <input type="text" class="title-input" id="editor-title" placeholder="Title">
+      <textarea id="editor-body" placeholder="What's on your mind…"></textarea>
+      <div class="thumb-row" id="editor-thumbs"></div>
+      <div class="btn-row" style="margin: 4px 0 16px;">
+        <button class="btn btn-ghost" id="btn-attach-image">Add photo</button>
+        <input type="file" id="input-image" accept="image/*" multiple class="visually-hidden">
+        <span class="btn-text" id="btn-open-lock-chooser" style="margin-left: auto;">Lock this note…</span>
+        <span class="btn-text" id="btn-remove-lock" style="display:none; color: var(--brick);">Remove lock</span>
+      </div>
+      <div id="editor-lock-summary"></div>
+      <div class="btn-row">
+        <button class="btn btn-primary" id="btn-save-note">Save</button>
+        <button class="btn btn-ghost" data-close="overlay-editor">Cancel</button>
+        <button class="btn btn-danger" id="btn-delete-note" style="margin-left: auto; display: none;">Delete</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Lock chooser modal -->
+<div class="overlay hidden" id="overlay-lock-chooser">
+  <div class="modal narrow">
+    <div class="modal-head">
+      <h2>Lock this note</h2>
+      <button class="icon-btn" data-close="overlay-lock-chooser" aria-label="Close">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div class="lock-choice-row">
+        <button class="lock-choice" id="choice-quick">
+          <div class="lock-choice-title">Quick lock</div>
+          <div class="lock-choice-desc">One password. Opens any time you enter it.</div>
+        </button>
+        <button class="lock-choice" id="choice-time">
+          <div class="lock-choice-title">Time lock</div>
+          <div class="lock-choice-desc">Stays sealed until a date you set.</div>
+        </button>
+      </div>
+
+      <div id="quick-lock-fields" style="display:none;">
+        <div class="field">
+          <label for="quick-password">Password for this note</label>
+          <input type="password" id="quick-password" autocomplete="new-password">
+        </div>
+        <div class="field">
+          <label for="quick-password-confirm">Confirm password</label>
+          <input type="password" id="quick-password-confirm" autocomplete="new-password">
+        </div>
+        <p class="field error visually-hidden" id="quick-lock-error"></p>
+        <button class="btn btn-primary" id="btn-confirm-quick-lock">Set quick lock</button>
+      </div>
+
+      <div id="time-lock-fields" style="display:none;">
+        <div class="field">
+          <label for="time-password">Your password</label>
+          <input type="password" id="time-password" autocomplete="new-password">
+        </div>
+        <div class="field">
+          <label for="time-password-confirm">Confirm password</label>
+          <input type="password" id="time-password-confirm" autocomplete="new-password">
+        </div>
+        <div class="field">
+          <label for="time-unlock-at">Unlock at</label>
+          <input type="datetime-local" id="time-unlock-at">
+          <p class="hint">A second, one-time password will also be generated and stored only inside this note's downloaded file — not shown here. After the date above, this note opens with just your password. Before then, downloading the note and looking up that second password lets you open it early.</p>
+        </div>
+        <p class="field error visually-hidden" id="time-lock-error"></p>
+        <button class="btn btn-primary" id="btn-confirm-time-lock">Set time lock</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Unlock modal -->
+<div class="overlay hidden" id="overlay-unlock">
+  <div class="modal narrow">
+    <div class="modal-head">
+      <h2 id="unlock-heading">Locked note</h2>
+      <button class="icon-btn" data-close="overlay-unlock" aria-label="Close">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="modal-body" id="unlock-body">
+      <!-- populated dynamically -->
+    </div>
+  </div>
+</div>
+
+<!-- Confirm modal -->
+<div class="overlay hidden" id="overlay-confirm">
+  <div class="modal narrow">
+    <div class="modal-head"><h2 id="confirm-title">Are you sure?</h2></div>
+    <div class="modal-body">
+      <p id="confirm-message" style="color: var(--ink-soft); font-size: 14.5px; line-height: 1.5;"></p>
+      <div class="btn-row" style="margin-top: 16px;">
+        <button class="btn btn-danger" id="btn-confirm-yes">Delete</button>
+        <button class="btn btn-ghost" data-close="overlay-confirm">Cancel</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Settings modal -->
+<div class="overlay hidden" id="overlay-settings">
+  <div class="modal narrow">
+    <div class="modal-head">
+      <h2>Settings</h2>
+      <button class="icon-btn" data-close="overlay-settings" aria-label="Close">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div class="field">
+        <label for="settings-api-base">Worker URL</label>
+        <input type="url" id="settings-api-base" placeholder="https://your-worker.workers.dev">
+      </div>
+      <div class="field">
+        <label for="settings-token">Access token</label>
+        <input type="password" id="settings-token" autocomplete="off">
+        <p class="hint">Matches the API_TOKEN secret set on your Worker. Stored only in this browser.</p>
+      </div>
+      <button class="btn btn-primary" id="btn-save-settings">Save</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+window.KEEPSAKE_VERSION = "1.0.0";
+</script>
+<script src="app.js"></script>
+</body>
+</html>
