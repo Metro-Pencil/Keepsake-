@@ -6,6 +6,13 @@ All notable changes to this project are recorded here, following
 small — gets a version bump. If the version number hasn't moved,
 nothing changed; that's the whole point of keeping one.
 
+## v1.0.2 — 2026-09-27
+
+- Replaced the cramped bottom-sheet note editor with a full-screen writing
+  view — title, a body that expands to fill the available height, and a
+  bottom toolbar for photo/lock/delete, closer to how Google Keep opens a
+  note rather than a small popup.
+
 ## v1.0.1 — 2026-09-27
 
 - Flattened the repo layout — no `icons/` or `worker/` subfolders anymore.

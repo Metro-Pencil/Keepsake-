@@ -373,6 +373,79 @@
     margin-top: 5px;
   }
 
+  /* ---------- Full-screen note editor ---------- */
+
+  .editor-screen {
+    position: fixed;
+    inset: 0;
+    background: var(--card);
+    z-index: 100;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .editor-screen.hidden { display: none; }
+
+  .editor-topbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 14px;
+    padding-top: max(12px, env(safe-area-inset-top));
+    border-bottom: 1px solid var(--line);
+    flex-shrink: 0;
+  }
+
+  .editor-topbar-title {
+    flex: 1;
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 17px;
+    color: var(--ink);
+  }
+
+  .editor-scroll {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 20px 22px 12px;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .editor-textarea {
+    flex: 1;
+    min-height: 40vh;
+    width: 100%;
+    border: none;
+    background: none;
+    resize: none;
+    font-family: var(--font-display);
+    font-size: 16.5px;
+    line-height: 1.65;
+    color: var(--ink);
+    padding: 0;
+  }
+
+  .editor-textarea:focus { outline: none; }
+
+  .editor-lock-status {
+    padding: 0 22px;
+    flex-shrink: 0;
+  }
+
+  .editor-lock-status:empty { display: none; }
+
+  .editor-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding: 8px 12px;
+    padding-bottom: max(8px, env(safe-area-inset-bottom));
+    border-top: 1px solid var(--line);
+    flex-shrink: 0;
+  }
+
   .title-input {
     width: 100%;
     border: none;
@@ -552,33 +625,40 @@
   <section class="grid hidden" id="grid-locked" aria-label="Locked notes"></section>
 </main>
 
-<!-- Editor modal -->
-<div class="overlay hidden" id="overlay-editor">
-  <div class="modal">
-    <div class="modal-head">
-      <h2 id="editor-heading">New note</h2>
-      <button class="icon-btn" data-close="overlay-editor" aria-label="Close">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M18 6 6 18M6 6l12 12"/></svg>
-      </button>
-    </div>
-    <div class="modal-body">
-      <input type="text" class="title-input" id="editor-title" placeholder="Title">
-      <textarea id="editor-body" placeholder="What's on your mind…"></textarea>
-      <div class="thumb-row" id="editor-thumbs"></div>
-      <div class="btn-row" style="margin: 4px 0 16px;">
-        <button class="btn btn-ghost" id="btn-attach-image">Add photo</button>
-        <input type="file" id="input-image" accept="image/*" multiple class="visually-hidden">
-        <span class="btn-text" id="btn-open-lock-chooser" style="margin-left: auto;">Lock this note…</span>
-        <span class="btn-text" id="btn-remove-lock" style="display:none; color: var(--brick);">Remove lock</span>
-      </div>
-      <div id="editor-lock-summary"></div>
-      <div class="btn-row">
-        <button class="btn btn-primary" id="btn-save-note">Save</button>
-        <button class="btn btn-ghost" data-close="overlay-editor">Cancel</button>
-        <button class="btn btn-danger" id="btn-delete-note" style="margin-left: auto; display: none;">Delete</button>
-      </div>
-    </div>
+<!-- Editor: full-screen, not a cramped popup -->
+<div class="editor-screen hidden" id="overlay-editor">
+  <header class="editor-topbar">
+    <button class="icon-btn" data-close="overlay-editor" aria-label="Close">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+    </button>
+    <span class="editor-topbar-title" id="editor-heading">New note</span>
+    <button class="btn btn-primary" id="btn-save-note">Save</button>
+  </header>
+
+  <div class="editor-scroll">
+    <input type="text" class="title-input" id="editor-title" placeholder="Title">
+    <textarea id="editor-body" class="editor-textarea" placeholder="What's on your mind…"></textarea>
+    <div class="thumb-row" id="editor-thumbs"></div>
   </div>
+
+  <div class="editor-lock-status" id="editor-lock-summary"></div>
+
+  <footer class="editor-toolbar">
+    <button class="icon-btn" id="btn-attach-image" title="Add photo" aria-label="Add photo">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8.5" cy="10" r="1.5"/><path d="M21 15l-5-5-4 4-3-3-6 6"/></svg>
+    </button>
+    <input type="file" id="input-image" accept="image/*" multiple class="visually-hidden">
+    <button class="icon-btn" id="btn-open-lock-chooser" title="Lock this note" aria-label="Lock this note">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+    </button>
+    <button class="icon-btn" id="btn-remove-lock" style="display:none;" title="Remove lock" aria-label="Remove lock">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-2.6"/></svg>
+    </button>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="btn-delete-note" style="display:none; color: var(--brick);" title="Delete" aria-label="Delete">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7h16M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2m1 0-.8 12.2a2 2 0 0 1-2 1.8H8.8a2 2 0 0 1-2-1.8L6 7"/></svg>
+    </button>
+  </footer>
 </div>
 
 <!-- Lock chooser modal -->
@@ -694,7 +774,7 @@
 <script>
 // Bump this on EVERY change to the app, no matter how small — a typo fix,
 // a copy tweak, whatever. See CHANGELOG.md for the policy and history.
-window.KEEPSAKE_VERSION = "1.0.1";
+window.KEEPSAKE_VERSION = "1.0.2";
 </script>
 <script src="app.js"></script>
 </body>

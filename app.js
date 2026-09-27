@@ -626,7 +626,7 @@ function wireStaticEvents() {
   });
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
-      document.querySelectorAll('.overlay:not(.hidden)').forEach((ov) => hide(ov.id));
+      document.querySelectorAll('.overlay:not(.hidden), .editor-screen:not(.hidden)').forEach((ov) => hide(ov.id));
     }
   });
 
@@ -730,7 +730,7 @@ function wireStaticEvents() {
 
 function init() {
   wireStaticEvents();
-  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.0.1');
+  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.0.2');
 
   if (!Config.configured()) {
     openSettings();
