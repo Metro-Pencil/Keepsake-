@@ -765,6 +765,18 @@
         <p class="hint">Matches the API_TOKEN secret set on your Worker. Stored only in this browser.</p>
       </div>
       <button class="btn btn-primary" id="btn-save-settings">Save</button>
+
+      <div class="field" style="margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--line);">
+        <label>App shell</label>
+        <div class="btn-row">
+          <button class="btn btn-ghost" id="btn-force-refresh">Force refresh</button>
+        </div>
+        <p class="hint">
+          You're on v<span id="settings-version"></span>. If the app ever looks
+          out of date after you've pushed changes, tap this to clear the
+          cached shell and reload the newest version.
+        </p>
+      </div>
     </div>
   </div>
 </div>
@@ -774,7 +786,7 @@
 <script>
 // Bump this on EVERY change to the app, no matter how small — a typo fix,
 // a copy tweak, whatever. See CHANGELOG.md for the policy and history.
-window.KEEPSAKE_VERSION = "1.0.2";
+window.KEEPSAKE_VERSION = "1.0.3";
 </script>
 <script src="app.js"></script>
 </body>

@@ -600,7 +600,37 @@ function openConfirm(title, message, onYes) {
 function openSettings() {
   document.getElementById('settings-api-base').value = Config.base();
   document.getElementById('settings-token').value = Config.token();
+  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.0.3';
   show('overlay-settings');
+}
+
+// Clears the installed service worker + its cached app shell, then reloads.
+// Needed because sw.js only re-fetches the shell when the browser notices
+// sw.js itself changed byte-for-byte — a deploy that only touches
+// index.html/app.js can otherwise leave people stuck on an old cached shell
+// indefinitely. This button is the manual escape hatch for that.
+async function forceRefresh() {
+  const btn = document.getElementById('btn-force-refresh');
+  btn.disabled = true;
+  btn.textContent = 'Refreshing…';
+  try {
+    if ('serviceWorker' in navigator) {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map((r) => r.unregister()));
+    }
+    if (window.caches) {
+      const keys = await caches.keys();
+      await Promise.all(keys.map((k) => caches.delete(k)));
+    }
+  } catch (e) {
+    // best-effort — fall through to reload regardless
+  }
+  // Cache-bust the navigation itself so the browser's own HTTP cache can't
+  // hand back a stale index.html either, now that no service worker is
+  // left to intercept the request.
+  const url = new URL(location.href);
+  url.searchParams.set('_r', Date.now());
+  location.replace(url.toString());
 }
 
 function saveSettings() {
@@ -651,6 +681,7 @@ function wireStaticEvents() {
 
   document.getElementById('btn-settings').addEventListener('click', openSettings);
   document.getElementById('btn-save-settings').addEventListener('click', saveSettings);
+  document.getElementById('btn-force-refresh').addEventListener('click', forceRefresh);
 
   document.getElementById('btn-new-note').addEventListener('click', () => {
     currentUnlockCreds = null;

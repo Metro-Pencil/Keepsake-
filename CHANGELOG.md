@@ -6,6 +6,14 @@ All notable changes to this project are recorded here, following
 small — gets a version bump. If the version number hasn't moved,
 nothing changed; that's the whole point of keeping one.
 
+## v1.0.3 — 2026-09-27
+
+- Added a "Force refresh" button in Settings that unregisters the service
+  worker, clears the cached app shell, and reloads — a manual way to get
+  the newest deployed version if the app ever looks stuck on an old one.
+- Bumped the service worker's cache name so this deploy itself is picked
+  up by everyone already using the installed app, not just new visits.
+
 ## v1.0.2 — 2026-09-27
 
 - Replaced the cramped bottom-sheet note editor with a full-screen writing

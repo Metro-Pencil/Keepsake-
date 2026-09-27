@@ -1,4 +1,9 @@
-const CACHE_NAME = 'keepsake-shell-v1';
+// Bump this string on any deploy that changes index.html, app.js, or any
+// other shell file. It's the only way the browser notices sw.js itself
+// changed and re-fetches the shell — otherwise installed PWAs can get
+// stuck on an old cached version forever. See the "Force refresh" button
+// in Settings for a manual way out of that if a deploy forgets to.
+const CACHE_NAME = 'keepsake-shell-v2';
 const SHELL_FILES = [
   './',
   './index.html',
