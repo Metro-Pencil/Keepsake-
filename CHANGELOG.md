@@ -6,6 +6,32 @@ All notable changes to this project are recorded here, following
 small — gets a version bump. If the version number hasn't moved,
 nothing changed; that's the whole point of keeping one.
 
+## v1.2.0 — 2026-09-28
+
+- **Opening a note no longer force-opens the keyboard.** The title field
+  used to grab focus automatically every time — new note or existing —
+  which popped the keyboard even when you just wanted to read. It now
+  waits until you actually tap into the title or body.
+- **Fixed the dark bar that appeared above the keyboard.** The full-screen
+  editor is pinned to the whole screen (`inset: 0`), and mobile browsers
+  don't shrink that box when the keyboard opens — only the visible area
+  shrinks — so a gap opened up behind the keyboard. The editor now tracks
+  `visualViewport` and resizes itself to match whenever the keyboard
+  opens or closes, so the toolbar sits right above the keyboard with
+  nothing behind it.
+- **Each photo now shows its saved (compressed) size** as a small badge
+  on its thumbnail and in the new photo viewer below.
+- **Tapping a photo now opens it full-screen**, with left/right arrows
+  (or a swipe) to page through every photo on the note, and a close
+  button / tap-outside / Escape to dismiss.
+- **The "Saving photos…" progress message no longer appears while you're
+  just typing text.** Because a note's text and photos are stored
+  together as one blob (see the README's KV notes), every autosave still
+  has to resend the whole thing — but the status strip now only calls it
+  out as a photo save when the photos themselves actually changed since
+  the last successful save; a text-only edit now just says "Saving…"
+  like it should.
+
 ## v1.1.0 — 2026-09-27
 
 - **Autosave.** While a note is open, changes are cached locally (IndexedDB)

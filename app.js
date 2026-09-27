@@ -183,8 +183,25 @@ function estimateContentBytes() {
   const title = document.getElementById('editor-title').value || '';
   const body = document.getElementById('editor-body').value || '';
   let total = title.length + body.length;
-  for (const src of editorImages) total += src.length * 0.75; // base64 -> raw bytes, roughly
+  for (const src of editorImages) total += estimateImageBytes(src);
   return total;
+}
+
+// Precise-enough byte size of one compressed photo, straight from its
+// base64 data URL — used both for the per-photo size shown under each
+// thumbnail/in the lightbox, and (summed) for the 25MB ceiling check above.
+function estimateImageBytes(dataUrl) {
+  const comma = dataUrl.indexOf(',');
+  const base64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
+  const len = base64.length;
+  const padding = base64.endsWith('==') ? 2 : base64.endsWith('=') ? 1 : 0;
+  return Math.max(0, Math.round((len * 3) / 4) - padding);
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return Math.round(bytes / 1024) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
 }
 
 /* ---------------------------------------------------------------------
@@ -319,8 +336,47 @@ function toast(msg) {
   toastTimer = setTimeout(() => el.classList.remove('show'), 2400);
 }
 
-function show(id) { document.getElementById(id).classList.remove('hidden'); }
-function hide(id) { document.getElementById(id).classList.add('hidden'); }
+function show(id) {
+  document.getElementById(id).classList.remove('hidden');
+  if (id === 'overlay-editor') applyEditorViewportFix();
+}
+function hide(id) {
+  document.getElementById(id).classList.add('hidden');
+  if (id === 'overlay-editor') applyEditorViewportFix();
+}
+
+/* ---------------------------------------------------------------------
+ * Keyboard viewport fix
+ *
+ * Mobile browsers (iOS Safari/standalone in particular) resize the
+ * *visual* viewport when the keyboard opens but leave the *layout*
+ * viewport — the box `position: fixed` elements are pinned to — alone.
+ * The full-screen editor is `inset: 0`, so it keeps sizing itself to the
+ * old, taller layout viewport, and the sliver between the bottom of the
+ * shrunk visible area and the bottom of that old box renders as a plain
+ * dark gap behind the keyboard. Keeping the editor's own height and
+ * offset in sync with `visualViewport` closes that gap, so the toolbar
+ * ends up sitting right above the keyboard with nothing behind it.
+ * ------------------------------------------------------------------- */
+
+function applyEditorViewportFix() {
+  const el = document.getElementById('overlay-editor');
+  if (!el) return;
+  const vv = window.visualViewport;
+  if (!vv || el.classList.contains('hidden')) {
+    el.style.top = '';
+    el.style.height = '';
+    return;
+  }
+  el.style.top = vv.offsetTop + 'px';
+  el.style.height = vv.height + 'px';
+}
+
+function setupKeyboardViewportFix() {
+  if (!window.visualViewport) return;
+  window.visualViewport.addEventListener('resize', applyEditorViewportFix);
+  window.visualViewport.addEventListener('scroll', applyEditorViewportFix);
+}
 
 /* ---------------------------------------------------------------------
  * Sync bar — one status strip used for every kind of background progress:
@@ -394,6 +450,7 @@ let currentView = 'notes';
 let editingNoteId = null;        // generated client-side the moment the editor opens — see openEditorWithContent
 let noteExistsOnServer = false;  // false until this note's first background save actually succeeds
 let editorImages = [];
+let lightboxIndex = 0;
 let pendingLock = null;          // { type: 'quick'|'time', password?, password2?, unlockAt?, existing? }
 let currentUnlockCreds = null;   // { password, password2? } — kept only for this editing session
 
@@ -523,16 +580,91 @@ function renderEditorThumbs() {
   const wrap = document.getElementById('editor-thumbs');
   wrap.innerHTML = editorImages.map((src, i) => `
     <div class="thumb">
-      <img src="${src}" alt="">
+      <img src="${src}" alt="" data-idx="${i}">
+      <span class="thumb-size">${formatBytes(estimateImageBytes(src))}</span>
       <button class="thumb-remove" data-idx="${i}" aria-label="Remove image">×</button>
     </div>`).join('');
   wrap.querySelectorAll('.thumb-remove').forEach((btn) => {
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
       editorImages.splice(Number(btn.dataset.idx), 1);
       renderEditorThumbs();
       onEditorContentChanged();
     });
   });
+  wrap.querySelectorAll('img').forEach((img) => {
+    img.addEventListener('click', () => openLightbox(Number(img.dataset.idx)));
+  });
+}
+
+/* ---------------------------------------------------------------------
+ * Lightbox — full-screen photo viewer with left/right paging, opened by
+ * tapping any thumbnail in the editor.
+ * ------------------------------------------------------------------- */
+
+function openLightbox(index) {
+  if (!editorImages.length) return;
+  lightboxIndex = index;
+  renderLightbox();
+  show('overlay-lightbox');
+}
+
+function closeLightbox() { hide('overlay-lightbox'); }
+
+function lightboxStep(delta) {
+  const total = editorImages.length;
+  if (!total) return;
+  lightboxIndex = (lightboxIndex + delta + total) % total;
+  renderLightbox();
+}
+
+function renderLightbox() {
+  const total = editorImages.length;
+  if (!total) { closeLightbox(); return; }
+  if (lightboxIndex >= total) lightboxIndex = total - 1;
+  if (lightboxIndex < 0) lightboxIndex = 0;
+  const src = editorImages[lightboxIndex];
+  document.getElementById('lightbox-img').src = src;
+  document.getElementById('lightbox-caption').textContent =
+    total > 1
+      ? `${lightboxIndex + 1} of ${total} — ${formatBytes(estimateImageBytes(src))}`
+      : formatBytes(estimateImageBytes(src));
+  const showNav = total > 1;
+  document.getElementById('btn-lightbox-prev').style.visibility = showNav ? 'visible' : 'hidden';
+  document.getElementById('btn-lightbox-next').style.visibility = showNav ? 'visible' : 'hidden';
+}
+
+function setupLightbox() {
+  document.getElementById('btn-lightbox-close').addEventListener('click', closeLightbox);
+  document.getElementById('btn-lightbox-prev').addEventListener('click', () => lightboxStep(-1));
+  document.getElementById('btn-lightbox-next').addEventListener('click', () => lightboxStep(1));
+
+  // Tapping the dark backdrop (but not the photo itself) closes, same as
+  // most native photo viewers.
+  document.getElementById('overlay-lightbox').addEventListener('click', (e) => {
+    if (e.target.id === 'overlay-lightbox') closeLightbox();
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if (document.getElementById('overlay-lightbox').classList.contains('hidden')) return;
+    if (e.key === 'Escape') closeLightbox();
+    else if (e.key === 'ArrowLeft') lightboxStep(-1);
+    else if (e.key === 'ArrowRight') lightboxStep(1);
+  });
+
+  // Swipe left/right to page between photos on touch devices.
+  let touchStartX = null;
+  const lightbox = document.getElementById('overlay-lightbox');
+  lightbox.addEventListener('touchstart', (e) => {
+    touchStartX = e.changedTouches[0].clientX;
+  }, { passive: true });
+  lightbox.addEventListener('touchend', (e) => {
+    if (touchStartX === null) return;
+    const dx = e.changedTouches[0].clientX - touchStartX;
+    touchStartX = null;
+    if (Math.abs(dx) < 40) return; // not a deliberate swipe
+    lightboxStep(dx < 0 ? 1 : -1);
+  }, { passive: true });
 }
 
 function renderLockSummary() {
@@ -584,8 +716,11 @@ function openEditorWithContent(meta, content) {
     : null;
   renderLockSummary();
   lastAutosavedJSON = computeEditorSnapshot();
+  seedSyncStateImages(editingNoteId, editorImages);
   show('overlay-editor');
-  document.getElementById('editor-title').focus();
+  // No auto-focus here on purpose — opening a note (new or existing)
+  // should never force the keyboard open by itself. It comes up only
+  // once the person actually taps into the title or body.
 
   // If an earlier session ended abruptly (crash, dead battery, a
   // swiped-away tab) before its background save could finish, offer to
@@ -688,6 +823,16 @@ async function buildSavePayload(snapshot) {
  * duplicate.
  * ------------------------------------------------------------------- */
 
+// Called once, right when a note is opened, so the "have the photos
+// actually changed since the server last saw them?" check below has a
+// real baseline from the start — otherwise the very first autosave of an
+// existing, already-synced note would look like a fresh photo upload.
+function seedSyncStateImages(noteId, images) {
+  let state = syncStateByNote.get(noteId);
+  if (!state) { state = { inFlight: false, queued: null }; syncStateByNote.set(noteId, state); }
+  state.lastSyncedImagesJSON = JSON.stringify(images);
+}
+
 function runSync(noteId, snapshot) {
   let state = syncStateByNote.get(noteId);
   if (!state) { state = { inFlight: false, queued: null }; syncStateByNote.set(noteId, state); }
@@ -718,10 +863,20 @@ async function syncRunOne(noteId, snapshot, state) {
   }
 
   const { payload, hasImages } = built;
-  const onProgress = hasImages && showInBar()
+
+  // The note's photos are stored together with its text in one blob (see
+  // worker.js), so every save necessarily re-sends all of it — but that's
+  // only worth calling out as "saving photos" when photos are actually
+  // part of what changed. Otherwise a plain text edit on a photo-heavy
+  // note would misleadingly claim to be re-saving pictures on every
+  // autosave tick.
+  const imagesJSON = JSON.stringify(snapshot.images);
+  const imagesChanged = hasImages && imagesJSON !== state.lastSyncedImagesJSON;
+
+  const onProgress = imagesChanged && showInBar()
     ? (fraction) => syncBarSet(`Saving photos… ${Math.round(fraction * 100)}%`, fraction)
     : null;
-  if (showInBar()) syncBarSet(hasImages ? 'Saving photos… 0%' : 'Saving…', hasImages ? 0 : null);
+  if (showInBar()) syncBarSet(imagesChanged ? 'Saving photos… 0%' : 'Saving…', imagesChanged ? 0 : null);
 
   try {
     const { note } = await API.saveNote(noteId, payload, onProgress);
@@ -731,6 +886,7 @@ async function syncRunOne(noteId, snapshot, state) {
       document.getElementById('editor-heading').textContent = 'Edit note';
       lastAutosavedJSON = JSON.stringify(snapshot);
     }
+    state.lastSyncedImagesJSON = imagesJSON;
     clearLocalDraft(noteId);
     patchNoteInCache(note);
     if (showInBar()) syncBarSuccess('Saved');
@@ -1072,7 +1228,7 @@ function openConfirm(title, message, onYes, yesLabel = 'Delete') {
 function openSettings() {
   document.getElementById('settings-api-base').value = Config.base();
   document.getElementById('settings-token').value = Config.token();
-  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.1.0';
+  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.2.0';
   show('overlay-settings');
 }
 
@@ -1312,7 +1468,9 @@ async function checkForRecoverableDrafts() {
 
 function init() {
   wireStaticEvents();
-  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.1.0');
+  setupKeyboardViewportFix();
+  setupLightbox();
+  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.2.0');
 
   if (!Config.configured()) {
     openSettings();
