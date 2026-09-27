@@ -6,6 +6,37 @@ All notable changes to this project are recorded here, following
 small — gets a version bump. If the version number hasn't moved,
 nothing changed; that's the whole point of keeping one.
 
+## v1.0.4 — 2026-09-27
+
+- Added a progress bar in the editor for adding photos (shows "photo X of
+  N" while each one is compressed) and for saving a note that contains
+  photos (shows real upload percentage).
+- Photos now appear as thumbnails one by one as each finishes processing,
+  instead of all at once at the end.
+- Fixed a bug where the Cancel/Close buttons inside the unlock dialog
+  didn't do anything — they're built fresh each time the dialog opens, but
+  were only ever wired once at startup, before they existed.
+- Fixed a bug where pressing Escape while a smaller dialog (e.g. the lock
+  chooser) was open over the note editor closed both at once, silently
+  discarding whatever was in the editor.
+- Closing the editor (✕ button or Escape) with unsaved changes now asks
+  "Discard this note?" instead of silently dropping them.
+- Fixed a bug where a fast double-tap on Save while creating a new note
+  could send two save requests and create a duplicate note. Save is now
+  disabled (and shows "Saving…") until the request finishes.
+- Skipped photos (ones that fail to read) are now reported with a toast
+  instead of silently disappearing.
+- Added a heads-up if a note's photos push it over Workers KV's 25MB
+  cap, both while adding photos and before attempting to save, instead of
+  only finding out from a server error after the fact.
+- The notes list now shows a "Loading…" state on first load instead of a
+  blank screen while the initial fetch is in flight.
+- The Worker URL field in Settings is now checked for an http(s)://
+  prefix — without one, requests were silently misrouted with a confusing
+  failure.
+- Disabled buttons (Force refresh, Add photo while processing) now look
+  visibly dimmed instead of appearing clickable while inactive.
+
 ## v1.0.3 — 2026-09-27
 
 - Added a "Force refresh" button in Settings that unregisters the service

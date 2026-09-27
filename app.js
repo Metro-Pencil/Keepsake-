@@ -102,10 +102,39 @@ const API = {
     }
     return res.json();
   },
+  // Same contract as request() (resolves with parsed JSON, rejects with an
+  // Error carrying .status/.body) but over XHR instead of fetch, so we can
+  // report real upload progress for payloads that carry photos.
+  requestWithProgress(path, method, payload, onProgress) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open(method, Config.base() + path);
+      xhr.setRequestHeader('Content-Type', 'application/json');
+      xhr.setRequestHeader('Authorization', 'Bearer ' + Config.token());
+      if (onProgress) {
+        xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(e.loaded / e.total); };
+      }
+      xhr.onload = () => {
+        let body = {};
+        try { body = JSON.parse(xhr.responseText); } catch (e) { /* non-JSON error body */ }
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve(body);
+        } else {
+          const err = new Error(body.error || ('Request failed (' + xhr.status + ')'));
+          err.status = xhr.status;
+          err.body = body;
+          reject(err);
+        }
+      };
+      xhr.onerror = () => reject(new Error('Network error — check your connection'));
+      xhr.send(JSON.stringify(payload));
+    });
+  },
+
   listNotes() { return this.request('/api/notes'); },
   getNote(id) { return this.request('/api/notes/' + id); },
-  createNote(payload) { return this.request('/api/notes', { method: 'POST', body: JSON.stringify(payload) }); },
-  updateNote(id, payload) { return this.request('/api/notes/' + id, { method: 'PUT', body: JSON.stringify(payload) }); },
+  createNote(payload, onProgress) { return this.requestWithProgress('/api/notes', 'POST', payload, onProgress); },
+  updateNote(id, payload, onProgress) { return this.requestWithProgress('/api/notes/' + id, 'PUT', payload, onProgress); },
   deleteNote(id) { return this.request('/api/notes/' + id, { method: 'DELETE' }); },
   getVault(id) { return this.request('/api/notes/' + id + '/vault'); },
   exportNote(id) { return this.request('/api/notes/' + id + '/export'); },
@@ -139,6 +168,19 @@ async function fileToCompressedDataURL(file, maxDim = 1600, quality = 0.82) {
   const ctx = canvas.getContext('2d');
   ctx.drawImage(img, 0, 0, width, height);
   return canvas.toDataURL('image/jpeg', quality);
+}
+
+// Workers KV caps each value at 25MB (see README) — content:{id} holds the
+// note's title + body + every photo, so this is the ceiling for all of it
+// combined, not per photo.
+const NOTE_SIZE_LIMIT = 25 * 1024 * 1024;
+
+function estimateContentBytes() {
+  const title = document.getElementById('editor-title').value || '';
+  const body = document.getElementById('editor-body').value || '';
+  let total = title.length + body.length;
+  for (const src of editorImages) total += src.length * 0.75; // base64 -> raw bytes, roughly
+  return total;
 }
 
 /* ---------------------------------------------------------------------
@@ -197,6 +239,16 @@ function toast(msg) {
 function show(id) { document.getElementById(id).classList.remove('hidden'); }
 function hide(id) { document.getElementById(id).classList.add('hidden'); }
 
+function setEditorProgress(label, fraction) {
+  document.getElementById('editor-progress').classList.remove('hidden');
+  document.getElementById('editor-progress-label').textContent = label;
+  document.getElementById('editor-progress-fill').style.width =
+    (Math.max(0, Math.min(1, fraction)) * 100) + '%';
+}
+function hideEditorProgress() {
+  document.getElementById('editor-progress').classList.add('hidden');
+}
+
 /* ---------------------------------------------------------------------
  * Icons (inline SVG strings, reused across cards)
  * ------------------------------------------------------------------- */
@@ -210,9 +262,12 @@ const trashGlyph = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" s
  * ------------------------------------------------------------------- */
 
 let notesCache = [];
+let notesLoaded = false;         // becomes true after the first successful list fetch
 let currentView = 'notes';
 let editingNoteId = null;
 let editorImages = [];
+let editorSnapshot = '';         // JSON snapshot taken when the editor opens, to detect unsaved changes
+let saveInFlight = false;        // guards against double-submitting (e.g. a fast double-tap on Save)
 let pendingLock = null;          // { type: 'quick'|'time', password?, password2?, unlockAt?, existing? }
 let currentUnlockCreds = null;   // { password, password2? } — kept only for this editing session
 
@@ -280,13 +335,24 @@ function renderLocked() {
 setInterval(() => { if (notesCache.some((m) => m.lockType === 'time')) renderLocked(); }, 60000);
 
 async function refreshNotes() {
+  if (!notesLoaded) {
+    const loading = emptyStateHTML('Loading…', 'Fetching your notes.');
+    document.getElementById('grid-notes').innerHTML = loading;
+    document.getElementById('grid-locked').innerHTML = loading;
+  }
   try {
     const { notes } = await API.listNotes();
     notesCache = notes;
+    notesLoaded = true;
     renderNotes();
     renderLocked();
   } catch (e) {
     toast('Could not load notes: ' + e.message);
+    if (!notesLoaded) {
+      const failed = emptyStateHTML('Could not load notes', e.message);
+      document.getElementById('grid-notes').innerHTML = failed;
+      document.getElementById('grid-locked').innerHTML = failed;
+    }
   }
 }
 
@@ -328,6 +394,19 @@ function renderLockSummary() {
     : `<p class="hint">Time-locked until ${fmtDateTime(pendingLock.unlockAt)}.</p>`;
 }
 
+function computeEditorSnapshot() {
+  return JSON.stringify({
+    title: document.getElementById('editor-title').value,
+    body: document.getElementById('editor-body').value,
+    images: editorImages,
+    lock: pendingLock ? { type: pendingLock.type, unlockAt: pendingLock.unlockAt || null } : null,
+  });
+}
+
+function editorHasUnsavedChanges() {
+  return computeEditorSnapshot() !== editorSnapshot;
+}
+
 function openEditorWithContent(meta, content) {
   editingNoteId = meta && meta.id ? meta.id : null;
   document.getElementById('editor-heading').textContent = editingNoteId ? 'Edit note' : 'New note';
@@ -335,20 +414,47 @@ function openEditorWithContent(meta, content) {
   document.getElementById('editor-body').value = content.body || '';
   editorImages = (content.images || []).slice();
   renderEditorThumbs();
+  hideEditorProgress();
   document.getElementById('btn-delete-note').style.display = editingNoteId ? '' : 'none';
 
   pendingLock = (meta && meta.lockType && meta.lockType !== 'none')
     ? { type: meta.lockType, unlockAt: meta.unlockAt, existing: true }
     : null;
   renderLockSummary();
+  editorSnapshot = computeEditorSnapshot();
   show('overlay-editor');
   document.getElementById('editor-title').focus();
 }
 
+function attemptCloseEditor() {
+  if (editorHasUnsavedChanges()) {
+    openConfirm(
+      'Discard this note?',
+      'Your changes haven\u2019t been saved.',
+      async () => { hide('overlay-editor'); },
+      'Discard'
+    );
+  } else {
+    hide('overlay-editor');
+  }
+}
+
 async function saveNote() {
+  if (saveInFlight) return; // already saving — ignore a fast double-tap on Save
   const title = document.getElementById('editor-title').value.trim();
   const body = document.getElementById('editor-body').value;
   if (!title && !body && editorImages.length === 0) { toast('Nothing to save'); return; }
+
+  if (estimateContentBytes() > NOTE_SIZE_LIMIT) {
+    toast('This note is over the 25MB limit — remove a photo before saving.');
+    return;
+  }
+
+  saveInFlight = true;
+  const saveBtn = document.getElementById('btn-save-note');
+  const originalLabel = saveBtn.textContent;
+  saveBtn.disabled = true;
+  saveBtn.textContent = 'Saving…';
 
   const content = { title, body, images: editorImages };
   let payload;
@@ -371,14 +477,23 @@ async function saveNote() {
     }
   } catch (e) {
     toast('Could not lock note — try setting the lock again.');
+    saveInFlight = false;
+    saveBtn.disabled = false;
+    saveBtn.textContent = originalLabel;
     return;
   }
 
+  const hasImages = editorImages.length > 0;
+  const onProgress = hasImages
+    ? (fraction) => setEditorProgress(`Uploading photos… ${Math.round(fraction * 100)}%`, fraction)
+    : null;
+  if (hasImages) setEditorProgress('Uploading photos… 0%', 0);
+
   try {
     if (editingNoteId) {
-      await API.updateNote(editingNoteId, payload);
+      await API.updateNote(editingNoteId, payload, onProgress);
     } else {
-      await API.createNote(payload);
+      await API.createNote(payload, onProgress);
     }
     toast('Saved');
     hide('overlay-editor');
@@ -386,6 +501,11 @@ async function saveNote() {
     await refreshNotes();
   } catch (e) {
     toast('Could not save: ' + e.message);
+  } finally {
+    saveInFlight = false;
+    saveBtn.disabled = false;
+    saveBtn.textContent = originalLabel;
+    hideEditorProgress();
   }
 }
 
@@ -580,11 +700,12 @@ async function downloadNote(id) {
  * Confirm modal
  * ------------------------------------------------------------------- */
 
-function openConfirm(title, message, onYes) {
+function openConfirm(title, message, onYes, yesLabel = 'Delete') {
   document.getElementById('confirm-title').textContent = title;
   document.getElementById('confirm-message').textContent = message;
   const yesBtn = document.getElementById('btn-confirm-yes');
   const freshYes = yesBtn.cloneNode(true);
+  freshYes.textContent = yesLabel;
   yesBtn.parentNode.replaceChild(freshYes, yesBtn);
   freshYes.addEventListener('click', async () => {
     hide('overlay-confirm');
@@ -600,7 +721,7 @@ function openConfirm(title, message, onYes) {
 function openSettings() {
   document.getElementById('settings-api-base').value = Config.base();
   document.getElementById('settings-token').value = Config.token();
-  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.0.3';
+  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.0.4';
   show('overlay-settings');
 }
 
@@ -637,6 +758,7 @@ function saveSettings() {
   const base = document.getElementById('settings-api-base').value.trim();
   const token = document.getElementById('settings-token').value.trim();
   if (!base || !token) { toast('Both fields are needed'); return; }
+  if (!/^https?:\/\//i.test(base)) { toast('Worker URL should start with https://'); return; }
   Config.setBase(base);
   Config.setToken(token);
   hide('overlay-settings');
@@ -648,15 +770,24 @@ function saveSettings() {
  * ------------------------------------------------------------------- */
 
 function wireStaticEvents() {
-  document.querySelectorAll('[data-close]').forEach((btn) => {
-    btn.addEventListener('click', () => hide(btn.dataset.close));
+  document.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-close]');
+    if (btn) hide(btn.dataset.close);
   });
   document.querySelectorAll('.overlay').forEach((ov) => {
     ov.addEventListener('click', (e) => { if (e.target === ov) hide(ov.id); });
   });
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') {
-      document.querySelectorAll('.overlay:not(.hidden), .editor-screen:not(.hidden)').forEach((ov) => hide(ov.id));
+    if (e.key !== 'Escape') return;
+    const openModals = document.querySelectorAll('.overlay:not(.hidden)');
+    if (openModals.length) {
+      // A modal (settings, lock chooser, unlock, confirm) is on top — close
+      // just that, and leave the full-screen editor underneath it alone.
+      openModals.forEach((ov) => hide(ov.id));
+      return;
+    }
+    if (!document.getElementById('overlay-editor').classList.contains('hidden')) {
+      attemptCloseEditor();
     }
   });
 
@@ -682,6 +813,7 @@ function wireStaticEvents() {
   document.getElementById('btn-settings').addEventListener('click', openSettings);
   document.getElementById('btn-save-settings').addEventListener('click', saveSettings);
   document.getElementById('btn-force-refresh').addEventListener('click', forceRefresh);
+  document.getElementById('btn-close-editor').addEventListener('click', attemptCloseEditor);
 
   document.getElementById('btn-new-note').addEventListener('click', () => {
     currentUnlockCreds = null;
@@ -698,14 +830,34 @@ function wireStaticEvents() {
   });
   document.getElementById('input-image').addEventListener('change', async (e) => {
     const files = Array.from(e.target.files || []);
-    for (const file of files) {
+    if (!files.length) return;
+
+    const attachBtn = document.getElementById('btn-attach-image');
+    attachBtn.disabled = true;
+    let failed = 0;
+
+    for (let i = 0; i < files.length; i++) {
+      setEditorProgress(`Adding photo ${i + 1} of ${files.length}…`, i / files.length);
       try {
-        const dataUrl = await fileToCompressedDataURL(file);
+        const dataUrl = await fileToCompressedDataURL(files[i]);
         editorImages.push(dataUrl);
-      } catch (err) { /* skip unreadable file */ }
+        renderEditorThumbs(); // show each photo as soon as it's ready, not all at once at the end
+      } catch (err) {
+        failed++;
+      }
+      setEditorProgress(`Adding photo ${i + 1} of ${files.length}…`, (i + 1) / files.length);
     }
-    renderEditorThumbs();
+
+    hideEditorProgress();
+    attachBtn.disabled = false;
     e.target.value = '';
+
+    if (failed) {
+      toast(failed === 1 ? 'Couldn\u2019t read one of those photos' : `Couldn\u2019t read ${failed} of those photos`);
+    }
+    if (estimateContentBytes() > NOTE_SIZE_LIMIT) {
+      toast('This note is now over the 25MB limit — remove a photo or it won\u2019t save.');
+    }
   });
 
   document.getElementById('btn-open-lock-chooser').addEventListener('click', openLockChooser);
@@ -761,7 +913,7 @@ function wireStaticEvents() {
 
 function init() {
   wireStaticEvents();
-  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.0.2');
+  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.0.4');
 
   if (!Config.configured()) {
     openSettings();
