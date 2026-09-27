@@ -730,7 +730,7 @@ function wireStaticEvents() {
 
 function init() {
   wireStaticEvents();
-  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.0.0');
+  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.0.1');
 
   if (!Config.configured()) {
     openSettings();

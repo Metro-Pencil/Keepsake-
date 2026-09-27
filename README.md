@@ -18,9 +18,14 @@ point — it's meant to slow down impulse, not defend against an attacker.
 ## What's in this repo
 
 ```
-index.html, app.js, manifest.json, sw.js, icons/   → the frontend (static)
-worker/worker.js, worker/wrangler.toml             → the Cloudflare Worker backend
+index.html, app.js, manifest.json, sw.js, icon-192.png, icon-512.png
+worker.js, wrangler.toml
 ```
+
+Everything sits in one flat folder — no subfolders to deal with in GitHub.
+`worker.js` and `wrangler.toml` are only there for you to copy from when
+setting up Cloudflare; GitHub Pages will happily ignore them since nothing
+links to them from the frontend.
 
 The frontend is plain HTML/CSS/JS — no framework, no build step. It talks to
 your own Worker over a small JSON API, authenticated with a bearer token you
@@ -32,7 +37,6 @@ You'll need a Cloudflare account and `wrangler` (`npm install -g wrangler`,
 or use `npx wrangler` for every command below).
 
 ```bash
-cd worker
 wrangler kv namespace create NOTES_KV
 ```
 
@@ -40,7 +44,6 @@ Copy the `id` it prints into `wrangler.toml`, replacing
 `REPLACE_WITH_YOUR_KV_NAMESPACE_ID`.
 
 ```bash
-wrangler r2 bucket create keepsake-notes
 wrangler secret put API_TOKEN
 ```
 
@@ -57,9 +60,12 @@ Note the `https://keepsake-worker.<you>.workers.dev` URL it prints.
 
 ## 2. Host the frontend
 
-Push `index.html`, `app.js`, `manifest.json`, `sw.js`, and `icons/` to a
-GitHub repo and turn on GitHub Pages (Settings → Pages) — or use any static
-host (Cloudflare Pages, Netlify, etc.). There's nothing to build.
+Push everything in this folder **except** `worker.js` and `wrangler.toml`
+(those two are only for Cloudflare, not the site) to a GitHub repo, then
+turn on GitHub Pages (Settings → Pages) — or use any static host. Nothing
+to build; if you'd rather not bother excluding the two Worker files, it's
+also harmless to push all of it — Pages just serves the site files and
+ignores the rest.
 
 ## 3. Point the app at your Worker
 
@@ -72,11 +78,16 @@ Both are stored only in that browser's local storage.
 
 ## Limits worth knowing
 
-- Each save (a note plus its photos) goes through the Worker as one request,
-  capped at 100 MB on Cloudflare's free plan — plenty of headroom, and the
-  app compresses photos client-side before upload to help.
-- R2 objects can be up to 5 TiB each; the free tier includes 10 GB-months of
-  storage and generous free request quotas, with downloads always free.
+- Everything lives in one Workers KV namespace — no R2 bucket, and no
+  payment method needed on your Cloudflare account to set this up.
+- Each note's content (text + all its photos combined) is capped at 25 MB,
+  which is a KV hard limit. The app compresses photos client-side before
+  upload, so this comfortably fits long entries plus a good handful of
+  photos — but it's not built for huge files or dozens of full-resolution
+  images on one note.
+- Total free storage across your whole account is around 1 GB. Plenty of
+  ordinary journaling, but worth knowing if you end up with a very large
+  number of photo-heavy notes over time.
 - There's no password recovery, by design — forgetting a note's password
   (or, for a time-locked note, both passwords) means that note is
   unrecoverable.
@@ -90,3 +101,9 @@ Both are stored only in that browser's local storage.
   single-file convention.
 - Note titles and previews are only ever stored in plain text for *unlocked*
   notes — locked notes (either type) store no plaintext at all server-side.
+- All three pieces of data — a note's content, its metadata, and (for
+  time-locked notes) the vaulted second password — live in the same KV
+  namespace under `content:{id}`, `meta:{id}`, and `vault:{id}`. If you ever
+  outgrow KV's 25MB-per-note or ~1GB-total ceiling, swapping the
+  `content:{id}` reads/writes in `worker.js` for an R2 bucket is a small,
+  contained change — the rest of the app doesn't need to know either way.

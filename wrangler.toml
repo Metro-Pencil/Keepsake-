@@ -1,0 +1,16 @@
+name = "keepsake-worker"
+main = "worker.js"
+compatibility_date = "2026-09-01"
+
+# Created with: wrangler kv namespace create NOTES_KV
+# Paste the id it prints below.
+kv_namespaces = [
+  { binding = "NOTES_KV", id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID" }
+]
+
+# Set with: wrangler secret put API_TOKEN
+# (not defined here — secrets never go in this file)
+
+# No R2 bucket needed — note content, metadata, and the password-2 vault
+# all live in the one KV namespace above. This avoids the payment-method
+# requirement Cloudflare has for enabling R2 on an account.
