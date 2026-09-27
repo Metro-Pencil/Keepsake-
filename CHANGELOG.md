@@ -6,6 +6,47 @@ All notable changes to this project are recorded here, following
 small — gets a version bump. If the version number hasn't moved,
 nothing changed; that's the whole point of keeping one.
 
+## v1.1.0 — 2026-09-27
+
+- **Autosave.** While a note is open, changes are cached locally (IndexedDB)
+  about once a second and synced to the server in the background a couple
+  of seconds after you pause typing, with a periodic safety net during a
+  long unbroken typing session. If a session ever ends abruptly — crash,
+  dead battery, a swiped-away tab — before a change reached the server,
+  reopening that note (or relaunching the app) offers to restore it.
+- **Save and closing the editor (✕/Escape) are now instant.** They close
+  the editor right away and finish the actual encrypt/upload in the
+  background instead of blocking on it. Progress for that background save
+  — and for adding photos — now shows in a status strip fixed to the very
+  top of the page, above everything else, so it's always visible instead
+  of hidden behind the editor. This is also the fix for the photo-upload
+  progress bar not showing up: it used to live inside the editor's
+  scrolling area, where a stretched, empty textarea (or the on-screen
+  keyboard) could push it out of view.
+- Because closing now always triggers a save if anything changed, the
+  "Discard this note?" prompt from v1.0.4 is gone — there's essentially
+  nothing left to discard.
+- **Fixed the root cause of duplicate notes**, not just the double-tap
+  case from v1.0.4. A note's id is now generated on the device the moment
+  you start editing it, and saving is a single idempotent operation on
+  that id (see `worker.js`) — so a double-tap, autosave overlapping a
+  manual save, or retrying a save that looked like it failed can no longer
+  create a second note; each one just overwrites the same one.
+  **Requires redeploying the Worker** (`wrangler deploy`) — the frontend
+  alone doesn't ship this fix.
+- Removed the instructions for finding a time-locked note's second
+  password early (from the lock-setup screen and the "I have both
+  passwords" unlock dialog). The early-unlock feature itself is unchanged.
+- Saving or deleting a note updates the list immediately from the
+  response you already have, instead of re-fetching and rebuilding the
+  entire grid every time.
+- Added visible press feedback (and matching transitions) to every
+  button, card, and tab — including on touch, where the old :hover-only
+  states never fired at all. This is the main fix for taps feeling slow
+  or unresponsive.
+- Bumped the service worker's cache name so this update reaches everyone
+  already using the installed app.
+
 ## v1.0.4 — 2026-09-27
 
 - Added a progress bar in the editor for adding photos (shows "photo X of

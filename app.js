@@ -133,8 +133,12 @@ const API = {
 
   listNotes() { return this.request('/api/notes'); },
   getNote(id) { return this.request('/api/notes/' + id); },
-  createNote(payload, onProgress) { return this.requestWithProgress('/api/notes', 'POST', payload, onProgress); },
-  updateNote(id, payload, onProgress) { return this.requestWithProgress('/api/notes/' + id, 'PUT', payload, onProgress); },
+  // Always a PUT to a client-generated id — see worker.js's upsertNote.
+  // There's no separate "create" call anymore: a note's first save and
+  // every save after it go through the exact same idempotent path, so
+  // retrying a save that looked like it failed can never create a
+  // duplicate note — it just overwrites the same one.
+  saveNote(id, payload, onProgress) { return this.requestWithProgress('/api/notes/' + id, 'PUT', payload, onProgress); },
   deleteNote(id) { return this.request('/api/notes/' + id, { method: 'DELETE' }); },
   getVault(id) { return this.request('/api/notes/' + id + '/vault'); },
   exportNote(id) { return this.request('/api/notes/' + id + '/export'); },
@@ -181,6 +185,85 @@ function estimateContentBytes() {
   let total = title.length + body.length;
   for (const src of editorImages) total += src.length * 0.75; // base64 -> raw bytes, roughly
   return total;
+}
+
+/* ---------------------------------------------------------------------
+ * Local draft cache — IndexedDB, not localStorage
+ *
+ * A note with a few photos can easily be tens of MB, well past
+ * localStorage's ~5MB quota, so drafts live in IndexedDB instead. This is
+ * a same-device safety net for an *abrupt* close only (crash, dead
+ * battery, a swiped-away tab) — anything gentler than that is already
+ * covered by the background server sync further down this file. Every
+ * draft is cleared the moment its content actually reaches the server.
+ * ------------------------------------------------------------------- */
+
+const DRAFT_DB_NAME = 'keepsake-drafts';
+const DRAFT_STORE = 'drafts';
+
+function openDraftDB() {
+  return new Promise((resolve, reject) => {
+    if (!window.indexedDB) { reject(new Error('IndexedDB unavailable')); return; }
+    const req = indexedDB.open(DRAFT_DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(DRAFT_STORE)) {
+        req.result.createObjectStore(DRAFT_STORE, { keyPath: 'id' });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function saveLocalDraft(id, title, body, images) {
+  if (!id) return;
+  try {
+    const db = await openDraftDB();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(DRAFT_STORE, 'readwrite');
+      tx.objectStore(DRAFT_STORE).put({ id, title, body, images, savedAt: Date.now() });
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (e) {
+    // Best-effort only — local caching should never interrupt the editor.
+  }
+}
+
+async function loadLocalDraft(id) {
+  try {
+    const db = await openDraftDB();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(DRAFT_STORE, 'readonly');
+      const req = tx.objectStore(DRAFT_STORE).get(id);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+  } catch (e) { return null; }
+}
+
+async function clearLocalDraft(id) {
+  if (!id) return;
+  try {
+    const db = await openDraftDB();
+    const tx = db.transaction(DRAFT_STORE, 'readwrite');
+    tx.objectStore(DRAFT_STORE).delete(id);
+  } catch (e) {
+    // Worst case an orphaned draft lingers and gets offered for recovery
+    // again later, which is harmless.
+  }
+}
+
+async function listLocalDraftIds() {
+  try {
+    const db = await openDraftDB();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(DRAFT_STORE, 'readonly');
+      const req = tx.objectStore(DRAFT_STORE).getAllKeys();
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error);
+    });
+  } catch (e) { return []; }
 }
 
 /* ---------------------------------------------------------------------
@@ -239,14 +322,58 @@ function toast(msg) {
 function show(id) { document.getElementById(id).classList.remove('hidden'); }
 function hide(id) { document.getElementById(id).classList.add('hidden'); }
 
-function setEditorProgress(label, fraction) {
-  document.getElementById('editor-progress').classList.remove('hidden');
-  document.getElementById('editor-progress-label').textContent = label;
-  document.getElementById('editor-progress-fill').style.width =
-    (Math.max(0, Math.min(1, fraction)) * 100) + '%';
+/* ---------------------------------------------------------------------
+ * Sync bar — one status strip used for every kind of background progress:
+ * autosave, the background upload after Save/close, and client-side photo
+ * processing. Centralizing it here (rather than a bar inside the editor)
+ * is what keeps it visible no matter what's on screen — it can't end up
+ * scrolled below a stretched textarea or hidden behind a full-screen
+ * overlay, which is what made the old photo-upload progress bar invisible.
+ * ------------------------------------------------------------------- */
+
+let syncBarHideTimer = null;
+
+function syncBarSet(label, fraction /* number 0..1, or null for indeterminate */) {
+  clearTimeout(syncBarHideTimer);
+  const bar = document.getElementById('sync-bar');
+  bar.classList.remove('error');
+  bar.classList.add('show');
+  document.getElementById('sync-bar-label').textContent = label;
+  document.getElementById('sync-bar-retry').classList.add('hidden');
+  const track = document.getElementById('sync-bar-track');
+  const fill = document.getElementById('sync-bar-fill');
+  if (fraction == null) {
+    track.classList.add('indeterminate');
+  } else {
+    track.classList.remove('indeterminate');
+    fill.style.width = (Math.max(0, Math.min(1, fraction)) * 100) + '%';
+  }
 }
-function hideEditorProgress() {
-  document.getElementById('editor-progress').classList.add('hidden');
+
+function syncBarHideSoon(delay = 1100) {
+  clearTimeout(syncBarHideTimer);
+  syncBarHideTimer = setTimeout(() => {
+    document.getElementById('sync-bar').classList.remove('show');
+  }, delay);
+}
+
+function syncBarSuccess(label = 'Saved') {
+  syncBarSet(label, 1);
+  syncBarHideSoon();
+}
+
+function syncBarError(label, onRetry) {
+  clearTimeout(syncBarHideTimer);
+  const bar = document.getElementById('sync-bar');
+  bar.classList.add('show', 'error');
+  document.getElementById('sync-bar-label').textContent = label;
+  const retryBtn = document.getElementById('sync-bar-retry');
+  // Rebuilt fresh each time so repeated failures never stack up duplicate
+  // click listeners on the same button.
+  const freshRetry = retryBtn.cloneNode(true);
+  freshRetry.classList.remove('hidden');
+  retryBtn.parentNode.replaceChild(freshRetry, retryBtn);
+  freshRetry.addEventListener('click', () => { bar.classList.remove('error'); onRetry(); });
 }
 
 /* ---------------------------------------------------------------------
@@ -264,12 +391,26 @@ const trashGlyph = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" s
 let notesCache = [];
 let notesLoaded = false;         // becomes true after the first successful list fetch
 let currentView = 'notes';
-let editingNoteId = null;
+let editingNoteId = null;        // generated client-side the moment the editor opens — see openEditorWithContent
+let noteExistsOnServer = false;  // false until this note's first background save actually succeeds
 let editorImages = [];
-let editorSnapshot = '';         // JSON snapshot taken when the editor opens, to detect unsaved changes
-let saveInFlight = false;        // guards against double-submitting (e.g. a fast double-tap on Save)
 let pendingLock = null;          // { type: 'quick'|'time', password?, password2?, unlockAt?, existing? }
 let currentUnlockCreds = null;   // { password, password2? } — kept only for this editing session
+
+// Autosave for whichever note is currently open: a throttled local cache
+// (~1s, IndexedDB) plus a debounced background sync to the server, with a
+// periodic safety net so a long unbroken typing session still reaches the
+// server every so often instead of waiting indefinitely for a pause.
+let lastAutosavedJSON = null;    // snapshot key already saved (or in flight) for the open note
+let localDraftThrottle = null;
+let serverSyncDebounce = null;
+let serverSyncSafetyInterval = null;
+
+// Per-note in-flight/queued sync state, keyed by note id — deliberately a
+// Map rather than one flag, because a background save for a note you just
+// closed can still be running while you open and start editing a
+// *different* note; keying by id is what stops the two from colliding.
+const syncStateByNote = new Map(); // id -> { inFlight: bool, queued: snapshot|null }
 
 /* ---------------------------------------------------------------------
  * Rendering
@@ -334,6 +475,16 @@ function renderLocked() {
 // Locked cards show a live countdown — cheap to just re-render locked view periodically.
 setInterval(() => { if (notesCache.some((m) => m.lockType === 'time')) renderLocked(); }, 60000);
 
+// Patches a single note's meta into the cache and re-renders, instead of
+// re-fetching and rebuilding the whole grid after every save. This is what
+// makes a save actually feel instant in the list, not just in the editor.
+function patchNoteInCache(meta) {
+  const idx = notesCache.findIndex((m) => m.id === meta.id);
+  if (idx === -1) notesCache.unshift(meta); else notesCache[idx] = meta;
+  renderNotes();
+  renderLocked();
+}
+
 async function refreshNotes() {
   if (!notesLoaded) {
     const loading = emptyStateHTML('Loading…', 'Fetching your notes.');
@@ -379,6 +530,7 @@ function renderEditorThumbs() {
     btn.addEventListener('click', () => {
       editorImages.splice(Number(btn.dataset.idx), 1);
       renderEditorThumbs();
+      onEditorContentChanged();
     });
   });
 }
@@ -403,120 +555,320 @@ function computeEditorSnapshot() {
   });
 }
 
-function editorHasUnsavedChanges() {
-  return computeEditorSnapshot() !== editorSnapshot;
+function noteHasContent() {
+  const title = document.getElementById('editor-title').value.trim();
+  const body = document.getElementById('editor-body').value;
+  return !!(title || body || editorImages.length);
 }
 
 function openEditorWithContent(meta, content) {
-  editingNoteId = meta && meta.id ? meta.id : null;
-  document.getElementById('editor-heading').textContent = editingNoteId ? 'Edit note' : 'New note';
+  const isExisting = !!(meta && meta.id);
+  // A fresh note gets its id right now, up front, rather than whenever it
+  // first gets saved. Every save — the Save button, autosave, a retry —
+  // then PUTs to this same id, which is what makes them all idempotent:
+  // there's no "create" request that a double-tap or a network retry
+  // could ever fire twice into two different notes.
+  editingNoteId = isExisting ? meta.id : crypto.randomUUID();
+  noteExistsOnServer = isExisting;
+  stopAutosaveTimers();
+
+  document.getElementById('editor-heading').textContent = isExisting ? 'Edit note' : 'New note';
   document.getElementById('editor-title').value = content.title || '';
   document.getElementById('editor-body').value = content.body || '';
   editorImages = (content.images || []).slice();
   renderEditorThumbs();
-  hideEditorProgress();
-  document.getElementById('btn-delete-note').style.display = editingNoteId ? '' : 'none';
+  document.getElementById('btn-delete-note').style.display = noteExistsOnServer ? '' : 'none';
 
   pendingLock = (meta && meta.lockType && meta.lockType !== 'none')
     ? { type: meta.lockType, unlockAt: meta.unlockAt, existing: true }
     : null;
   renderLockSummary();
-  editorSnapshot = computeEditorSnapshot();
+  lastAutosavedJSON = computeEditorSnapshot();
   show('overlay-editor');
   document.getElementById('editor-title').focus();
+
+  // If an earlier session ended abruptly (crash, dead battery, a
+  // swiped-away tab) before its background save could finish, offer to
+  // bring those changes back rather than silently showing the older,
+  // already-saved version underneath them.
+  maybeOfferDraftRestore(editingNoteId, content);
 }
 
-function attemptCloseEditor() {
-  if (editorHasUnsavedChanges()) {
-    openConfirm(
-      'Discard this note?',
-      'Your changes haven\u2019t been saved.',
-      async () => { hide('overlay-editor'); },
-      'Discard'
-    );
-  } else {
-    hide('overlay-editor');
+async function maybeOfferDraftRestore(noteId, serverContent) {
+  const draft = await loadLocalDraft(noteId);
+  if (!draft) return;
+  const draftKey = JSON.stringify({ title: draft.title || '', body: draft.body || '', images: draft.images || [] });
+  const serverKey = JSON.stringify({
+    title: serverContent.title || '', body: serverContent.body || '', images: serverContent.images || [],
+  });
+  if (draftKey === serverKey) { clearLocalDraft(noteId); return; }
+  if (editingNoteId !== noteId) return; // the user has already moved on
+
+  openConfirm(
+    'Restore unsaved draft?',
+    'This note has changes from an earlier session that never made it to the server. Restore them?',
+    async () => {
+      if (editingNoteId !== noteId) return;
+      document.getElementById('editor-title').value = draft.title || '';
+      document.getElementById('editor-body').value = draft.body || '';
+      editorImages = (draft.images || []).slice();
+      renderEditorThumbs();
+      onEditorContentChanged();
+      toast('Draft restored');
+    },
+    'Restore'
+  );
+}
+
+/* ---------------------------------------------------------------------
+ * Save payload building — shared by the Save button, autosave, and retries
+ * ------------------------------------------------------------------- */
+
+// Resolves pendingLock (plus any unlock-session password) into a plain,
+// self-contained description with the actual password strings baked in.
+// Doing this synchronously, the moment a save is triggered, means the
+// result can be safely used by an async save later even if the user has
+// since closed this note and opened a different one — it no longer
+// depends on any live, mutable state.
+function resolveLockForSnapshot() {
+  if (!pendingLock || pendingLock.type === 'none') return null;
+  const password = pendingLock.password || (currentUnlockCreds && currentUnlockCreds.password) || null;
+  if (pendingLock.type === 'quick') {
+    return { type: 'quick', password };
+  }
+  if (pendingLock.type === 'time') {
+    let password2 = pendingLock.password2 || (currentUnlockCreds && currentUnlockCreds.password2) || null;
+    if (!password2) {
+      // Generated once and cached on pendingLock so a later autosave tick
+      // (or a retry) reuses this exact value instead of silently rotating
+      // it out from under a copy the note owner may already have.
+      password2 = generateSecondPassword();
+      pendingLock.password2 = password2;
+    }
+    return { type: 'time', password, password2, unlockAt: pendingLock.unlockAt };
+  }
+  return null;
+}
+
+function captureSnapshot() {
+  return {
+    title: document.getElementById('editor-title').value.trim(),
+    body: document.getElementById('editor-body').value,
+    images: editorImages.slice(),
+    lock: resolveLockForSnapshot(),
+  };
+}
+
+async function buildSavePayload(snapshot) {
+  const { title, body, images, lock } = snapshot;
+  const content = { title, body, images };
+  let payload;
+
+  if (!lock || lock.type === 'none') {
+    payload = { lockType: 'none', title, preview: makePreview(body), content };
+  } else if (lock.type === 'quick') {
+    if (!lock.password) throw new Error('missing password for quick lock');
+    const record = await encryptNote(lock.password, content);
+    payload = { lockType: 'quick', content: record };
+  } else if (lock.type === 'time') {
+    if (!lock.password) throw new Error('missing password for time lock');
+    const record = await encryptNote(combine(lock.password, lock.password2), content);
+    payload = { lockType: 'time', unlockAt: lock.unlockAt, password2: lock.password2, content: record };
+  }
+
+  return { payload, hasImages: images.length > 0 };
+}
+
+/* ---------------------------------------------------------------------
+ * Background save — used by both the Save button and autosave. Always a
+ * PUT to a note id generated client-side (see worker.js's upsertNote), so
+ * it's idempotent: saving the same content twice — a double-tap, a
+ * retried request after a flaky connection, autosave racing the Save
+ * button — just overwrites the same note instead of ever creating a
+ * duplicate.
+ * ------------------------------------------------------------------- */
+
+function runSync(noteId, snapshot) {
+  let state = syncStateByNote.get(noteId);
+  if (!state) { state = { inFlight: false, queued: null }; syncStateByNote.set(noteId, state); }
+
+  if (state.inFlight) {
+    state.queued = snapshot; // latest wins — no point sending a stale mid-typing snapshot
+    return;
+  }
+  state.inFlight = true;
+  syncRunOne(noteId, snapshot, state);
+}
+
+async function syncRunOne(noteId, snapshot, state) {
+  // Only the note currently open in the editor (or just closed from it)
+  // gets to talk in the sync bar — a background save finishing for some
+  // *other* note shouldn't interrupt whatever the person is looking at now.
+  const showInBar = () => noteId === editingNoteId;
+
+  let built;
+  try {
+    built = await buildSavePayload(snapshot);
+  } catch (e) {
+    state.inFlight = false;
+    toast('Could not lock note — try setting the lock again.');
+    if (showInBar()) syncBarError('Couldn\u2019t save — check the lock', () => runSync(noteId, snapshot));
+    maybeContinueQueued(noteId, state);
+    return;
+  }
+
+  const { payload, hasImages } = built;
+  const onProgress = hasImages && showInBar()
+    ? (fraction) => syncBarSet(`Saving photos… ${Math.round(fraction * 100)}%`, fraction)
+    : null;
+  if (showInBar()) syncBarSet(hasImages ? 'Saving photos… 0%' : 'Saving…', hasImages ? 0 : null);
+
+  try {
+    const { note } = await API.saveNote(noteId, payload, onProgress);
+    if (noteId === editingNoteId) {
+      noteExistsOnServer = true;
+      document.getElementById('btn-delete-note').style.display = '';
+      document.getElementById('editor-heading').textContent = 'Edit note';
+      lastAutosavedJSON = JSON.stringify(snapshot);
+    }
+    clearLocalDraft(noteId);
+    patchNoteInCache(note);
+    if (showInBar()) syncBarSuccess('Saved');
+  } catch (e) {
+    if (showInBar()) {
+      syncBarError('Couldn\u2019t save — tap to retry', () => runSync(noteId, snapshot));
+    } else {
+      toast('Couldn\u2019t save "' + (snapshot.title || 'Untitled') + '" — it\u2019s still cached on this device.');
+    }
+  } finally {
+    state.inFlight = false;
+    maybeContinueQueued(noteId, state);
   }
 }
 
-async function saveNote() {
-  if (saveInFlight) return; // already saving — ignore a fast double-tap on Save
-  const title = document.getElementById('editor-title').value.trim();
-  const body = document.getElementById('editor-body').value;
-  if (!title && !body && editorImages.length === 0) { toast('Nothing to save'); return; }
+function maybeContinueQueued(noteId, state) {
+  if (state.queued) {
+    const next = state.queued;
+    state.queued = null;
+    state.inFlight = true;
+    syncRunOne(noteId, next, state);
+  }
+}
 
-  if (estimateContentBytes() > NOTE_SIZE_LIMIT) {
+/* ---------------------------------------------------------------------
+ * Autosave scheduling — local cache is aggressive (~1s) since it's free
+ * and instant; the server sync is debounced so ordinary typing doesn't
+ * hit the Worker on every keystroke, with a periodic safety net so a long
+ * unbroken typing session still gets flushed to the server periodically
+ * rather than waiting indefinitely for a pause.
+ * ------------------------------------------------------------------- */
+
+function onEditorContentChanged() {
+  if (!editingNoteId) return;
+
+  if (!localDraftThrottle) {
+    localDraftThrottle = setTimeout(() => {
+      localDraftThrottle = null;
+      if (noteHasContent()) {
+        saveLocalDraft(
+          editingNoteId,
+          document.getElementById('editor-title').value,
+          document.getElementById('editor-body').value,
+          editorImages.slice()
+        );
+      }
+    }, 1000);
+  }
+
+  clearTimeout(serverSyncDebounce);
+  serverSyncDebounce = setTimeout(triggerAutosave, 2000);
+
+  if (!serverSyncSafetyInterval) {
+    serverSyncSafetyInterval = setInterval(triggerAutosave, 15000);
+  }
+}
+
+function triggerAutosave() {
+  if (!editingNoteId || !noteHasContent()) return;
+  const snapshot = captureSnapshot();
+  const key = JSON.stringify(snapshot);
+  if (key === lastAutosavedJSON) return; // nothing's changed since the last successful save
+  runSync(editingNoteId, snapshot);
+}
+
+function stopAutosaveTimers() {
+  clearTimeout(localDraftThrottle); localDraftThrottle = null;
+  clearTimeout(serverSyncDebounce); serverSyncDebounce = null;
+  clearInterval(serverSyncSafetyInterval); serverSyncSafetyInterval = null;
+}
+
+/* ---------------------------------------------------------------------
+ * Closing the editor — Save and the ✕/Escape close path do the same
+ * thing: hand off to the background and close immediately, so the app
+ * never sits there with a spinner while a photo uploads. There's no
+ * separate "discard changes?" prompt anymore, because with autosave
+ * running there's essentially never anything un-cached to lose — closing
+ * just triggers one final sync of whatever's changed in the last moment.
+ * ------------------------------------------------------------------- */
+
+function closeEditorAndSync(isExplicitSave) {
+  const noteId = editingNoteId;
+  const overLimit = estimateContentBytes() > NOTE_SIZE_LIMIT;
+
+  if (overLimit && isExplicitSave) {
     toast('This note is over the 25MB limit — remove a photo before saving.');
     return;
   }
 
-  saveInFlight = true;
-  const saveBtn = document.getElementById('btn-save-note');
-  const originalLabel = saveBtn.textContent;
-  saveBtn.disabled = true;
-  saveBtn.textContent = 'Saving…';
+  stopAutosaveTimers();
 
-  const content = { title, body, images: editorImages };
-  let payload;
-
-  try {
-    if (!pendingLock || pendingLock.type === 'none') {
-      payload = { lockType: 'none', title, preview: makePreview(body), content };
-    } else if (pendingLock.type === 'quick') {
-      const password = pendingLock.password || (currentUnlockCreds && currentUnlockCreds.password);
-      if (!password) throw new Error('missing password for quick lock');
-      const record = await encryptNote(password, content);
-      payload = { lockType: 'quick', content: record };
-    } else if (pendingLock.type === 'time') {
-      const password = pendingLock.password || (currentUnlockCreds && currentUnlockCreds.password);
-      let password2 = pendingLock.password2 || (currentUnlockCreds && currentUnlockCreds.password2);
-      if (!password) throw new Error('missing password for time lock');
-      if (!password2) password2 = generateSecondPassword();
-      const record = await encryptNote(combine(password, password2), content);
-      payload = { lockType: 'time', unlockAt: pendingLock.unlockAt, password2, content: record };
-    }
-  } catch (e) {
-    toast('Could not lock note — try setting the lock again.');
-    saveInFlight = false;
-    saveBtn.disabled = false;
-    saveBtn.textContent = originalLabel;
+  if (!noteHasContent()) {
+    clearLocalDraft(noteId);
+    hide('overlay-editor');
+    currentUnlockCreds = null;
     return;
   }
 
-  const hasImages = editorImages.length > 0;
-  const onProgress = hasImages
-    ? (fraction) => setEditorProgress(`Uploading photos… ${Math.round(fraction * 100)}%`, fraction)
-    : null;
-  if (hasImages) setEditorProgress('Uploading photos… 0%', 0);
-
-  try {
-    if (editingNoteId) {
-      await API.updateNote(editingNoteId, payload, onProgress);
-    } else {
-      await API.createNote(payload, onProgress);
-    }
-    toast('Saved');
+  if (overLimit) {
+    // Closing (not explicitly saving) with an oversized note: the local
+    // draft cache already has it, so nothing is lost — just skip sending a
+    // request to the server that KV would reject anyway.
     hide('overlay-editor');
     currentUnlockCreds = null;
-    await refreshNotes();
-  } catch (e) {
-    toast('Could not save: ' + e.message);
-  } finally {
-    saveInFlight = false;
-    saveBtn.disabled = false;
-    saveBtn.textContent = originalLabel;
-    hideEditorProgress();
+    toast('Kept on this device only — this note is over the 25MB limit. Remove a photo to sync it.');
+    return;
   }
+
+  const snapshot = captureSnapshot();
+  const key = JSON.stringify(snapshot);
+  hide('overlay-editor'); // instant — the real work continues below, in the background
+  currentUnlockCreds = null;
+
+  if (key === lastAutosavedJSON) return; // autosave already has this exact version covered
+  runSync(noteId, snapshot);
 }
+
+function saveNote() { closeEditorAndSync(true); }
+function attemptCloseEditor() { closeEditorAndSync(false); }
 
 function confirmDelete(id, fromEditor) {
   openConfirm('Delete this note?', 'This can\u2019t be undone.', async () => {
+    // Optimistic: drop it from the list immediately rather than waiting on
+    // a full refetch, then reconcile quietly if the request turns out to
+    // have failed.
+    const previous = notesCache;
+    notesCache = notesCache.filter((m) => m.id !== id);
+    renderNotes();
+    renderLocked();
+    clearLocalDraft(id);
+    if (fromEditor) hide('overlay-editor');
     try {
       await API.deleteNote(id);
       toast('Deleted');
-      if (fromEditor) hide('overlay-editor');
-      await refreshNotes();
     } catch (e) {
+      notesCache = previous;
+      renderNotes();
+      renderLocked();
       toast('Could not delete: ' + e.message);
     }
   });
@@ -628,7 +980,6 @@ function openUnlockFlow(meta) {
       <div class="field">
         <label for="unlock-password2">Password 2</label>
         <input type="password" id="unlock-password2" autocomplete="off">
-        <p class="hint">Found inside this note's downloaded file. Use the download button on its card if you need to fetch it again.</p>
       </div>
       <p class="field error" id="unlock-error" style="display:none;"></p>
       <button class="btn btn-primary" id="btn-do-unlock">Open early</button>
@@ -721,7 +1072,7 @@ function openConfirm(title, message, onYes, yesLabel = 'Delete') {
 function openSettings() {
   document.getElementById('settings-api-base').value = Config.base();
   document.getElementById('settings-token').value = Config.token();
-  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.0.4';
+  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.1.0';
   show('overlay-settings');
 }
 
@@ -825,6 +1176,9 @@ function wireStaticEvents() {
     if (editingNoteId) confirmDelete(editingNoteId, true);
   });
 
+  document.getElementById('editor-title').addEventListener('input', onEditorContentChanged);
+  document.getElementById('editor-body').addEventListener('input', onEditorContentChanged);
+
   document.getElementById('btn-attach-image').addEventListener('click', () => {
     document.getElementById('input-image').click();
   });
@@ -837,18 +1191,19 @@ function wireStaticEvents() {
     let failed = 0;
 
     for (let i = 0; i < files.length; i++) {
-      setEditorProgress(`Adding photo ${i + 1} of ${files.length}…`, i / files.length);
+      syncBarSet(`Adding photo ${i + 1} of ${files.length}…`, i / files.length);
       try {
         const dataUrl = await fileToCompressedDataURL(files[i]);
         editorImages.push(dataUrl);
         renderEditorThumbs(); // show each photo as soon as it's ready, not all at once at the end
+        onEditorContentChanged();
       } catch (err) {
         failed++;
       }
-      setEditorProgress(`Adding photo ${i + 1} of ${files.length}…`, (i + 1) / files.length);
+      syncBarSet(`Adding photo ${i + 1} of ${files.length}…`, (i + 1) / files.length);
     }
 
-    hideEditorProgress();
+    syncBarHideSoon(700);
     attachBtn.disabled = false;
     e.target.value = '';
 
@@ -884,6 +1239,7 @@ function wireStaticEvents() {
     pendingLock = { type: 'quick', password: pw, existing: false };
     hide('overlay-lock-chooser');
     renderLockSummary();
+    onEditorContentChanged();
   });
 
   document.getElementById('btn-confirm-time-lock').addEventListener('click', () => {
@@ -899,12 +1255,55 @@ function wireStaticEvents() {
     pendingLock = { type: 'time', password: pw, unlockAt, existing: false };
     hide('overlay-lock-chooser');
     renderLockSummary();
+    onEditorContentChanged();
   });
 
   document.getElementById('btn-remove-lock').addEventListener('click', () => {
     pendingLock = null;
     renderLockSummary();
+    onEditorContentChanged();
   });
+}
+
+/* ---------------------------------------------------------------------
+ * Init
+ * ------------------------------------------------------------------- */
+
+/* ---------------------------------------------------------------------
+ * Draft recovery banner — surfaces a local draft that never made it to
+ * the server (an abrupt close mid-typing, before the ~1s local cache even
+ * had a version the last successful save doesn't already cover).
+ * ------------------------------------------------------------------- */
+
+async function checkForRecoverableDrafts() {
+  const ids = await listLocalDraftIds();
+  if (!ids.length) return;
+  const id = ids[0]; // surface one at a time; picking another note re-checks
+  const draft = await loadLocalDraft(id);
+  if (!draft) return;
+
+  const banner = document.getElementById('draft-banner');
+  const label = draft.title ? `"${draft.title}"` : 'a note';
+  document.getElementById('draft-banner-text').textContent =
+    `You have unsaved changes to ${label} from an earlier session.`;
+  banner.classList.remove('hidden');
+
+  document.getElementById('draft-banner-resume').onclick = () => {
+    banner.classList.add('hidden');
+    const meta = notesCache.find((m) => m.id === id) || null;
+    openEditorWithContent(meta, { title: draft.title, body: draft.body, images: draft.images || [] });
+    // If the note this draft belonged to no longer exists server-side,
+    // openEditorWithContent treats it as a new note under a new id — so
+    // this old entry is now orphaned and needs clearing explicitly, or
+    // it would keep getting offered again on every future launch. (If the
+    // note *does* still exist, openEditorWithContent reuses this exact id
+    // and clears it the normal way once the restore is confirmed.)
+    if (!meta) clearLocalDraft(id);
+  };
+  document.getElementById('draft-banner-dismiss').onclick = async () => {
+    banner.classList.add('hidden');
+    await clearLocalDraft(id);
+  };
 }
 
 /* ---------------------------------------------------------------------
@@ -913,13 +1312,13 @@ function wireStaticEvents() {
 
 function init() {
   wireStaticEvents();
-  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.0.4');
+  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.1.0');
 
   if (!Config.configured()) {
     openSettings();
     toast('Add your Worker URL and access token to get started');
   } else {
-    refreshNotes();
+    refreshNotes().then(checkForRecoverableDrafts);
   }
 
   if ('serviceWorker' in navigator) {

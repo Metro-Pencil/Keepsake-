@@ -49,6 +49,21 @@
 
   a, button, input, textarea { font-family: inherit; }
 
+  /* Every tappable control gets an immediate :active response (scale/opacity)
+     so a tap *reads* as instant even while the real work is still happening
+     in the background — the perceived-speed fix that matters most on touch,
+     where :hover never fires at all. -webkit-tap-highlight-color is turned
+     off so it doesn't fight with these custom states. */
+  button, a, .card-open, [role="tab"], [role="button"] {
+    -webkit-tap-highlight-color: transparent;
+    transition: background-color 0.12s ease, color 0.12s ease,
+      border-color 0.12s ease, opacity 0.12s ease, transform 0.08s ease;
+  }
+
+  button:active, [role="button"]:active {
+    transform: scale(0.96);
+  }
+
   button {
     cursor: pointer;
     border: none;
@@ -67,6 +82,115 @@
     overflow: hidden;
     clip: rect(0,0,0,0);
   }
+
+  /* ---------- Sync bar ----------
+     A single strip fixed to the very top of the viewport, above the header
+     AND above the full-screen editor (z-index 300 beats both), so save /
+     autosave / photo-processing progress is never hidden behind the editor
+     or scrolled out of view below a stretched textarea — wherever a save is
+     actually happening, this is always on top of it. */
+
+  .sync-bar {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    z-index: 300;
+    background: var(--card);
+    border-bottom: 1px solid var(--line);
+    box-shadow: var(--shadow);
+    transform: translateY(-100%);
+    transition: transform 0.22s ease;
+    padding-top: env(safe-area-inset-top, 0px);
+  }
+
+  .sync-bar.show { transform: translateY(0); }
+  .sync-bar.error { background: var(--amber-bg); border-bottom-color: #e6d3ae; }
+
+  .sync-bar-inner {
+    max-width: 980px;
+    margin: 0 auto;
+    padding: 8px 20px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 12.5px;
+    font-weight: 500;
+    color: var(--ink-soft);
+  }
+
+  .sync-bar.error .sync-bar-inner { color: var(--amber); }
+
+  .sync-bar-spin {
+    width: 12px; height: 12px;
+    flex-shrink: 0;
+    border-radius: 50%;
+    border: 2px solid var(--line);
+    border-top-color: var(--pine);
+    animation: sync-spin 0.7s linear infinite;
+  }
+
+  .sync-bar.error .sync-bar-spin { display: none; }
+
+  @keyframes sync-spin { to { transform: rotate(360deg); } }
+
+  .sync-bar-label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  .sync-bar-track {
+    flex: 1;
+    max-width: 180px;
+    height: 4px;
+    background: var(--line);
+    border-radius: 999px;
+    overflow: hidden;
+    position: relative;
+  }
+
+  .sync-bar-fill {
+    height: 100%;
+    width: 0%;
+    background: var(--pine);
+    border-radius: 999px;
+    transition: width 0.2s ease;
+  }
+
+  .sync-bar-track.indeterminate .sync-bar-fill {
+    width: 35% !important;
+    position: absolute;
+    animation: sync-indeterminate 1.1s ease-in-out infinite;
+  }
+
+  @keyframes sync-indeterminate {
+    0% { left: -35%; }
+    100% { left: 100%; }
+  }
+
+  .sync-bar-retry {
+    flex-shrink: 0;
+    font-size: 12.5px;
+    font-weight: 700;
+    color: var(--brick);
+    text-decoration: underline;
+  }
+
+  .sync-bar-retry.hidden { display: none; }
+
+  /* ---------- Draft recovery banner ---------- */
+
+  .draft-banner {
+    max-width: 620px;
+    margin: 0 auto 18px;
+    background: var(--amber-bg);
+    border: 1px solid #e6d3ae;
+    border-radius: var(--radius);
+    padding: 12px 14px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 13.5px;
+    color: var(--amber);
+  }
+
+  .draft-banner.hidden { display: none; }
+  .draft-banner span { flex: 1; line-height: 1.4; }
 
   /* ---------- Header ---------- */
 
@@ -137,6 +261,8 @@
     box-shadow: var(--shadow);
   }
 
+  .tabbar button:active { transform: scale(0.95); }
+
   .icon-btn {
     width: 38px;
     height: 38px;
@@ -148,6 +274,7 @@
   }
 
   .icon-btn:hover { background: var(--card-2); color: var(--ink); }
+  .icon-btn:active { background: var(--line); transform: scale(0.92); }
 
   .icon-btn svg { width: 19px; height: 19px; }
 
@@ -172,6 +299,7 @@
   }
 
   .composer:hover { border-color: #cfc9b6; }
+  .composer:active { transform: scale(0.99); border-color: #cfc9b6; }
 
   /* ---------- Grid ---------- */
 
@@ -194,10 +322,15 @@
     display: block;
     width: 100%;
     text-align: left;
+    transition: box-shadow 0.15s ease;
   }
 
   .card.type-quick { border-left-color: var(--violet); }
   .card.type-time { border-left-color: var(--amber); }
+
+  .card-open { cursor: pointer; }
+  .card:hover { box-shadow: 0 2px 4px rgba(35,36,31,0.08), 0 8px 20px rgba(35,36,31,0.09); }
+  .card-open:active { opacity: 0.72; }
 
   .card-title {
     font-family: var(--font-display);
@@ -491,30 +624,6 @@
     justify-content: center;
   }
 
-  .upload-progress { margin: 2px 0 10px; }
-  .upload-progress.hidden { display: none; }
-
-  .upload-progress-label {
-    font-size: 12.5px;
-    color: var(--ink-soft);
-    margin-bottom: 5px;
-  }
-
-  .upload-progress-track {
-    height: 6px;
-    background: var(--card-2);
-    border-radius: 999px;
-    overflow: hidden;
-  }
-
-  .upload-progress-fill {
-    height: 100%;
-    width: 0%;
-    background: var(--pine);
-    border-radius: 999px;
-    transition: width 0.15s ease;
-  }
-
   .icon-btn:disabled { opacity: 0.4; cursor: default; }
   .btn-ghost:disabled { opacity: 0.55; cursor: default; }
 
@@ -533,16 +642,20 @@
 
   .btn-primary { background: var(--pine); color: var(--card); }
   .btn-primary:hover { background: var(--pine-light); }
+  .btn-primary:active:not(:disabled) { background: #1A362F; transform: scale(0.97); }
   .btn-primary:disabled { opacity: 0.55; cursor: default; }
 
   .btn-ghost { background: var(--card-2); color: var(--ink); }
   .btn-ghost:hover { background: var(--line); }
+  .btn-ghost:active:not(:disabled) { background: #cfc9b6; transform: scale(0.97); }
 
   .btn-danger { background: none; color: var(--brick); }
   .btn-danger:hover { background: #F5E7E7; }
+  .btn-danger:active { background: #EBD5D5; transform: scale(0.97); }
 
   .btn-text { color: var(--ink-soft); font-size: 13.5px; font-weight: 500; padding: 6px 4px; }
   .btn-text:hover { color: var(--ink); }
+  .btn-text:active { opacity: 0.65; }
 
   .lock-choice-row {
     display: flex;
@@ -556,9 +669,11 @@
     border-radius: 12px;
     padding: 14px;
     text-align: left;
+    transition: border-color 0.12s ease, background-color 0.12s ease, transform 0.08s ease;
   }
 
   .lock-choice:hover { border-color: var(--pine-light); }
+  .lock-choice:active { transform: scale(0.98); }
   .lock-choice.selected { border-color: var(--pine); background: var(--card-2); }
 
   .lock-choice-title {
@@ -629,11 +744,23 @@
 </head>
 <body>
 
+<!-- Always-on-top status strip: background save / autosave / photo progress.
+     Fixed above the header AND the full-screen editor so it's never hidden
+     behind either one — see the .sync-bar rule for why. -->
+<div class="sync-bar" id="sync-bar" role="status" aria-live="polite">
+  <div class="sync-bar-inner">
+    <span class="sync-bar-spin" aria-hidden="true"></span>
+    <span class="sync-bar-label" id="sync-bar-label">Saved</span>
+    <div class="sync-bar-track" id="sync-bar-track"><div class="sync-bar-fill" id="sync-bar-fill"></div></div>
+    <button class="sync-bar-retry hidden" id="sync-bar-retry">Retry</button>
+  </div>
+</div>
+
 <header class="top">
   <div class="top-inner">
     <div class="brand">
       <span class="brand-mark">Keepsake</span>
-      <span class="version-badge" id="version-badge">v1.0.0</span>
+      <span class="version-badge" id="version-badge">v1.1.0</span>
     </div>
     <div class="tabbar" role="tablist" aria-label="Note views">
       <button role="tab" id="tab-notes" aria-selected="true">Notes</button>
@@ -646,6 +773,14 @@
 </header>
 
 <main>
+  <div class="draft-banner hidden" id="draft-banner">
+    <span id="draft-banner-text"></span>
+    <button class="btn-text" id="draft-banner-resume">Resume</button>
+    <button class="icon-btn" id="draft-banner-dismiss" aria-label="Dismiss">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" width="16" height="16"><path d="M18 6 6 18M6 6l12 12"/></svg>
+    </button>
+  </div>
+
   <button class="composer" id="btn-new-note">Write something…</button>
 
   <section class="grid" id="grid-notes" aria-label="Notes"></section>
@@ -666,10 +801,6 @@
     <input type="text" class="title-input" id="editor-title" placeholder="Title">
     <textarea id="editor-body" class="editor-textarea" placeholder="What's on your mind…"></textarea>
     <div class="thumb-row" id="editor-thumbs"></div>
-    <div class="upload-progress hidden" id="editor-progress">
-      <div class="upload-progress-label" id="editor-progress-label"></div>
-      <div class="upload-progress-track"><div class="upload-progress-fill" id="editor-progress-fill"></div></div>
-    </div>
   </div>
 
   <div class="editor-lock-status" id="editor-lock-summary"></div>
@@ -738,7 +869,7 @@
         <div class="field">
           <label for="time-unlock-at">Unlock at</label>
           <input type="datetime-local" id="time-unlock-at">
-          <p class="hint">A second, one-time password will also be generated and stored only inside this note's downloaded file — not shown here. After the date above, this note opens with just your password. Before then, downloading the note and looking up that second password lets you open it early.</p>
+          <p class="hint">A second, one-time password is also generated for this note and isn't shown to you. After the date above, this note opens with just your password.</p>
         </div>
         <p class="field error visually-hidden" id="time-lock-error"></p>
         <button class="btn btn-primary" id="btn-confirm-time-lock">Set time lock</button>
@@ -817,7 +948,7 @@
 <script>
 // Bump this on EVERY change to the app, no matter how small — a typo fix,
 // a copy tweak, whatever. See CHANGELOG.md for the policy and history.
-window.KEEPSAKE_VERSION = "1.0.4";
+window.KEEPSAKE_VERSION = "1.1.0";
 </script>
 <script src="app.js"></script>
 </body>

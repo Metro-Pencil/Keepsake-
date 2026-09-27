@@ -72,26 +72,19 @@ async function listNotes(env) {
   return notes;
 }
 
-async function handleCreate(request, env) {
-  const body = await request.json();
-  const id = crypto.randomUUID();
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Create and update now share one idempotent path: the id always comes from
+// the client (the frontend generates it once, up front, the moment a note
+// starts being edited), and saving twice with the same id is just a
+// second write to the same keys — never a second note. This is what makes
+// it safe for the frontend to retry a save that appeared to fail (flaky
+// connection, etc.) or to autosave in the background without any risk of
+// duplicate notes, regardless of how many times "save" fires.
+async function upsertNote(env, id, body) {
   const now = Date.now();
-  const meta = metaFromBody(null, { ...body, id }, now);
-
-  await env.NOTES_KV.put(`content:${id}`, JSON.stringify(body.content));
-  await env.NOTES_KV.put(`meta:${id}`, JSON.stringify(meta));
-
-  if (meta.lockType === 'time' && body.password2) {
-    await env.NOTES_KV.put(`vault:${id}`, body.password2);
-  }
-
-  return json({ note: meta }, 201);
-}
-
-async function handleUpdate(request, env, id, existingMeta) {
-  const body = await request.json();
-  const now = Date.now();
-  const meta = metaFromBody(existingMeta, body, now);
+  const existing = await readMeta(env, id);
+  const meta = metaFromBody(existing, { ...body, id }, now);
 
   await env.NOTES_KV.put(`content:${id}`, JSON.stringify(body.content));
   await env.NOTES_KV.put(`meta:${id}`, JSON.stringify(meta));
@@ -102,7 +95,18 @@ async function handleUpdate(request, env, id, existingMeta) {
     await env.NOTES_KV.delete(`vault:${id}`);
   }
 
-  return json({ note: meta });
+  return json({ note: meta }, existing ? 200 : 201);
+}
+
+async function handleCreate(request, env) {
+  const body = await request.json();
+  const id = typeof body.id === 'string' && UUID_RE.test(body.id) ? body.id : crypto.randomUUID();
+  return upsertNote(env, id, body);
+}
+
+async function handleUpdate(request, env, id) {
+  const body = await request.json();
+  return upsertNote(env, id, body);
 }
 
 async function handleDelete(env, id) {
@@ -174,15 +178,22 @@ export default {
         return errorResponse('Method not allowed', 405);
       }
 
-      const meta = await readMeta(env, id);
-      if (!meta) return errorResponse('Not found', 404);
-
       if (!sub) {
+        // PUT is an upsert — it doesn't need the note to already exist, so
+        // it's the one method that skips the readMeta/404 check below. This
+        // is what lets the frontend always PUT to an id it generated itself,
+        // whether this is the note's first save or its fiftieth.
+        if (request.method === 'PUT') return handleUpdate(request, env, id);
+
+        const meta = await readMeta(env, id);
+        if (!meta) return errorResponse('Not found', 404);
         if (request.method === 'GET') return handleGetOne(env, id, meta);
-        if (request.method === 'PUT') return handleUpdate(request, env, id, meta);
         if (request.method === 'DELETE') return handleDelete(env, id);
         return errorResponse('Method not allowed', 405);
       }
+
+      const meta = await readMeta(env, id);
+      if (!meta) return errorResponse('Not found', 404);
 
       if (sub === 'vault' && request.method === 'GET') return handleVault(env, id, meta);
       if (sub === 'export' && request.method === 'GET') return handleExport(env, id, meta);
