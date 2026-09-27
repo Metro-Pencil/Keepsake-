@@ -1225,10 +1225,21 @@ function openConfirm(title, message, onYes, yesLabel = 'Delete') {
  * Settings
  * ------------------------------------------------------------------- */
 
+// Mirrors sw.js's SHELL_FILES — kept as a separate list because sw.js runs
+// in its own worker scope and can't be imported from here. Keep the two in
+// sync if the shell's file list ever changes.
+const FORCE_REFRESH_SHELL_FILES = [
+  './index.html',
+  './app.js',
+  './manifest.json',
+  './icon-192.png',
+  './icon-512.png',
+];
+
 function openSettings() {
   document.getElementById('settings-api-base').value = Config.base();
   document.getElementById('settings-token').value = Config.token();
-  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.2.0';
+  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.2.1';
   show('overlay-settings');
 }
 
@@ -1250,6 +1261,16 @@ async function forceRefresh() {
       const keys = await caches.keys();
       await Promise.all(keys.map((k) => caches.delete(k)));
     }
+    // The two steps above only clear the Service Worker's own Cache
+    // Storage — a separate layer from the browser's plain HTTP cache,
+    // which can still serve an old app.js with no network request at
+    // all. Re-fetching every shell file with `cache: 'reload'` forces a
+    // real round trip and overwrites that HTTP cache entry, so the
+    // reload below loads current code, not just an updated version
+    // number in index.html.
+    await Promise.all(FORCE_REFRESH_SHELL_FILES.map((f) =>
+      fetch(f, { cache: 'reload' }).catch(() => {})
+    ));
   } catch (e) {
     // best-effort — fall through to reload regardless
   }
@@ -1470,7 +1491,7 @@ function init() {
   wireStaticEvents();
   setupKeyboardViewportFix();
   setupLightbox();
-  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.2.0');
+  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.2.1');
 
   if (!Config.configured()) {
     openSettings();

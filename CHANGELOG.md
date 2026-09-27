@@ -6,6 +6,19 @@ All notable changes to this project are recorded here, following
 small — gets a version bump. If the version number hasn't moved,
 nothing changed; that's the whole point of keeping one.
 
+## v1.2.1 — 2026-09-28
+
+- **Fixed "Force refresh" not actually refreshing.** It correctly cleared
+  the service worker's own cache, but that's a separate layer from the
+  browser's plain HTTP cache — which could still hand back an old `app.js`
+  with no network request at all. That's why the version number in
+  Settings would bump but the actual behavior stayed the same, and why
+  reopening the app later could even revert the version number back down
+  (a freshly (re)installed service worker was precaching straight from
+  that same stale HTTP cache). Both the button and the service worker's
+  own install step now force a real network fetch for every shell file,
+  so a refresh — manual or automatic — always loads current code.
+
 ## v1.2.0 — 2026-09-28
 
 - **Opening a note no longer force-opens the keyboard.** The title field
