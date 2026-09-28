@@ -84,28 +84,35 @@
   }
 
   /* ---------- Sync bar ----------
-     A single strip fixed to the very top of the viewport, above the header
-     AND above the full-screen editor (z-index 300 beats both), so save /
-     autosave / photo-processing progress is never hidden behind the editor
-     or scrolled out of view below a stretched textarea — wherever a save is
-     actually happening, this is always on top of it. */
+     Lives inside the sticky header (as a second row, below .top-inner)
+     instead of as its own fixed, high-z-index overlay — so it's always in
+     exactly one place on the front page rather than sliding down from
+     off-screen on every autosave tick. Being part of the header also
+     means the full-screen editor (which sits above the header) naturally
+     covers it while you're writing, which is exactly when this shouldn't
+     be competing for attention.
+     grid-template-rows (not height/max-height) is what's animated here —
+     it collapses to nothing without ever measuring/animating an explicit
+     height, and keeps the transition to transform/opacity-adjacent
+     properties. */
 
   .sync-bar {
-    position: fixed;
-    top: 0; left: 0; right: 0;
-    z-index: 300;
-    background: var(--card);
-    border-bottom: 1px solid var(--line);
-    box-shadow: var(--shadow);
-    transform: translateY(-100%);
-    transition: transform 0.22s ease;
-    padding-top: env(safe-area-inset-top, 0px);
+    display: grid;
+    grid-template-rows: 0fr;
+    opacity: 0;
+    background: var(--card-2);
+    border-top: 1px solid transparent;
+    transition: grid-template-rows 0.2s ease, opacity 0.15s ease, border-color 0.2s ease;
   }
 
-  .sync-bar.show { transform: translateY(0); }
-  .sync-bar.error { background: var(--amber-bg); border-bottom-color: #e6d3ae; }
+  .sync-bar.show { grid-template-rows: 1fr; opacity: 1; border-top-color: var(--line); }
+  .sync-bar.error { background: var(--amber-bg); }
+  .sync-bar.error.show { border-top-color: #e6d3ae; }
 
   .sync-bar-inner {
+    overflow: hidden;
+    min-height: 0;
+    width: 100%; /* a grid item with auto margins otherwise shrink-wraps, collapsing the track */
     max-width: 980px;
     margin: 0 auto;
     padding: 8px 20px;
@@ -200,6 +207,7 @@
     z-index: 20;
     background: var(--paper);
     border-bottom: 1px solid var(--line);
+    padding-top: env(safe-area-inset-top, 0px);
   }
 
   .top-inner {
@@ -236,6 +244,35 @@
     border-radius: 999px;
     padding: 2px 9px;
     line-height: 1.6;
+  }
+
+  /* Small always-in-the-header indicator for "there's something on this
+     device that hasn't reached the server yet" — offline, or a save that
+     got queued while offline. Separate from .sync-bar: this one is meant
+     to sit here quietly whenever it applies, not just during an active
+     save. */
+  .sync-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11px;
+    font-weight: 600;
+    border-radius: 999px;
+    padding: 2px 9px 2px 7px;
+    line-height: 1.6;
+    color: var(--amber);
+    background: var(--amber-bg);
+    border: 1px solid #e6d3ae;
+  }
+
+  .sync-status.hidden { display: none; }
+
+  .sync-status::before {
+    content: '';
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--amber);
+    flex-shrink: 0;
   }
 
   .tabbar {
@@ -383,21 +420,74 @@
   .card-meta {
     font-size: 12px;
     color: var(--ink-faint);
-    margin-bottom: 10px;
+    margin: 0;
   }
+
+  /* Download/delete sit inline with the date instead of in their own
+     bordered footer strip below it — inside the same content block
+     rather than tacked on underneath it. */
+  .card-footer {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 8px;
+  }
+
+  .card-footer .card-meta { flex: 1; }
 
   .card-actions {
     display: flex;
     align-items: center;
-    gap: 4px;
-    border-top: 1px solid var(--line);
-    padding-top: 8px;
-    margin-top: 4px;
+    gap: 8px; /* keeps the two touch targets comfortably apart */
+    opacity: 1;
+    transition: opacity 0.15s ease;
   }
 
-  .card-actions .icon-btn { width: 32px; height: 32px; }
+  /* A little larger than the old 32px footer icons — still compact enough
+     for a card this size, but a better touch target. */
+  .card-actions .icon-btn { width: 36px; height: 36px; }
   .card-actions .icon-btn svg { width: 16px; height: 16px; }
-  .card-actions .spacer { margin-left: auto; }
+
+  /* Locked notes keep these hidden until the card's been tapped once (see
+     handleOpenCard in app.js) — tapping again then opens the unlock
+     prompt, same as before. Keeps a locked card's face uncluttered, and
+     echoes the "deliberate friction" the locks themselves are meant to
+     have (see README). Tab focus also reveals them, so a keyboard user
+     is never left focused on an invisible button. */
+  .card.type-quick .card-actions,
+  .card.type-time .card-actions {
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .card.revealed .card-actions,
+  .card.type-quick .card-actions:focus-within,
+  .card.type-time .card-actions:focus-within {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  /* A note saved on this device but not yet pushed to the server. */
+  .pending-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--amber);
+    background: var(--amber-bg);
+    padding: 3px 8px;
+    border-radius: 999px;
+    margin: 0 0 10px;
+  }
+
+  .pending-pill::before {
+    content: '';
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--amber);
+    flex-shrink: 0;
+  }
 
   .empty-state {
     text-align: center;
@@ -821,23 +911,12 @@
 </head>
 <body>
 
-<!-- Always-on-top status strip: background save / autosave / photo progress.
-     Fixed above the header AND the full-screen editor so it's never hidden
-     behind either one — see the .sync-bar rule for why. -->
-<div class="sync-bar" id="sync-bar" role="status" aria-live="polite">
-  <div class="sync-bar-inner">
-    <span class="sync-bar-spin" aria-hidden="true"></span>
-    <span class="sync-bar-label" id="sync-bar-label">Saved</span>
-    <div class="sync-bar-track" id="sync-bar-track"><div class="sync-bar-fill" id="sync-bar-fill"></div></div>
-    <button class="sync-bar-retry hidden" id="sync-bar-retry">Retry</button>
-  </div>
-</div>
-
 <header class="top">
   <div class="top-inner">
     <div class="brand">
       <span class="brand-mark">Keepsake</span>
-      <span class="version-badge" id="version-badge">v1.1.0</span>
+      <span class="version-badge" id="version-badge">v1.3.0</span>
+      <span class="sync-status hidden" id="sync-status" role="status" aria-live="polite"></span>
     </div>
     <div class="tabbar" role="tablist" aria-label="Note views">
       <button role="tab" id="tab-notes" aria-selected="true">Notes</button>
@@ -846,6 +925,20 @@
     <button class="icon-btn" id="btn-settings" title="Settings" aria-label="Settings">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V21a2 2 0 1 1-4 0v-.2a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.6-1H3a2 2 0 1 1 0-4h.2a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.6V3a2 2 0 1 1 4 0v.2a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.6 1H21a2 2 0 1 1 0 4h-.2a1.7 1.7 0 0 0-1.5 1z"/></svg>
     </button>
+  </div>
+
+  <!-- Status strip for background save / autosave / photo-processing
+       progress — fixed in this one spot on the front page (see the
+       .sync-bar rule) instead of sliding down over everything on every
+       tick. Being part of the header means the full-screen editor
+       automatically covers it while you're writing. -->
+  <div class="sync-bar" id="sync-bar" role="status" aria-live="polite">
+    <div class="sync-bar-inner">
+      <span class="sync-bar-spin" aria-hidden="true"></span>
+      <span class="sync-bar-label" id="sync-bar-label">Saved</span>
+      <div class="sync-bar-track" id="sync-bar-track"><div class="sync-bar-fill" id="sync-bar-fill"></div></div>
+      <button class="sync-bar-retry hidden" id="sync-bar-retry">Retry</button>
+    </div>
   </div>
 </header>
 
@@ -1040,7 +1133,7 @@
 <script>
 // Bump this on EVERY change to the app, no matter how small — a typo fix,
 // a copy tweak, whatever. See CHANGELOG.md for the policy and history.
-window.KEEPSAKE_VERSION = "1.2.1";
+window.KEEPSAKE_VERSION = "1.3.0";
 </script>
 <script src="app.js"></script>
 </body>

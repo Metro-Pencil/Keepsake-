@@ -3,7 +3,7 @@
 // changed and re-fetches the shell — otherwise installed PWAs can get
 // stuck on an old cached version forever. See the "Force refresh" button
 // in Settings for a manual way out of that if a deploy forgets to.
-const CACHE_NAME = 'keepsake-shell-v6';
+const CACHE_NAME = 'keepsake-shell-v7';
 const SHELL_FILES = [
   './',
   './index.html',
@@ -47,8 +47,10 @@ self.addEventListener('activate', (event) => {
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
   // Only ever serve the app shell from cache. Anything cross-origin —
-  // i.e. every call to your Worker — always goes straight to the network,
-  // so notes are never served stale or offline.
+  // i.e. every call to your Worker — always goes straight to the network.
+  // Offline access to *notes* isn't handled here: app.js keeps its own
+  // copy of every note in IndexedDB and reads from that when a request
+  // can't get through.
   if (url.origin !== self.location.origin) return;
   event.respondWith(
     caches.match(event.request).then((cached) => cached || fetch(event.request))

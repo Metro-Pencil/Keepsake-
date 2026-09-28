@@ -84,14 +84,24 @@ const Config = {
 
 const API = {
   async request(path, opts = {}) {
-    const res = await fetch(Config.base() + path, {
-      ...opts,
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + Config.token(),
-        ...(opts.headers || {}),
-      },
-    });
+    let res;
+    try {
+      res = await fetch(Config.base() + path, {
+        ...opts,
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + Config.token(),
+          ...(opts.headers || {}),
+        },
+      });
+    } catch (e) {
+      // fetch() only rejects when the request never got an HTTP response at
+      // all (offline, DNS, dropped connection). Flagged so callers can treat
+      // that as "queue it locally", unlike a 401/500 which is a real error.
+      const err = new Error('Network error — check your connection');
+      err.isNetworkError = true;
+      throw err;
+    }
     if (!res.ok) {
       let body = {};
       try { body = await res.json(); } catch (e) { /* non-JSON error body */ }
@@ -103,8 +113,9 @@ const API = {
     return res.json();
   },
   // Same contract as request() (resolves with parsed JSON, rejects with an
-  // Error carrying .status/.body) but over XHR instead of fetch, so we can
-  // report real upload progress for payloads that carry photos.
+  // Error carrying .status/.body, or .isNetworkError for a connection-level
+  // failure) but over XHR instead of fetch, so we can report real upload
+  // progress for payloads that carry photos.
   requestWithProgress(path, method, payload, onProgress) {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
@@ -126,7 +137,14 @@ const API = {
           reject(err);
         }
       };
-      xhr.onerror = () => reject(new Error('Network error — check your connection'));
+      const networkFail = () => {
+        const err = new Error('Network error — check your connection');
+        err.isNetworkError = true;
+        reject(err);
+      };
+      xhr.onerror = networkFail;
+      xhr.ontimeout = networkFail;
+      xhr.onabort = networkFail;
       xhr.send(JSON.stringify(payload));
     });
   },
@@ -205,43 +223,91 @@ function formatBytes(bytes) {
 }
 
 /* ---------------------------------------------------------------------
- * Local draft cache — IndexedDB, not localStorage
+ * IndexedDB — one database, three stores:
  *
- * A note with a few photos can easily be tens of MB, well past
- * localStorage's ~5MB quota, so drafts live in IndexedDB instead. This is
- * a same-device safety net for an *abrupt* close only (crash, dead
- * battery, a swiped-away tab) — anything gentler than that is already
- * covered by the background server sync further down this file. Every
- * draft is cleared the moment its content actually reaches the server.
+ *   drafts     - a same-device safety net for an *abrupt* close only
+ *                (crash, dead battery, a swiped-away tab). Cleared the
+ *                moment its content actually reaches the server OR the
+ *                outbox below (either one is durable enough to retire it).
+ *   noteCache  - a full local mirror of every note: the exact metadata
+ *                and content (encrypted or plain, same shape the server
+ *                stores) the list/editor/download flows need. This is
+ *                what the grid actually renders from — a live fetch just
+ *                refreshes it — which is what makes every note, locked
+ *                or not, still open with no connection at all.
+ *   outbox     - notes with a local change the server hasn't seen yet:
+ *                a save (the exact PUT payload, already built/encrypted)
+ *                or a delete. Flushed whenever a connection is available;
+ *                see flushOutbox.
  * ------------------------------------------------------------------- */
 
-const DRAFT_DB_NAME = 'keepsake-drafts';
+const KEEPSAKE_DB_NAME = 'keepsake-drafts'; // unchanged so existing installs upgrade in place
+const KEEPSAKE_DB_VERSION = 2;
 const DRAFT_STORE = 'drafts';
+const NOTE_CACHE_STORE = 'noteCache';
+const OUTBOX_STORE = 'outbox';
 
-function openDraftDB() {
+function openKeepsakeDB() {
   return new Promise((resolve, reject) => {
     if (!window.indexedDB) { reject(new Error('IndexedDB unavailable')); return; }
-    const req = indexedDB.open(DRAFT_DB_NAME, 1);
+    const req = indexedDB.open(KEEPSAKE_DB_NAME, KEEPSAKE_DB_VERSION);
     req.onupgradeneeded = () => {
-      if (!req.result.objectStoreNames.contains(DRAFT_STORE)) {
-        req.result.createObjectStore(DRAFT_STORE, { keyPath: 'id' });
-      }
+      const db = req.result;
+      if (!db.objectStoreNames.contains(DRAFT_STORE)) db.createObjectStore(DRAFT_STORE, { keyPath: 'id' });
+      if (!db.objectStoreNames.contains(NOTE_CACHE_STORE)) db.createObjectStore(NOTE_CACHE_STORE, { keyPath: 'id' });
+      if (!db.objectStoreNames.contains(OUTBOX_STORE)) db.createObjectStore(OUTBOX_STORE, { keyPath: 'id' });
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
 }
 
+function idbPut(db, store, value) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readwrite');
+    tx.objectStore(store).put(value);
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
+}
+function idbGet(db, store, key) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readonly');
+    const req = tx.objectStore(store).get(key);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+function idbGetAll(db, store) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readonly');
+    const req = tx.objectStore(store).getAll();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+function idbGetAllKeys(db, store) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readonly');
+    const req = tx.objectStore(store).getAllKeys();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+function idbDelete(db, store, key) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readwrite');
+    tx.objectStore(store).delete(key);
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
 async function saveLocalDraft(id, title, body, images) {
   if (!id) return;
   try {
-    const db = await openDraftDB();
-    await new Promise((resolve, reject) => {
-      const tx = db.transaction(DRAFT_STORE, 'readwrite');
-      tx.objectStore(DRAFT_STORE).put({ id, title, body, images, savedAt: Date.now() });
-      tx.oncomplete = resolve;
-      tx.onerror = () => reject(tx.error);
-    });
+    const db = await openKeepsakeDB();
+    await idbPut(db, DRAFT_STORE, { id, title, body, images, savedAt: Date.now() });
   } catch (e) {
     // Best-effort only — local caching should never interrupt the editor.
   }
@@ -249,22 +315,16 @@ async function saveLocalDraft(id, title, body, images) {
 
 async function loadLocalDraft(id) {
   try {
-    const db = await openDraftDB();
-    return await new Promise((resolve, reject) => {
-      const tx = db.transaction(DRAFT_STORE, 'readonly');
-      const req = tx.objectStore(DRAFT_STORE).get(id);
-      req.onsuccess = () => resolve(req.result || null);
-      req.onerror = () => reject(req.error);
-    });
+    const db = await openKeepsakeDB();
+    return await idbGet(db, DRAFT_STORE, id);
   } catch (e) { return null; }
 }
 
 async function clearLocalDraft(id) {
   if (!id) return;
   try {
-    const db = await openDraftDB();
-    const tx = db.transaction(DRAFT_STORE, 'readwrite');
-    tx.objectStore(DRAFT_STORE).delete(id);
+    const db = await openKeepsakeDB();
+    await idbDelete(db, DRAFT_STORE, id);
   } catch (e) {
     // Worst case an orphaned draft lingers and gets offered for recovery
     // again later, which is harmless.
@@ -273,13 +333,114 @@ async function clearLocalDraft(id) {
 
 async function listLocalDraftIds() {
   try {
-    const db = await openDraftDB();
-    return await new Promise((resolve, reject) => {
-      const tx = db.transaction(DRAFT_STORE, 'readonly');
-      const req = tx.objectStore(DRAFT_STORE).getAllKeys();
-      req.onsuccess = () => resolve(req.result || []);
-      req.onerror = () => reject(req.error);
+    const db = await openKeepsakeDB();
+    return await idbGetAllKeys(db, DRAFT_STORE);
+  } catch (e) { return []; }
+}
+
+/* ---------------------------------------------------------------------
+ * Note cache — the local mirror every render/open/download reads from.
+ * ------------------------------------------------------------------- */
+
+async function cacheNote(meta, content) {
+  try {
+    const db = await openKeepsakeDB();
+    const existing = await idbGet(db, NOTE_CACHE_STORE, meta.id);
+    await idbPut(db, NOTE_CACHE_STORE, {
+      id: meta.id,
+      meta,
+      content,
+      contentUpdatedAt: meta.updatedAt, // which version of the note `content` is
+      vault: existing ? existing.vault : undefined,
+      cachedAt: Date.now(),
     });
+  } catch (e) { /* best-effort — a failed cache write just means this one note won't be available offline yet */ }
+}
+
+// Used when only fresh *metadata* is on hand (the list endpoint doesn't
+// return content) — keeps whatever content/vault is already cached for
+// this note rather than clobbering it with nothing. contentUpdatedAt is
+// deliberately carried over unchanged, so a newer meta.updatedAt shows up
+// as "cached content is out of date" to prefetchOfflineData.
+async function cacheNoteMetaOnly(meta) {
+  try {
+    const db = await openKeepsakeDB();
+    const existing = await idbGet(db, NOTE_CACHE_STORE, meta.id);
+    await idbPut(db, NOTE_CACHE_STORE, {
+      id: meta.id,
+      meta,
+      content: existing ? existing.content : null,
+      contentUpdatedAt: existing ? existing.contentUpdatedAt : undefined,
+      vault: existing ? existing.vault : undefined,
+      cachedAt: Date.now(),
+    });
+  } catch (e) { /* best-effort */ }
+}
+
+async function cacheVault(id, password2) {
+  try {
+    const db = await openKeepsakeDB();
+    const existing = await idbGet(db, NOTE_CACHE_STORE, id);
+    if (!existing) return; // no meta/content for this note yet — nothing to attach it to
+    await idbPut(db, NOTE_CACHE_STORE, { ...existing, vault: password2, cachedAt: Date.now() });
+  } catch (e) { /* best-effort */ }
+}
+
+async function getCachedNote(id) {
+  try {
+    const db = await openKeepsakeDB();
+    return await idbGet(db, NOTE_CACHE_STORE, id);
+  } catch (e) { return null; }
+}
+
+async function getAllCachedNotes() {
+  try {
+    const db = await openKeepsakeDB();
+    return await idbGetAll(db, NOTE_CACHE_STORE);
+  } catch (e) { return []; }
+}
+
+async function removeCachedNote(id) {
+  try {
+    const db = await openKeepsakeDB();
+    await idbDelete(db, NOTE_CACHE_STORE, id);
+  } catch (e) { /* best-effort */ }
+}
+
+// The list the grid actually renders: every cached note's metadata,
+// flagged _pending when it has a queued-but-not-yet-synced change.
+async function buildNotesCacheFromLocal() {
+  const [cached, outboxItems] = await Promise.all([getAllCachedNotes(), getOutbox()]);
+  const outboxIds = new Set(outboxItems.map((o) => o.id));
+  const metas = cached.map((c) => ({ ...c.meta, _pending: outboxIds.has(c.id) }));
+  metas.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  return metas;
+}
+
+/* ---------------------------------------------------------------------
+ * Outbox — notes with a save or delete the server hasn't seen yet.
+ * ------------------------------------------------------------------- */
+
+async function queueOutbox(id, op, payload) {
+  try {
+    const db = await openKeepsakeDB();
+    await idbPut(db, OUTBOX_STORE, { id, op, payload: payload || null, queuedAt: Date.now() });
+  } catch (e) { /* best-effort */ }
+  await refreshOutboxCount();
+}
+
+async function clearOutbox(id) {
+  try {
+    const db = await openKeepsakeDB();
+    await idbDelete(db, OUTBOX_STORE, id);
+  } catch (e) { /* best-effort */ }
+  await refreshOutboxCount();
+}
+
+async function getOutbox() {
+  try {
+    const db = await openKeepsakeDB();
+    return await idbGetAll(db, OUTBOX_STORE);
   } catch (e) { return []; }
 }
 
@@ -433,6 +594,98 @@ function syncBarError(label, onRetry) {
 }
 
 /* ---------------------------------------------------------------------
+ * Connection + sync status
+ *
+ * isOnline blends the browser's own online/offline events with what
+ * actual requests report (navigator.onLine can say "online" on a dead
+ * wifi network), and outboxCount is how many notes have a local change
+ * the server hasn't seen yet. Together they drive the small pill in the
+ * header, which is the one place "not synced" is shown.
+ * ------------------------------------------------------------------- */
+
+let isOnline = navigator.onLine;
+let outboxCount = 0;
+let isFlushing = false;
+
+function updateSyncStatusUI() {
+  const badge = document.getElementById('sync-status');
+  if (!badge) return;
+  if (!isOnline) {
+    badge.textContent = outboxCount ? `Offline · ${outboxCount} not synced` : 'Offline';
+    badge.className = 'sync-status';
+  } else if (outboxCount > 0) {
+    badge.textContent = outboxCount === 1 ? 'Not synced' : `${outboxCount} not synced`;
+    badge.className = 'sync-status';
+  } else {
+    badge.textContent = '';
+    badge.className = 'sync-status hidden';
+  }
+}
+
+function setOnline(value) {
+  if (isOnline === value) return;
+  isOnline = value;
+  updateSyncStatusUI();
+}
+
+async function refreshOutboxCount() {
+  outboxCount = (await getOutbox()).length;
+  updateSyncStatusUI();
+}
+
+async function rerenderFromLocal() {
+  notesCache = await buildNotesCacheFromLocal();
+  renderNotes();
+  renderLocked();
+}
+
+// Pushes every queued save/delete to the server, oldest first. Stops at the
+// first connection failure (the rest stay queued for next time); a real
+// server error on one note leaves just that note queued and carries on.
+async function flushOutbox() {
+  if (isFlushing || !navigator.onLine) return;
+  const items = (await getOutbox()).sort((a, b) => a.queuedAt - b.queuedAt);
+  if (!items.length) return;
+  isFlushing = true;
+  try {
+    for (const item of items) {
+      // A live editor/background save is already handling this note — let it.
+      const st = syncStateByNote.get(item.id);
+      if (st && st.inFlight) continue;
+      try {
+        let result = null;
+        if (item.op === 'delete') {
+          await API.deleteNote(item.id);
+        } else {
+          result = await API.saveNote(item.id, item.payload);
+        }
+        setOnline(true);
+        // If the note was edited again while this request was in flight, a
+        // newer entry replaced this one in the outbox — leave that newer
+        // one (and its cached copy) alone; the next flush sends it.
+        const latest = (await getOutbox()).find((o) => o.id === item.id);
+        if (latest && latest.queuedAt !== item.queuedAt) continue;
+        if (item.op === 'delete') {
+          await removeCachedNote(item.id);
+        } else {
+          await cacheNote(result.note, item.payload.content);
+          if (item.payload.lockType === 'time' && item.payload.password2) {
+            await cacheVault(item.id, item.payload.password2);
+          }
+        }
+        await clearOutbox(item.id);
+      } catch (e) {
+        if (e.isNetworkError) { setOnline(false); break; }
+        // Real server error for this one item — leave it queued, keep going.
+      }
+    }
+  } finally {
+    isFlushing = false;
+    await rerenderFromLocal();
+  }
+}
+
+/* ---------------------------------------------------------------------
  * Icons (inline SVG strings, reused across cards)
  * ------------------------------------------------------------------- */
 
@@ -447,6 +700,10 @@ const trashGlyph = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" s
 let notesCache = [];
 let notesLoaded = false;         // becomes true after the first successful list fetch
 let currentView = 'notes';
+// Locked cards whose download/delete buttons have been revealed by a tap
+// this session (see handleOpenCard) — in-memory only, resets on reload,
+// which is fine: it's meant as light friction, not a saved preference.
+const revealedLockedCards = new Set();
 let editingNoteId = null;        // generated client-side the moment the editor opens — see openEditorWithContent
 let noteExistsOnServer = false;  // false until this note's first background save actually succeeds
 let editorImages = [];
@@ -480,6 +737,7 @@ function emptyStateHTML(title, body) {
 function cardHTML(meta) {
   const isLocked = meta.lockType !== 'none';
   const typeClass = meta.lockType === 'quick' ? 'type-quick' : meta.lockType === 'time' ? 'type-time' : '';
+  const revealedClass = revealedLockedCards.has(meta.id) ? ' revealed' : '';
 
   let pill = '';
   if (meta.lockType === 'quick') {
@@ -488,6 +746,12 @@ function cardHTML(meta) {
     const left = fmtCountdown(meta.unlockAt);
     pill = `<span class="lock-pill time">${lockGlyph}${left ? left + ' left' : 'Ready to open'}</span>`;
   }
+
+  // Saved on this device but not yet pushed to the server (offline, or a
+  // save that failed to reach it) — see queueOutbox/buildNotesCacheFromLocal.
+  const pendingBadge = meta._pending
+    ? `<span class="pending-pill" title="Saved on this device — will sync once you\u2019re back online">Not synced</span>`
+    : '';
 
   const titleText = isLocked ? 'Locked note' : (meta.title || 'Untitled');
   let snippet = meta.preview || '';
@@ -498,17 +762,18 @@ function cardHTML(meta) {
   }
 
   return `
-    <article class="card ${typeClass}">
+    <article class="card ${typeClass}${revealedClass}">
       <div class="card-open" data-action="open" data-id="${meta.id}" role="button" tabindex="0">
-        ${pill}
+        ${pill}${pendingBadge}
         <div class="card-title">${escapeHTML(titleText)}</div>
         <div class="card-snippet">${escapeHTML(snippet)}</div>
-        <div class="card-meta">${fmtDate(meta.updatedAt || meta.createdAt)}</div>
       </div>
-      <div class="card-actions">
-        <button class="icon-btn" data-action="download" data-id="${meta.id}" title="Download" aria-label="Download">${downloadGlyph}</button>
-        <span class="spacer"></span>
-        <button class="icon-btn" data-action="delete" data-id="${meta.id}" title="Delete" aria-label="Delete">${trashGlyph}</button>
+      <div class="card-footer">
+        <span class="card-meta">${fmtDate(meta.updatedAt || meta.createdAt)}</span>
+        <div class="card-actions">
+          <button class="icon-btn" data-action="download" data-id="${meta.id}" title="Download" aria-label="Download">${downloadGlyph}</button>
+          <button class="icon-btn" data-action="delete" data-id="${meta.id}" title="Delete" aria-label="Delete">${trashGlyph}</button>
+        </div>
       </div>
     </article>`;
 }
@@ -532,35 +797,157 @@ function renderLocked() {
 // Locked cards show a live countdown — cheap to just re-render locked view periodically.
 setInterval(() => { if (notesCache.some((m) => m.lockType === 'time')) renderLocked(); }, 60000);
 
-// Patches a single note's meta into the cache and re-renders, instead of
-// re-fetching and rebuilding the whole grid after every save. This is what
-// makes a save actually feel instant in the list, not just in the editor.
-function patchNoteInCache(meta) {
-  const idx = notesCache.findIndex((m) => m.id === meta.id);
-  if (idx === -1) notesCache.unshift(meta); else notesCache[idx] = meta;
-  renderNotes();
-  renderLocked();
+// Records a note that just reached the server: refreshes its cached copy
+// (metadata + content, and the vault password for time locks), drops any
+// queued entry it supersedes, and redraws the grid — straight from the
+// response already in hand rather than re-fetching the whole list. This is
+// what makes a save actually feel instant in the list, not just the editor.
+async function applySavedNote(noteId, note, payload) {
+  const pending = (await getOutbox()).find((o) => o.id === noteId);
+  // Deleted while this save was in flight — leave the queued delete alone
+  // (it'll clear the server copy this request just wrote) instead of
+  // resurrecting the note in the cache.
+  if (pending && pending.op === 'delete') return;
+  await clearOutbox(noteId);
+  await cacheNote(note, payload.content);
+  if (payload.lockType === 'time' && payload.password2) await cacheVault(noteId, payload.password2);
+  await rerenderFromLocal();
+}
+
+// The offline counterpart: no server response exists, so the metadata is
+// built here exactly the way worker.js's metaFromBody would build it, the
+// note is cached + queued for the next flush, and the grid shows it as a
+// normal card marked "Not synced". Queueing is a plain put keyed by note
+// id, so a later edit while still offline simply replaces this entry.
+function synthesizeMeta(id, payload) {
+  const existing = notesCache.find((m) => m.id === id);
+  const now = Date.now();
+  return {
+    id,
+    createdAt: existing ? existing.createdAt : now,
+    updatedAt: now,
+    lockType: payload.lockType,
+    unlockAt: payload.lockType === 'time' ? (payload.unlockAt || null) : null,
+    title: payload.lockType === 'none' ? String(payload.title || '') : null,
+    preview: payload.lockType === 'none' ? String(payload.preview || '') : null,
+  };
+}
+
+async function applyOfflineSavedNote(noteId, payload) {
+  const pending = (await getOutbox()).find((o) => o.id === noteId);
+  if (pending && pending.op === 'delete') return; // deleted meanwhile — don't resurrect it
+  await cacheNote(synthesizeMeta(noteId, payload), payload.content);
+  if (payload.lockType === 'time' && payload.password2) await cacheVault(noteId, payload.password2);
+  await queueOutbox(noteId, 'save', payload);
+  // The outbox is now the durable local copy of this exact content, so the
+  // abrupt-close draft would just be a duplicate of it.
+  clearLocalDraft(noteId);
+  await rerenderFromLocal();
+}
+
+let lastListErrorMessage = null;
+
+// Refreshes the local cache from the server (when reachable), then pushes
+// anything queued. Never throws and never blanks the grid: whatever is
+// cached stays on screen if the request fails.
+async function syncFromServer() {
+  if (!navigator.onLine) { setOnline(false); return; }
+  let notes;
+  try {
+    ({ notes } = await API.listNotes());
+  } catch (e) {
+    if (e.isNetworkError) {
+      setOnline(false);
+    } else {
+      lastListErrorMessage = e.message;
+      if (!notesLoaded) toast('Could not load notes: ' + e.message);
+    }
+    return;
+  }
+  lastListErrorMessage = null;
+  setOnline(true);
+
+  const outboxIds = new Set((await getOutbox()).map((o) => o.id));
+  const serverIds = new Set(notes.map((n) => n.id));
+  // A note with a queued local change keeps its local version — a possibly
+  // stale server copy must not overwrite work the server hasn't seen yet.
+  for (const meta of notes) {
+    if (!outboxIds.has(meta.id)) await cacheNoteMetaOnly(meta);
+  }
+  // Cached but gone from the server (and not a local creation still waiting
+  // to upload) means it was deleted from another device.
+  for (const c of await getAllCachedNotes()) {
+    if (!serverIds.has(c.id) && !outboxIds.has(c.id)) await removeCachedNote(c.id);
+  }
+
+  notesLoaded = true;
+  await rerenderFromLocal();
+  await flushOutbox();
+  prefetchOfflineData(notes.filter((m) => !outboxIds.has(m.id)));
+}
+
+// Quietly downloads the content of every note whose cached copy is missing
+// or older than the server's — this is what makes *all* notes, locked and
+// unlocked, open offline rather than just the ones opened before. Locked
+// notes are cached still-encrypted, exactly as the server holds them.
+// A time-locked note past its unlock date also gets its released second
+// password cached; before that date the server withholds it, so a note
+// whose date passes while you're offline has to wait for a connection.
+async function prefetchOfflineData(metas) {
+  for (const meta of metas) {
+    if (!navigator.onLine) return;
+    try {
+      const cached = await getCachedNote(meta.id);
+      const needContent = !cached || !cached.content || cached.contentUpdatedAt !== meta.updatedAt;
+      if (needContent) {
+        const { content } = await API.getNote(meta.id);
+        await cacheNote(meta, content);
+      }
+      const unlocked = meta.lockType === 'time' && meta.unlockAt && Date.now() >= meta.unlockAt;
+      if (unlocked && !(cached && cached.vault)) {
+        try {
+          const { password2 } = await API.getVault(meta.id);
+          if (password2) await cacheVault(meta.id, password2);
+        } catch (e) { if (e.isNetworkError) return; }
+      }
+    } catch (e) {
+      if (e.isNetworkError) { setOnline(false); return; }
+      // Anything else (e.g. one note's content missing server-side) —
+      // skip it and keep going with the rest.
+    }
+  }
 }
 
 async function refreshNotes() {
-  if (!notesLoaded) {
+  // Cards come from the local cache first — instant, and the only source
+  // when there's no connection. The server fetch below just refreshes it.
+  notesCache = await buildNotesCacheFromLocal();
+  await refreshOutboxCount();
+  if (notesCache.length) {
+    notesLoaded = true;
+    renderNotes();
+    renderLocked();
+  } else if (!notesLoaded) {
     const loading = emptyStateHTML('Loading…', 'Fetching your notes.');
     document.getElementById('grid-notes').innerHTML = loading;
     document.getElementById('grid-locked').innerHTML = loading;
   }
-  try {
-    const { notes } = await API.listNotes();
-    notesCache = notes;
-    notesLoaded = true;
-    renderNotes();
-    renderLocked();
-  } catch (e) {
-    toast('Could not load notes: ' + e.message);
-    if (!notesLoaded) {
-      const failed = emptyStateHTML('Could not load notes', e.message);
-      document.getElementById('grid-notes').innerHTML = failed;
-      document.getElementById('grid-locked').innerHTML = failed;
-    }
+
+  await syncFromServer();
+
+  // Only reachable on a genuinely empty start: nothing cached yet AND the
+  // server couldn't be reached. (A successful fetch of zero notes sets
+  // notesLoaded and renders the normal "No notes yet" state instead.)
+  if (!notesLoaded && !notesCache.length) {
+    const offline = !navigator.onLine || !isOnline;
+    const empty = emptyStateHTML(
+      offline ? 'You\u2019re offline' : 'Could not load notes',
+      offline
+        ? 'Your notes will appear here once you\u2019ve connected at least once.'
+        : (lastListErrorMessage || 'Check your connection and try again.')
+    );
+    document.getElementById('grid-notes').innerHTML = empty;
+    document.getElementById('grid-locked').innerHTML = empty;
   }
 }
 
@@ -678,15 +1065,6 @@ function renderLockSummary() {
     : `<p class="hint">Time-locked until ${fmtDateTime(pendingLock.unlockAt)}.</p>`;
 }
 
-function computeEditorSnapshot() {
-  return JSON.stringify({
-    title: document.getElementById('editor-title').value,
-    body: document.getElementById('editor-body').value,
-    images: editorImages,
-    lock: pendingLock ? { type: pendingLock.type, unlockAt: pendingLock.unlockAt || null } : null,
-  });
-}
-
 function noteHasContent() {
   const title = document.getElementById('editor-title').value.trim();
   const body = document.getElementById('editor-body').value;
@@ -715,7 +1093,10 @@ function openEditorWithContent(meta, content) {
     ? { type: meta.lockType, unlockAt: meta.unlockAt, existing: true }
     : null;
   renderLockSummary();
-  lastAutosavedJSON = computeEditorSnapshot();
+  // Baseline must be built the same way later snapshots are (captureSnapshot,
+  // which carries the resolved lock passwords) or a locked note would always
+  // look "changed" and get re-encrypted and re-uploaded just for being opened.
+  lastAutosavedJSON = JSON.stringify(captureSnapshot());
   seedSyncStateImages(editingNoteId, editorImages);
   show('overlay-editor');
   // No auto-focus here on purpose — opening a note (new or existing)
@@ -879,7 +1260,15 @@ async function syncRunOne(noteId, snapshot, state) {
   if (showInBar()) syncBarSet(imagesChanged ? 'Saving photos… 0%' : 'Saving…', imagesChanged ? 0 : null);
 
   try {
+    if (!navigator.onLine) {
+      // No point attempting a request that can't leave the device — go
+      // straight to the offline path below.
+      const offlineErr = new Error('Offline');
+      offlineErr.isNetworkError = true;
+      throw offlineErr;
+    }
     const { note } = await API.saveNote(noteId, payload, onProgress);
+    setOnline(true);
     if (noteId === editingNoteId) {
       noteExistsOnServer = true;
       document.getElementById('btn-delete-note').style.display = '';
@@ -888,10 +1277,25 @@ async function syncRunOne(noteId, snapshot, state) {
     }
     state.lastSyncedImagesJSON = imagesJSON;
     clearLocalDraft(noteId);
-    patchNoteInCache(note);
+    await applySavedNote(noteId, note, payload);
     if (showInBar()) syncBarSuccess('Saved');
+    flushOutbox(); // a working connection is the moment to drain anything else that's queued
   } catch (e) {
-    if (showInBar()) {
+    if (e.isNetworkError) {
+      // Offline (or the connection dropped mid-save). That's not a failure:
+      // the note is cached locally as if it had saved, queued for the next
+      // flush, and marked "Not synced" — no error toast, no retry prompt.
+      setOnline(false);
+      await applyOfflineSavedNote(noteId, payload);
+      if (noteId === editingNoteId) {
+        noteExistsOnServer = true;
+        document.getElementById('btn-delete-note').style.display = '';
+        document.getElementById('editor-heading').textContent = 'Edit note';
+        lastAutosavedJSON = JSON.stringify(snapshot);
+      }
+      state.lastSyncedImagesJSON = imagesJSON;
+      if (showInBar()) syncBarSuccess('Saved on this device — will sync later');
+    } else if (showInBar()) {
       syncBarError('Couldn\u2019t save — tap to retry', () => runSync(noteId, snapshot));
     } else {
       toast('Couldn\u2019t save "' + (snapshot.title || 'Untitled') + '" — it\u2019s still cached on this device.');
@@ -1009,23 +1413,33 @@ function attemptCloseEditor() { closeEditorAndSync(false); }
 
 function confirmDelete(id, fromEditor) {
   openConfirm('Delete this note?', 'This can\u2019t be undone.', async () => {
-    // Optimistic: drop it from the list immediately rather than waiting on
-    // a full refetch, then reconcile quietly if the request turns out to
-    // have failed.
-    const previous = notesCache;
-    notesCache = notesCache.filter((m) => m.id !== id);
-    renderNotes();
-    renderLocked();
+    // Local-first: it disappears from the cache and grid right away, and the
+    // server delete is queued in the outbox so it still happens if there's
+    // no connection right now (or the request fails).
+    await removeCachedNote(id);
     clearLocalDraft(id);
+    revealedLockedCards.delete(id);
     if (fromEditor) hide('overlay-editor');
+    await queueOutbox(id, 'delete', null);
+    await rerenderFromLocal();
+
+    if (!navigator.onLine) {
+      setOnline(false);
+      toast('Deleted — will sync once you\u2019re back online.');
+      return;
+    }
     try {
       await API.deleteNote(id);
+      setOnline(true);
+      await clearOutbox(id);
       toast('Deleted');
     } catch (e) {
-      notesCache = previous;
-      renderNotes();
-      renderLocked();
-      toast('Could not delete: ' + e.message);
+      if (e.isNetworkError) {
+        setOnline(false);
+        toast('Deleted — will sync once you\u2019re back online.');
+      } else {
+        toast('Deleted here, but the server said: ' + e.message);
+      }
     }
   });
 }
@@ -1076,14 +1490,14 @@ function openUnlockFlow(meta) {
     document.getElementById('btn-do-unlock').addEventListener('click', async () => {
       const pw = document.getElementById('unlock-password').value;
       try {
-        const { content: record } = await API.getNote(meta.id);
+        const record = await fetchNoteContent(meta);
         const content = await decryptNote(pw, record);
         currentUnlockCreds = { password: pw };
         hide('overlay-unlock');
         openEditorWithContent(meta, content);
       } catch (e) {
         const err = document.getElementById('unlock-error');
-        err.textContent = 'Wrong password.';
+        err.textContent = e.notCached ? e.message : 'Wrong password.';
         err.style.display = '';
       }
     });
@@ -1111,14 +1525,14 @@ function openUnlockFlow(meta) {
       const pw = document.getElementById('unlock-password').value;
       const err = document.getElementById('unlock-error');
       try {
-        const { password2 } = await API.getVault(meta.id);
-        const { content: record } = await API.getNote(meta.id);
+        const password2 = await fetchVaultPassword2(meta);
+        const record = await fetchNoteContent(meta);
         const content = await decryptNote(combine(pw, password2), record);
         currentUnlockCreds = { password: pw, password2 };
         hide('overlay-unlock');
         openEditorWithContent(meta, content);
       } catch (e) {
-        err.textContent = 'Wrong password.';
+        err.textContent = e.notCached ? e.message : 'Wrong password.';
         err.style.display = '';
       }
     });
@@ -1156,16 +1570,65 @@ function openUnlockFlow(meta) {
     const pw2 = document.getElementById('unlock-password2').value;
     const err = document.getElementById('unlock-error');
     try {
-      const { content: record } = await API.getNote(meta.id);
+      const record = await fetchNoteContent(meta);
       const content = await decryptNote(combine(pw, pw2), record);
       currentUnlockCreds = { password: pw, password2: pw2 };
       hide('overlay-unlock');
       openEditorWithContent(meta, content);
     } catch (e) {
-      err.textContent = 'Couldn\u2019t unlock — check both passwords.';
+      err.textContent = e.notCached ? e.message : 'Couldn\u2019t unlock — check both passwords.';
       err.style.display = '';
     }
   });
+}
+
+function notCachedError() {
+  const err = new Error('Not available offline yet — open it once while connected.');
+  err.notCached = true;
+  return err;
+}
+
+// Reads a note's stored content: live from the server when reachable (which
+// also refreshes the local copy), otherwise from the local cache. This is
+// what lets any note — locked (still encrypted) or not — open with no
+// connection at all.
+async function fetchNoteContent(meta) {
+  if (navigator.onLine) {
+    try {
+      const { content } = await API.getNote(meta.id);
+      setOnline(true);
+      await cacheNote(meta, content);
+      return content;
+    } catch (e) {
+      if (!e.isNetworkError) throw e;
+      setOnline(false);
+    }
+  }
+  const cached = await getCachedNote(meta.id);
+  if (!cached || !cached.content) throw notCachedError();
+  return cached.content;
+}
+
+// Same idea for the released second password of a time-locked note.
+async function fetchVaultPassword2(meta) {
+  if (navigator.onLine) {
+    try {
+      const { password2 } = await API.getVault(meta.id);
+      setOnline(true);
+      await cacheVault(meta.id, password2);
+      return password2;
+    } catch (e) {
+      if (!e.isNetworkError) throw e;
+      setOnline(false);
+    }
+  }
+  const cached = await getCachedNote(meta.id);
+  if (!cached || !cached.vault) {
+    const err = new Error('Needs a connection — the second password is released by the server.');
+    err.notCached = true;
+    throw err;
+  }
+  return cached.vault;
 }
 
 async function handleOpenCard(id) {
@@ -1173,12 +1636,19 @@ async function handleOpenCard(id) {
   if (!meta) return;
   if (meta.lockType === 'none') {
     try {
-      const { content } = await API.getNote(id);
+      const content = await fetchNoteContent(meta);
       currentUnlockCreds = null;
       openEditorWithContent(meta, content);
     } catch (e) {
-      toast('Could not load note: ' + e.message);
+      toast('Could not open note: ' + e.message);
     }
+    return;
+  }
+  // Locked card: the first tap only reveals its download/delete buttons;
+  // a tap once they're showing goes on to the unlock prompt as usual.
+  if (!revealedLockedCards.has(id)) {
+    revealedLockedCards.add(id);
+    renderLocked();
     return;
   }
   currentUnlockCreds = null;
@@ -1187,7 +1657,24 @@ async function handleOpenCard(id) {
 
 async function downloadNote(id) {
   try {
-    const bundle = await API.exportNote(id);
+    let bundle = null;
+    if (navigator.onLine) {
+      try {
+        bundle = await API.exportNote(id);
+        setOnline(true);
+        await cacheNote(bundle.meta, bundle.content);
+        if (bundle.password2) await cacheVault(id, bundle.password2);
+      } catch (e) {
+        if (!e.isNetworkError) throw e;
+        setOnline(false);
+      }
+    }
+    if (!bundle) {
+      // Offline: build the same export from the local copy.
+      const cached = await getCachedNote(id);
+      if (!cached || !cached.content) throw notCachedError();
+      bundle = { meta: cached.meta, content: cached.content, password2: cached.vault || null };
+    }
     const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -1239,7 +1726,7 @@ const FORCE_REFRESH_SHELL_FILES = [
 function openSettings() {
   document.getElementById('settings-api-base').value = Config.base();
   document.getElementById('settings-token').value = Config.token();
-  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.2.1';
+  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.3.0';
   show('overlay-settings');
 }
 
@@ -1491,7 +1978,15 @@ function init() {
   wireStaticEvents();
   setupKeyboardViewportFix();
   setupLightbox();
-  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.2.1');
+  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.3.0');
+
+  // Connectivity: react the moment the browser notices, and keep retrying
+  // on a timer since navigator.onLine can't see a connection that's up but
+  // not actually reaching the Worker.
+  window.addEventListener('online', () => { setOnline(true); flushOutbox(); });
+  window.addEventListener('offline', () => setOnline(false));
+  setInterval(() => { if (navigator.onLine && outboxCount > 0) flushOutbox(); }, 30000);
+  updateSyncStatusUI();
 
   if (!Config.configured()) {
     openSettings();

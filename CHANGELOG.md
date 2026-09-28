@@ -6,6 +6,47 @@ All notable changes to this project are recorded here, following
 small — gets a version bump. If the version number hasn't moved,
 nothing changed; that's the whole point of keeping one.
 
+## v1.3.0 — 2026-09-28
+
+- **Every note now works offline — locked and unlocked.** The app keeps a
+  full local copy of all your notes (still encrypted, for locked ones) in
+  IndexedDB and renders the list from that, so opening the app with no
+  connection shows your notes as normal cards instead of a "Could not load
+  notes" warning. After each successful sync it quietly downloads the
+  content of anything it doesn't have yet, so notes you've never opened on
+  this device are available too. Opening, unlocking, and downloading a note
+  all fall back to the local copy when the server can't be reached.
+  (One limit: a time-locked note whose date passes *while you're offline*
+  needs one connection to fetch its released second password.)
+- **Writing works offline.** Creating, editing, locking, and deleting notes
+  with no connection no longer errors — the change is saved on the device,
+  queued, and shown right away. A queued note appears as a normal card
+  with a small "Not synced" tag, and everything is pushed to the server
+  automatically once a connection is back (on reconnect, and every 30s
+  while anything is waiting). Only real server errors (bad token, 500s)
+  still surface as errors; being offline no longer does.
+- **"Not synced" indicator in the top bar**, next to the version badge:
+  shows "Offline", "Offline · N not synced", or "N not synced", and
+  disappears when everything has reached the server.
+- **The save/progress bar no longer slides down from the top on every
+  autosave.** It now lives in one fixed spot — a strip directly under the
+  title row of the front page — and, because the full-screen editor sits
+  above it, it isn't shown while you're writing. (Its progress text and bar
+  are unchanged; it just no longer overlays everything.)
+- **Note cards: download and delete now sit inline with the date** instead
+  of in a separate bordered footer strip, and are a bit larger to tap.
+  On **locked** notes they're hidden until you tap the card once; a second
+  tap opens the unlock prompt as before.
+- Fixed opening a locked note and closing it without changes re-encrypting
+  and re-uploading it anyway (the "already saved" baseline was built in a
+  different shape than the snapshot it's compared to, so it never matched).
+- Deleting is now local-first: the note leaves the list immediately and the
+  server delete is queued, instead of being rolled back if the request
+  fails.
+- The header now pads for the device's top safe area itself (that used to
+  be handled only by the old fixed sync bar).
+- Bumped the service worker's cache name so this reaches installed copies.
+
 ## v1.2.1 — 2026-09-28
 
 - **Fixed "Force refresh" not actually refreshing.** It correctly cleared

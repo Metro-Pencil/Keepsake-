@@ -76,6 +76,17 @@ Open the deployed site, tap the gear icon, and fill in:
 
 Both are stored only in that browser's local storage.
 
+## Offline
+
+Keepsake keeps a copy of every note on the device (in IndexedDB), so the
+list, reading, unlocking, downloading, writing, and deleting all work with
+no connection. Changes made offline are queued and sent automatically once
+you're back online; until then the note shows a "Not synced" tag and the
+top bar shows an offline / not-synced indicator. Locked notes are cached in
+their encrypted form, exactly as the server stores them. This is
+last-write-wins: if you edit the same note on two devices while one is
+offline, whichever syncs last overwrites the other.
+
 ## Limits worth knowing
 
 - Everything lives in one Workers KV namespace — no R2 bucket, and no
