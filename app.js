@@ -199,9 +199,10 @@ const NOTE_SIZE_LIMIT = 25 * 1024 * 1024;
 
 function estimateContentBytes() {
   const title = document.getElementById('editor-title').value || '';
-  const body = document.getElementById('editor-body').value || '';
-  let total = title.length + body.length;
+  // HTML + the plain-text copy stored beside it, roughly.
+  let total = title.length + document.getElementById('editor-body').innerHTML.length * 2;
   for (const src of editorImages) total += estimateImageBytes(src);
+  total += inkEstimateBytes();
   return total;
 }
 
@@ -303,11 +304,11 @@ function idbDelete(db, store, key) {
   });
 }
 
-async function saveLocalDraft(id, title, body, images) {
+async function saveLocalDraft(id, title, body, images, html, drawing) {
   if (!id) return;
   try {
     const db = await openKeepsakeDB();
-    await idbPut(db, DRAFT_STORE, { id, title, body, images, savedAt: Date.now() });
+    await idbPut(db, DRAFT_STORE, { id, title, body, images, html, drawing, savedAt: Date.now() });
   } catch (e) {
     // Best-effort only — local caching should never interrupt the editor.
   }
@@ -499,44 +500,54 @@ function toast(msg) {
 
 function show(id) {
   document.getElementById(id).classList.remove('hidden');
-  if (id === 'overlay-editor') applyEditorViewportFix();
+  applyViewportFix();
 }
 function hide(id) {
   document.getElementById(id).classList.add('hidden');
-  if (id === 'overlay-editor') applyEditorViewportFix();
+  applyViewportFix();
 }
 
 /* ---------------------------------------------------------------------
  * Keyboard viewport fix
  *
- * Mobile browsers (iOS Safari/standalone in particular) resize the
- * *visual* viewport when the keyboard opens but leave the *layout*
- * viewport — the box `position: fixed` elements are pinned to — alone.
- * The full-screen editor is `inset: 0`, so it keeps sizing itself to the
- * old, taller layout viewport, and the sliver between the bottom of the
- * shrunk visible area and the bottom of that old box renders as a plain
- * dark gap behind the keyboard. Keeping the editor's own height and
- * offset in sync with `visualViewport` closes that gap, so the toolbar
- * ends up sitting right above the keyboard with nothing behind it.
+ * Mobile browsers (iOS Safari/standalone in particular, and Android
+ * Chrome) resize the *visual* viewport when the keyboard opens but leave
+ * the *layout* viewport — the box `position: fixed` elements are pinned
+ * to — alone. The full-screen editor and the centred dialogs are all
+ * `inset: 0`, so they'd keep sizing themselves to the old, taller box:
+ * the editor would leave a dark gap behind the keyboard, and a centred
+ * dialog would be centred on a screen that's half hidden by the keyboard,
+ * putting its password fields under it. Keeping their height and offset
+ * in sync with `visualViewport` fixes both — the toolbar sits right above
+ * the keyboard, and dialogs re-centre in the space that's actually left.
  * ------------------------------------------------------------------- */
 
-function applyEditorViewportFix() {
-  const el = document.getElementById('overlay-editor');
-  if (!el) return;
+function applyViewportFix() {
   const vv = window.visualViewport;
-  if (!vv || el.classList.contains('hidden')) {
-    el.style.top = '';
-    el.style.height = '';
-    return;
-  }
-  el.style.top = vv.offsetTop + 'px';
-  el.style.height = vv.height + 'px';
+  document.querySelectorAll('#overlay-editor, .overlay').forEach((el) => {
+    if (!vv || el.classList.contains('hidden')) {
+      el.style.top = '';
+      el.style.height = '';
+      return;
+    }
+    el.style.top = vv.offsetTop + 'px';
+    el.style.height = vv.height + 'px';
+  });
 }
 
 function setupKeyboardViewportFix() {
-  if (!window.visualViewport) return;
-  window.visualViewport.addEventListener('resize', applyEditorViewportFix);
-  window.visualViewport.addEventListener('scroll', applyEditorViewportFix);
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', applyViewportFix);
+    window.visualViewport.addEventListener('scroll', applyViewportFix);
+  }
+  // A focused field inside a dialog scrolls into the middle of what's left
+  // once the keyboard has finished animating in.
+  document.addEventListener('focusin', (e) => {
+    const t = e.target;
+    if (!t.closest || !t.closest('.modal') || !t.matches('input, textarea, select')) return;
+    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    setTimeout(() => t.scrollIntoView({ block: 'center', behavior: reduce ? 'auto' : 'smooth' }), 250);
+  });
 }
 
 /* ---------------------------------------------------------------------
@@ -655,7 +666,15 @@ async function flushOutbox() {
       try {
         let result = null;
         if (item.op === 'delete') {
-          await API.deleteNote(item.id);
+          try {
+            await API.deleteNote(item.id);
+          } catch (delErr) {
+            // 404 = the server never had this note (or it's already gone),
+            // which is exactly the outcome a delete wants. Treating it as a
+            // failure left the delete queued forever — that was the
+            // permanent "Not synced" pill.
+            if (delErr.status !== 404) throw delErr;
+          }
         } else {
           result = await API.saveNote(item.id, item.payload);
         }
@@ -677,6 +696,7 @@ async function flushOutbox() {
       } catch (e) {
         if (e.isNetworkError) { setOnline(false); break; }
         // Real server error for this one item — leave it queued, keep going.
+        // (Deletes of missing notes are handled above and never land here.)
       }
     }
   } finally {
@@ -753,6 +773,15 @@ function cardHTML(meta) {
     ? `<span class="pending-pill" title="Saved on this device — will sync once you\u2019re back online">Not synced</span>`
     : '';
 
+  // Normal notes keep Download / Delete inside the note (editor toolbar).
+  // Locked notes must keep them on the card: Download is the only way into
+  // a time-locked note before its date, and that has to work while sealed.
+  const actions = isLocked ? `
+        <div class="card-actions">
+          <button class="icon-btn" data-action="download" data-id="${meta.id}" title="Download" aria-label="Download">${downloadGlyph}</button>
+          <button class="icon-btn" data-action="delete" data-id="${meta.id}" title="Delete" aria-label="Delete">${trashGlyph}</button>
+        </div>` : '';
+
   const titleText = isLocked ? 'Locked note' : (meta.title || 'Untitled');
   let snippet = meta.preview || '';
   if (isLocked) {
@@ -770,10 +799,7 @@ function cardHTML(meta) {
       </div>
       <div class="card-footer">
         <span class="card-meta">${fmtDate(meta.updatedAt || meta.createdAt)}</span>
-        <div class="card-actions">
-          <button class="icon-btn" data-action="download" data-id="${meta.id}" title="Download" aria-label="Download">${downloadGlyph}</button>
-          <button class="icon-btn" data-action="delete" data-id="${meta.id}" title="Delete" aria-label="Delete">${trashGlyph}</button>
-        </div>
+        ${actions}
       </div>
     </article>`;
 }
@@ -1067,8 +1093,26 @@ function renderLockSummary() {
 
 function noteHasContent() {
   const title = document.getElementById('editor-title').value.trim();
-  const body = document.getElementById('editor-body').value;
-  return !!(title || body || editorImages.length);
+  const body = document.getElementById('editor-body').textContent.trim();
+  return !!(title || body || editorImages.length || Ink.strokes.length);
+}
+
+// The Download / Delete buttons in the editor only make sense once the
+// note exists (has been saved at least once).
+function setExistingNoteButtons(exists) {
+  document.getElementById('btn-delete-note').style.display = exists ? '' : 'none';
+  document.getElementById('btn-download-note').style.display = exists ? '' : 'none';
+}
+
+// Fills every editor field from a stored content object. Old notes only
+// have plain `body` text; newer ones also carry `html` and `drawing`.
+function setEditorContent(content) {
+  document.getElementById('editor-title').value = content.title || '';
+  document.getElementById('editor-body').innerHTML =
+    content.html ? sanitizeHTML(content.html) : textToHTML(content.body);
+  editorImages = (content.images || []).slice();
+  renderEditorThumbs();
+  inkLoad(content.drawing);
 }
 
 function openEditorWithContent(meta, content) {
@@ -1083,11 +1127,9 @@ function openEditorWithContent(meta, content) {
   stopAutosaveTimers();
 
   document.getElementById('editor-heading').textContent = isExisting ? 'Edit note' : 'New note';
-  document.getElementById('editor-title').value = content.title || '';
-  document.getElementById('editor-body').value = content.body || '';
-  editorImages = (content.images || []).slice();
-  renderEditorThumbs();
-  document.getElementById('btn-delete-note').style.display = noteExistsOnServer ? '' : 'none';
+  setDrawMode(false);
+  setEditorContent(content);
+  setExistingNoteButtons(noteExistsOnServer);
 
   pendingLock = (meta && meta.lockType && meta.lockType !== 'none')
     ? { type: meta.lockType, unlockAt: meta.unlockAt, existing: true }
@@ -1113,10 +1155,14 @@ function openEditorWithContent(meta, content) {
 async function maybeOfferDraftRestore(noteId, serverContent) {
   const draft = await loadLocalDraft(noteId);
   if (!draft) return;
-  const draftKey = JSON.stringify({ title: draft.title || '', body: draft.body || '', images: draft.images || [] });
-  const serverKey = JSON.stringify({
-    title: serverContent.title || '', body: serverContent.body || '', images: serverContent.images || [],
+  const contentKey = (c) => JSON.stringify({
+    title: c.title || '',
+    html: sanitizeHTML(c.html || textToHTML(c.body)),
+    images: c.images || [],
+    drawing: (c.drawing && c.drawing.strokes && c.drawing.strokes.length) ? c.drawing.strokes : null,
   });
+  const draftKey = contentKey(draft);
+  const serverKey = contentKey(serverContent);
   if (draftKey === serverKey) { clearLocalDraft(noteId); return; }
   if (editingNoteId !== noteId) return; // the user has already moved on
 
@@ -1125,10 +1171,7 @@ async function maybeOfferDraftRestore(noteId, serverContent) {
     'This note has changes from an earlier session that never made it to the server. Restore them?',
     async () => {
       if (editingNoteId !== noteId) return;
-      document.getElementById('editor-title').value = draft.title || '';
-      document.getElementById('editor-body').value = draft.body || '';
-      editorImages = (draft.images || []).slice();
-      renderEditorThumbs();
+      setEditorContent(draft);
       onEditorContentChanged();
       toast('Draft restored');
     },
@@ -1167,21 +1210,25 @@ function resolveLockForSnapshot() {
 }
 
 function captureSnapshot() {
+  const html = sanitizeHTML(document.getElementById('editor-body').innerHTML);
   return {
     title: document.getElementById('editor-title').value.trim(),
-    body: document.getElementById('editor-body').value,
+    body: htmlToText(html), // plain-text copy: previews, search, and readers that predate formatting
+    html,
     images: editorImages.slice(),
+    drawing: inkGetData(),
     lock: resolveLockForSnapshot(),
   };
 }
 
 async function buildSavePayload(snapshot) {
-  const { title, body, images, lock } = snapshot;
-  const content = { title, body, images };
+  const { title, body, html, images, drawing, lock } = snapshot;
+  const content = { title, body, html, images };
+  if (drawing) content.drawing = drawing;
   let payload;
 
   if (!lock || lock.type === 'none') {
-    payload = { lockType: 'none', title, preview: makePreview(body), content };
+    payload = { lockType: 'none', title, preview: makePreview(body) || (drawing ? 'Drawing' : ''), content };
   } else if (lock.type === 'quick') {
     if (!lock.password) throw new Error('missing password for quick lock');
     const record = await encryptNote(lock.password, content);
@@ -1271,7 +1318,7 @@ async function syncRunOne(noteId, snapshot, state) {
     setOnline(true);
     if (noteId === editingNoteId) {
       noteExistsOnServer = true;
-      document.getElementById('btn-delete-note').style.display = '';
+      setExistingNoteButtons(true);
       document.getElementById('editor-heading').textContent = 'Edit note';
       lastAutosavedJSON = JSON.stringify(snapshot);
     }
@@ -1289,7 +1336,7 @@ async function syncRunOne(noteId, snapshot, state) {
       await applyOfflineSavedNote(noteId, payload);
       if (noteId === editingNoteId) {
         noteExistsOnServer = true;
-        document.getElementById('btn-delete-note').style.display = '';
+        setExistingNoteButtons(true);
         document.getElementById('editor-heading').textContent = 'Edit note';
         lastAutosavedJSON = JSON.stringify(snapshot);
       }
@@ -1330,11 +1377,14 @@ function onEditorContentChanged() {
     localDraftThrottle = setTimeout(() => {
       localDraftThrottle = null;
       if (noteHasContent()) {
+        const html = sanitizeHTML(document.getElementById('editor-body').innerHTML);
         saveLocalDraft(
           editingNoteId,
           document.getElementById('editor-title').value,
-          document.getElementById('editor-body').value,
-          editorImages.slice()
+          htmlToText(html),
+          editorImages.slice(),
+          html,
+          inkGetData()
         );
       }
     }, 1000);
@@ -1381,6 +1431,7 @@ function closeEditorAndSync(isExplicitSave) {
   }
 
   stopAutosaveTimers();
+  setDrawMode(false);
 
   if (!noteHasContent()) {
     clearLocalDraft(noteId);
@@ -1429,7 +1480,11 @@ function confirmDelete(id, fromEditor) {
       return;
     }
     try {
-      await API.deleteNote(id);
+      try {
+        await API.deleteNote(id);
+      } catch (delErr) {
+        if (delErr.status !== 404) throw delErr; // already gone server-side = success
+      }
       setOnline(true);
       await clearOutbox(id);
       toast('Deleted');
@@ -1726,7 +1781,7 @@ const FORCE_REFRESH_SHELL_FILES = [
 function openSettings() {
   document.getElementById('settings-api-base').value = Config.base();
   document.getElementById('settings-token').value = Config.token();
-  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.3.0';
+  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.4.0';
   show('overlay-settings');
 }
 
@@ -1802,6 +1857,7 @@ function wireStaticEvents() {
       return;
     }
     if (!document.getElementById('overlay-editor').classList.contains('hidden')) {
+      if (Ink.mode) { setDrawMode(false); return; }
       attemptCloseEditor();
     }
   });
@@ -1841,7 +1897,9 @@ function wireStaticEvents() {
   });
 
   document.getElementById('editor-title').addEventListener('input', onEditorContentChanged);
-  document.getElementById('editor-body').addEventListener('input', onEditorContentChanged);
+  document.getElementById('btn-download-note').addEventListener('click', () => {
+    if (editingNoteId) downloadNote(editingNoteId);
+  });
 
   document.getElementById('btn-attach-image').addEventListener('click', () => {
     document.getElementById('input-image').click();
@@ -1934,6 +1992,542 @@ function wireStaticEvents() {
  * ------------------------------------------------------------------- */
 
 /* ---------------------------------------------------------------------
+ * Rich text — bold / italic / underline, headings, lists
+ *
+ * The note body is a contenteditable element. What's *stored* is sanitized
+ * HTML (only the handful of tags below, no attributes at all) in
+ * `content.html`, plus a plain-text copy in `content.body` that previews
+ * and older copies of the app keep using. Notes written before formatting
+ * existed only have `body`; they're turned into paragraphs on open.
+ * ------------------------------------------------------------------- */
+
+const RICH_ALLOWED_TAGS = new Set([
+  'P', 'DIV', 'BR', 'STRONG', 'B', 'EM', 'I', 'U',
+  'H1', 'H2', 'H3', 'UL', 'OL', 'LI', 'BLOCKQUOTE',
+]);
+// Dropped along with everything inside them. Any other unknown tag
+// (span, font, a, …) is unwrapped: its text stays, the tag goes.
+const RICH_DROP_TAGS = new Set([
+  'SCRIPT', 'STYLE', 'IFRAME', 'OBJECT', 'EMBED', 'LINK', 'META', 'TEMPLATE', 'NOSCRIPT',
+  'SVG', 'MATH', 'FORM', 'INPUT', 'TEXTAREA', 'SELECT', 'BUTTON', 'IMG', 'VIDEO', 'AUDIO', 'CANVAS',
+]);
+const RICH_BLOCK_TAGS = new Set(['P', 'DIV', 'H1', 'H2', 'H3', 'LI', 'BLOCKQUOTE']);
+
+function sanitizeHTML(html) {
+  // DOMParser documents are inert: nothing in them runs or loads.
+  const doc = new DOMParser().parseFromString('<!doctype html><body>' + String(html || ''), 'text/html');
+  const walk = (node) => {
+    let out = '';
+    node.childNodes.forEach((child) => {
+      if (child.nodeType === 3) { out += escapeHTML(child.nodeValue); return; }
+      if (child.nodeType !== 1) return;
+      const tag = child.tagName.toUpperCase();
+      if (RICH_DROP_TAGS.has(tag)) return;
+      if (tag === 'BR') { out += '<br>'; return; }
+      const inner = walk(child);
+      if (RICH_ALLOWED_TAGS.has(tag)) {
+        const t = tag.toLowerCase();
+        out += '<' + t + '>' + inner + '</' + t + '>';
+      } else {
+        out += inner;
+      }
+    });
+    return out;
+  };
+  return walk(doc.body);
+}
+
+function textToHTML(text) {
+  const t = String(text || '');
+  if (!t) return '';
+  return t.split('\n').map((line) => (line ? '<div>' + escapeHTML(line) + '</div>' : '<div><br></div>')).join('');
+}
+
+function htmlToText(html) {
+  const doc = new DOMParser().parseFromString('<!doctype html><body>' + String(html || ''), 'text/html');
+  const lines = [];
+  let cur = '';
+  const flush = () => { if (cur) { lines.push(cur); cur = ''; } };
+  const walk = (node) => {
+    node.childNodes.forEach((child) => {
+      if (child.nodeType === 3) { cur += child.nodeValue; return; }
+      if (child.nodeType !== 1) return;
+      const tag = child.tagName.toUpperCase();
+      if (tag === 'BR') {
+        // A <br> that just holds an otherwise-empty block open (<div><br></div>) is a blank line.
+        lines.push(cur); cur = ''; return;
+      }
+      if (RICH_BLOCK_TAGS.has(tag)) {
+        flush();
+        if (tag === 'LI') cur = '\u2022 ';
+        walk(child);
+        flush();
+      } else {
+        walk(child);
+      }
+    });
+  };
+  walk(doc.body);
+  flush();
+  return lines.join('\n').replace(/\u00a0/g, ' ').replace(/\n+$/, '');
+}
+
+let savedBodyRange = null;
+
+function selectionInBody() {
+  const body = document.getElementById('editor-body');
+  const sel = window.getSelection();
+  return !!(sel && sel.rangeCount && body.contains(sel.anchorNode));
+}
+
+function currentBlockTag() {
+  const body = document.getElementById('editor-body');
+  const sel = window.getSelection();
+  let node = sel && sel.anchorNode;
+  while (node && node !== body) {
+    if (node.nodeType === 1 && RICH_BLOCK_TAGS.has(node.tagName.toUpperCase())) {
+      const tag = node.tagName.toLowerCase();
+      if (tag !== 'li') return tag;
+    }
+    node = node.parentNode;
+  }
+  return 'div';
+}
+
+function updateFormatState() {
+  if (!selectionInBody()) return;
+  const block = currentBlockTag();
+  const state = {
+    bold: document.queryCommandState('bold'),
+    italic: document.queryCommandState('italic'),
+    underline: document.queryCommandState('underline'),
+    h1: block === 'h1',
+    h2: block === 'h2',
+    ul: document.queryCommandState('insertUnorderedList'),
+    ol: document.queryCommandState('insertOrderedList'),
+  };
+  document.querySelectorAll('[data-fmt]').forEach((btn) => {
+    btn.setAttribute('aria-pressed', String(!!state[btn.dataset.fmt]));
+  });
+}
+
+function runFormat(cmd) {
+  const body = document.getElementById('editor-body');
+  if (!selectionInBody()) {
+    body.focus();
+    if (savedBodyRange) {
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(savedBodyRange);
+    }
+  }
+  if (cmd === 'bold' || cmd === 'italic' || cmd === 'underline') {
+    document.execCommand(cmd);
+  } else if (cmd === 'h1' || cmd === 'h2') {
+    // Tapping the active heading again turns it back into a normal paragraph.
+    document.execCommand('formatBlock', false, currentBlockTag() === cmd ? '<div>' : '<' + cmd + '>');
+  } else if (cmd === 'ul') {
+    document.execCommand('insertUnorderedList');
+  } else if (cmd === 'ol') {
+    document.execCommand('insertOrderedList');
+  }
+  updateFormatState();
+  onEditorContentChanged();
+}
+
+function setupRichText() {
+  const body = document.getElementById('editor-body');
+  try {
+    document.execCommand('defaultParagraphSeparator', false, 'div'); // <div> lines nest cleanly with lists/headings; <p> doesn't
+    document.execCommand('styleWithCSS', false, false); // <b>/<i>/<u> tags, not inline styles
+  } catch (e) { /* older engines — formatting still works, tags may differ and get sanitized */ }
+
+  body.addEventListener('input', () => {
+    // Browsers leave a lone <br>/empty block behind after deleting
+    // everything, which would hide the placeholder — reset it.
+    const h = body.innerHTML.trim();
+    if (h === '<br>' || h === '<p><br></p>' || h === '<div><br></div>') body.innerHTML = '';
+    onEditorContentChanged();
+  });
+
+  // Paste as plain text so formatting from other apps can't sneak in.
+  body.addEventListener('paste', (e) => {
+    e.preventDefault();
+    const text = (e.clipboardData || window.clipboardData).getData('text/plain');
+    if (text) document.execCommand('insertText', false, text);
+  });
+  body.addEventListener('drop', (e) => e.preventDefault());
+
+  document.addEventListener('selectionchange', () => {
+    const sel = window.getSelection();
+    if (selectionInBody() && sel.rangeCount) savedBodyRange = sel.getRangeAt(0).cloneRange();
+    updateFormatState();
+  });
+
+  document.querySelectorAll('[data-fmt]').forEach((btn) => {
+    // Keep focus + selection in the note while a formatting button is tapped.
+    btn.addEventListener('mousedown', (e) => e.preventDefault());
+    btn.addEventListener('click', () => runFormat(btn.dataset.fmt));
+  });
+}
+
+/* ---------------------------------------------------------------------
+ * Ink — draw directly over a note
+ *
+ * Two canvases sit on top of the note's title/body/photos (see
+ * .editor-sheet in index.html): one for finished strokes, one for the
+ * stroke being drawn right now. Strokes are stored as vectors, not a
+ * bitmap, so they stay sharp, can be erased/undone, and stay small.
+ * Every coordinate and width is a fraction of the sheet's *width*, so a
+ * drawing scales with the note on a different screen. (The text still
+ * reflows, so ink sits over the same words on the same width, and drifts
+ * a little if the width changes a lot — the usual limit of ink over
+ * reflowing text.)
+ *
+ * Saved in content.drawing = { v: 1, strokes: [{ t, c, w, p }] }
+ *   t: 'p' pen | 'h' highlighter     c: '#rrggbb'
+ *   w: line width     p: [x0, y0, x1, y1, …]
+ * ------------------------------------------------------------------- */
+
+const INK_PEN_PX = { s: 1.5, m: 3, l: 6 };   // at a ~360px-wide note
+const INK_HIGHLIGHT_FACTOR = 5;
+const INK_HIGHLIGHT_ALPHA = 0.35;
+const INK_ERASER_PX = 12;
+const INK_MAX_UNDO = 100;
+const INK_MAX_CANVAS_PIXELS = 16e6;
+
+const Ink = {
+  strokes: [], undoStack: [], redoStack: [],
+  mode: false, tool: 'pen', color: '#23241F', size: 'm',
+  W: 0, H: 0, dpr: 1,
+  canvas: null, live: null, ctx: null, lctx: null, sheet: null,
+  current: null,        // stroke being drawn
+  gestureBefore: null,  // eraser: strokes as they were when the gesture began
+  erased: false,
+  raf: 0,
+};
+
+const inkBBoxCache = new WeakMap();
+const inkR4 = (v) => Math.round(v * 10000) / 10000;
+
+function inkEstimateBytes() {
+  let n = 0;
+  for (const s of Ink.strokes) n += s.p.length * 7 + 40;
+  return n;
+}
+
+// A copy of the array (stroke objects are never mutated once committed),
+// so an in-flight save can't be changed by drawing that happens meanwhile.
+function inkGetData() {
+  return Ink.strokes.length ? { v: 1, strokes: Ink.strokes.slice() } : null;
+}
+
+function inkLoad(data) {
+  const ok = (s) => s && (s.t === 'p' || s.t === 'h') && /^#[0-9a-f]{6}$/i.test(s.c)
+    && typeof s.w === 'number' && s.w > 0 && s.w < 1
+    && Array.isArray(s.p) && s.p.length >= 2 && s.p.length % 2 === 0 && s.p.every(Number.isFinite);
+  Ink.strokes = data && Array.isArray(data.strokes) ? data.strokes.filter(ok) : [];
+  Ink.undoStack = [];
+  Ink.redoStack = [];
+  Ink.current = null;
+  inkRender();
+  inkUpdateButtons();
+}
+
+function inkResize() {
+  const { sheet, canvas, live } = Ink;
+  if (!sheet) return;
+  const W = sheet.clientWidth, H = sheet.clientHeight;
+  if (!W || !H) return;
+  let dpr = Math.min(window.devicePixelRatio || 1, 3);
+  if (W * H * dpr * dpr > INK_MAX_CANVAS_PIXELS) dpr = Math.sqrt(INK_MAX_CANVAS_PIXELS / (W * H));
+  if (W === Ink.W && H === Ink.H && dpr === Ink.dpr) return;
+  Ink.W = W; Ink.H = H; Ink.dpr = dpr;
+  for (const c of [canvas, live]) {
+    c.width = Math.round(W * dpr);
+    c.height = Math.round(H * dpr);
+  }
+  inkRender();
+}
+
+function inkPaint(ctx, s) {
+  const W = Ink.W, p = s.p, n = p.length / 2;
+  ctx.save();
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.strokeStyle = s.c;
+  ctx.fillStyle = s.c;
+  ctx.lineWidth = s.w * W;
+  ctx.globalAlpha = s.t === 'h' ? INK_HIGHLIGHT_ALPHA : 1;
+  ctx.beginPath();
+  if (n === 1) {
+    ctx.arc(p[0] * W, p[1] * W, ctx.lineWidth / 2, 0, Math.PI * 2);
+    ctx.fill();
+  } else {
+    ctx.moveTo(p[0] * W, p[1] * W);
+    // Quadratic curves through the midpoints smooth out pointer jitter.
+    for (let i = 1; i < n - 1; i++) {
+      ctx.quadraticCurveTo(
+        p[2 * i] * W, p[2 * i + 1] * W,
+        (p[2 * i] + p[2 * i + 2]) / 2 * W, (p[2 * i + 1] + p[2 * i + 3]) / 2 * W
+      );
+    }
+    ctx.lineTo(p[2 * (n - 1)] * W, p[2 * (n - 1) + 1] * W);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function inkRender() {
+  if (!Ink.ctx || !Ink.W) return;
+  const { ctx, canvas, dpr } = Ink;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  for (const s of Ink.strokes) inkPaint(ctx, s);
+}
+
+function inkDrawLive() {
+  Ink.raf = 0;
+  if (!Ink.lctx || !Ink.W) return;
+  const { lctx, live, dpr } = Ink;
+  lctx.setTransform(1, 0, 0, 1, 0, 0);
+  lctx.clearRect(0, 0, live.width, live.height);
+  if (!Ink.current) return;
+  lctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  inkPaint(lctx, Ink.current);
+}
+
+function inkChanged() {
+  inkUpdateButtons();
+  onEditorContentChanged();
+}
+
+function inkPushUndo(before) {
+  Ink.undoStack.push(before);
+  if (Ink.undoStack.length > INK_MAX_UNDO) Ink.undoStack.shift();
+  Ink.redoStack = [];
+}
+
+function inkCommit(stroke) {
+  inkPushUndo(Ink.strokes.slice());
+  Ink.strokes.push(stroke);
+  const { ctx, dpr } = Ink;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  inkPaint(ctx, stroke);
+  inkChanged();
+}
+
+function inkUndo() {
+  if (!Ink.undoStack.length) return;
+  Ink.redoStack.push(Ink.strokes);
+  Ink.strokes = Ink.undoStack.pop();
+  inkRender();
+  inkChanged();
+}
+
+function inkRedo() {
+  if (!Ink.redoStack.length) return;
+  Ink.undoStack.push(Ink.strokes);
+  Ink.strokes = Ink.redoStack.pop();
+  inkRender();
+  inkChanged();
+}
+
+function inkClear() {
+  if (!Ink.strokes.length) return;
+  inkPushUndo(Ink.strokes.slice());
+  Ink.strokes = [];
+  inkRender();
+  inkChanged();
+  toast('Drawing cleared — tap Undo to bring it back');
+}
+
+/* Eraser: removes whole strokes the pointer touches. */
+
+function inkBBox(s) {
+  let bb = inkBBoxCache.get(s);
+  if (!bb) {
+    bb = [Infinity, Infinity, -Infinity, -Infinity];
+    for (let i = 0; i < s.p.length; i += 2) {
+      bb[0] = Math.min(bb[0], s.p[i]);     bb[2] = Math.max(bb[2], s.p[i]);
+      bb[1] = Math.min(bb[1], s.p[i + 1]); bb[3] = Math.max(bb[3], s.p[i + 1]);
+    }
+    inkBBoxCache.set(s, bb);
+  }
+  return bb;
+}
+
+function inkSegDist(px, py, x1, y1, x2, y2) {
+  const dx = x2 - x1, dy = y2 - y1;
+  const len2 = dx * dx + dy * dy;
+  let t = len2 ? ((px - x1) * dx + (py - y1) * dy) / len2 : 0;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+}
+
+function inkStrokeHit(s, pt, r) {
+  const pad = r + s.w / 2;
+  const bb = inkBBox(s);
+  if (pt[0] < bb[0] - pad || pt[0] > bb[2] + pad || pt[1] < bb[1] - pad || pt[1] > bb[3] + pad) return false;
+  const p = s.p, n = p.length / 2;
+  if (n === 1) return Math.hypot(p[0] - pt[0], p[1] - pt[1]) <= pad;
+  for (let i = 0; i < n - 1; i++) {
+    if (inkSegDist(pt[0], pt[1], p[2 * i], p[2 * i + 1], p[2 * i + 2], p[2 * i + 3]) <= pad) return true;
+  }
+  return false;
+}
+
+function inkEraseAt(pt) {
+  const r = INK_ERASER_PX / Ink.W;
+  const keep = Ink.strokes.filter((s) => !inkStrokeHit(s, pt, r));
+  if (keep.length !== Ink.strokes.length) {
+    Ink.strokes = keep;
+    Ink.erased = true;
+    inkRender();
+  }
+}
+
+/* Pointer input */
+
+function inkPoint(e) {
+  const r = Ink.live.getBoundingClientRect();
+  return [inkR4((e.clientX - r.left) / Ink.W), inkR4((e.clientY - r.top) / Ink.W)];
+}
+
+function inkEvents(e) {
+  const list = e.getCoalescedEvents ? e.getCoalescedEvents() : [];
+  return list.length ? list : [e];
+}
+
+function inkPointerDown(e) {
+  if (!Ink.mode || Ink.tool === 'scroll' || !e.isPrimary) return;
+  if (e.pointerType === 'mouse' && e.button !== 0) return;
+  e.preventDefault();
+  Ink.live.setPointerCapture(e.pointerId);
+  const pt = inkPoint(e);
+  if (Ink.tool === 'eraser') {
+    Ink.gestureBefore = Ink.strokes.slice();
+    Ink.erased = false;
+    inkEraseAt(pt);
+    return;
+  }
+  const highlight = Ink.tool === 'highlighter';
+  const px = INK_PEN_PX[Ink.size] * (highlight ? INK_HIGHLIGHT_FACTOR : 1);
+  Ink.current = { t: highlight ? 'h' : 'p', c: Ink.color, w: inkR4(px / Ink.W), p: pt };
+  if (!Ink.raf) Ink.raf = requestAnimationFrame(inkDrawLive);
+}
+
+function inkPointerMove(e) {
+  if (!e.isPrimary) return;
+  if (Ink.tool === 'eraser') {
+    if (Ink.gestureBefore) for (const ev of inkEvents(e)) inkEraseAt(inkPoint(ev));
+    return;
+  }
+  const cur = Ink.current;
+  if (!cur) return;
+  for (const ev of inkEvents(e)) {
+    const pt = inkPoint(ev);
+    const n = cur.p.length;
+    // Skip points closer than ~1px to the last one — keeps saved data small.
+    if (Math.hypot(pt[0] - cur.p[n - 2], pt[1] - cur.p[n - 1]) * Ink.W < 1) continue;
+    cur.p.push(pt[0], pt[1]);
+  }
+  if (!Ink.raf) Ink.raf = requestAnimationFrame(inkDrawLive);
+}
+
+function inkPointerEnd(e) {
+  if (!e.isPrimary) return;
+  if (Ink.gestureBefore) {
+    if (Ink.erased) { inkPushUndo(Ink.gestureBefore); inkChanged(); }
+    Ink.gestureBefore = null;
+    Ink.erased = false;
+  }
+  if (Ink.current) {
+    const stroke = Ink.current;
+    Ink.current = null;
+    inkCommit(stroke);
+    if (!Ink.raf) Ink.raf = requestAnimationFrame(inkDrawLive); // clears the live layer
+  }
+}
+
+/* Toolbar + mode */
+
+function inkUpdateButtons() {
+  const undo = document.querySelector('[data-ink-action="undo"]');
+  const redo = document.querySelector('[data-ink-action="redo"]');
+  const clear = document.querySelector('[data-ink-action="clear"]');
+  if (undo) undo.disabled = !Ink.undoStack.length;
+  if (redo) redo.disabled = !Ink.redoStack.length;
+  if (clear) clear.disabled = !Ink.strokes.length;
+}
+
+function inkSyncPressed() {
+  document.querySelectorAll('[data-ink-tool]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.inkTool === Ink.tool)));
+  document.querySelectorAll('[data-ink-color]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.inkColor === Ink.color)));
+  document.querySelectorAll('[data-ink-size]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.inkSize === Ink.size)));
+  Ink.live.classList.toggle('can-draw', Ink.tool !== 'scroll');
+}
+
+function setDrawMode(on) {
+  if (!Ink.sheet) return;
+  Ink.mode = on;
+  Ink.sheet.classList.toggle('is-drawing', on);
+  document.getElementById('draw-bar').hidden = !on;
+  document.getElementById('format-bar').hidden = on;
+  document.getElementById('btn-draw').setAttribute('aria-pressed', String(on));
+  if (on && document.activeElement && document.activeElement.blur) document.activeElement.blur(); // drops the keyboard
+  if (!on) { Ink.current = null; Ink.gestureBefore = null; }
+  inkSyncPressed();
+  inkUpdateButtons();
+  requestAnimationFrame(inkResize);
+}
+
+function setupInk() {
+  Ink.sheet = document.getElementById('editor-sheet');
+  Ink.canvas = document.getElementById('ink-canvas');
+  Ink.live = document.getElementById('ink-live');
+  Ink.ctx = Ink.canvas.getContext('2d');
+  Ink.lctx = Ink.live.getContext('2d');
+
+  if (window.ResizeObserver) new ResizeObserver(inkResize).observe(Ink.sheet);
+  window.addEventListener('resize', inkResize);
+
+  Ink.live.addEventListener('pointerdown', inkPointerDown);
+  Ink.live.addEventListener('pointermove', inkPointerMove);
+  Ink.live.addEventListener('pointerup', inkPointerEnd);
+  Ink.live.addEventListener('pointercancel', inkPointerEnd);
+
+  document.getElementById('btn-draw').addEventListener('click', () => setDrawMode(!Ink.mode));
+
+  document.querySelectorAll('[data-ink-tool]').forEach((b) => b.addEventListener('click', () => {
+    Ink.tool = b.dataset.inkTool;
+    // Highlighting in black is rarely what anyone wants — nudge to yellow
+    // the first time the highlighter is picked while black is selected.
+    if (Ink.tool === 'highlighter' && Ink.color === '#23241F') Ink.color = '#E5B417';
+    inkSyncPressed();
+  }));
+  document.querySelectorAll('[data-ink-color]').forEach((b) => b.addEventListener('click', () => {
+    Ink.color = b.dataset.inkColor;
+    if (Ink.tool === 'eraser' || Ink.tool === 'scroll') Ink.tool = 'pen';
+    inkSyncPressed();
+  }));
+  document.querySelectorAll('[data-ink-size]').forEach((b) => b.addEventListener('click', () => {
+    Ink.size = b.dataset.inkSize;
+    inkSyncPressed();
+  }));
+  document.querySelectorAll('[data-ink-action]').forEach((b) => b.addEventListener('click', () => {
+    const a = b.dataset.inkAction;
+    if (a === 'undo') inkUndo();
+    else if (a === 'redo') inkRedo();
+    else if (a === 'clear') inkClear();
+  }));
+
+  inkSyncPressed();
+  inkUpdateButtons();
+}
+
+/* ---------------------------------------------------------------------
  * Draft recovery banner — surfaces a local draft that never made it to
  * the server (an abrupt close mid-typing, before the ~1s local cache even
  * had a version the last successful save doesn't already cover).
@@ -1955,7 +2549,7 @@ async function checkForRecoverableDrafts() {
   document.getElementById('draft-banner-resume').onclick = () => {
     banner.classList.add('hidden');
     const meta = notesCache.find((m) => m.id === id) || null;
-    openEditorWithContent(meta, { title: draft.title, body: draft.body, images: draft.images || [] });
+    openEditorWithContent(meta, { title: draft.title, body: draft.body, html: draft.html, images: draft.images || [], drawing: draft.drawing });
     // If the note this draft belonged to no longer exists server-side,
     // openEditorWithContent treats it as a new note under a new id — so
     // this old entry is now orphaned and needs clearing explicitly, or
@@ -1978,7 +2572,9 @@ function init() {
   wireStaticEvents();
   setupKeyboardViewportFix();
   setupLightbox();
-  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.3.0');
+  setupRichText();
+  setupInk();
+  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.4.0');
 
   // Connectivity: react the moment the browser notices, and keep retrying
   // on a timer since navigator.onLine can't see a connection that's up but

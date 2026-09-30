@@ -7,7 +7,7 @@
  *
  * Data layout (all in the one KV namespace):
  *   meta:{id}    -> { id, createdAt, updatedAt, lockType, unlockAt, title, preview }
- *   content:{id} -> plain {title, body, images} OR encrypted {salt, iv, ciphertext}
+ *   content:{id} -> plain {title, body, html?, images, drawing?} OR encrypted {salt, iv, ciphertext}
  *   vault:{id}   -> password2 string (time-locked notes only)
  *
  * No R2 bucket, no payment method required on the Cloudflare account — KV's

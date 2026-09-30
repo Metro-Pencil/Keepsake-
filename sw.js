@@ -3,7 +3,7 @@
 // changed and re-fetches the shell — otherwise installed PWAs can get
 // stuck on an old cached version forever. See the "Force refresh" button
 // in Settings for a manual way out of that if a deploy forgets to.
-const CACHE_NAME = 'keepsake-shell-v7';
+const CACHE_NAME = 'keepsake-shell-v8';
 const SHELL_FILES = [
   './',
   './index.html',

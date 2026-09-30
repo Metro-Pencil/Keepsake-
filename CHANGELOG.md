@@ -6,6 +6,42 @@ All notable changes to this project are recorded here, following
 small — gets a version bump. If the version number hasn't moved,
 nothing changed; that's the whole point of keeping one.
 
+## v1.4.0 — 2026-09-30
+
+- **Fixed "Not synced" staying on forever.** The Worker answers a delete
+  for a note it doesn't have with a 404, and the app treated that as a real
+  failure: a delete queued for a note that never reached the server (or was
+  already gone) stayed in the outbox permanently, retrying silently every
+  30s, so the "Not synced" pill never cleared no matter how many later saves
+  succeeded. A 404 on delete now counts as done — including for anything
+  already stuck in the queue, which clears the next time the app opens.
+- **Formatting.** The note body is now a rich-text editor with a bar above
+  the toolbar: **bold**, *italic*, underline, two heading sizes, and
+  bulleted / numbered lists (Ctrl/Cmd+B, I, U also work). Pasting always
+  inserts plain text. Formatting is stored as sanitized HTML in
+  `content.html`, with the plain text kept in `content.body`, so previews
+  and older notes are unaffected — old notes simply open as ordinary lines.
+- **Draw on notes.** New pencil/scribble button in the editor toolbar
+  switches to drawing mode directly over the note: pen, highlighter (tints
+  text instead of hiding it), eraser (removes whole strokes), five colours,
+  three thicknesses, undo / redo / clear, and a scroll tool for moving the
+  page without drawing. Drawings are saved as vector strokes in
+  `content.drawing` (encrypted along with everything else on locked notes),
+  scale with the note's width, and autosave like text.
+- **Download and Delete moved inside normal notes.** They're gone from the
+  card face on ordinary notes and live in the editor's toolbar (Download is
+  new there; Delete already was). **Locked notes keep them on the card** —
+  Download has to work while a note is sealed.
+- **Dialogs are centred instead of sliding up from the bottom** (lock
+  chooser, unlock, confirm, settings). They also follow the on-screen
+  keyboard, re-centring in the space left above it, and a focused field
+  scrolls into the middle, so password fields are no longer hidden by it.
+  Dialog inputs are now 16px, which stops iOS zooming the page on focus.
+- Editor buttons are now 44px touch targets; the new UI uses spacing,
+  radius and z-index tokens.
+- Bumped the service worker's cache name so this reaches installed copies.
+- No Worker redeploy needed for this release.
+
 ## v1.3.0 — 2026-09-28
 
 - **Every note now works offline — locked and unlocked.** The app keeps a

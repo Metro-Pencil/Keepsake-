@@ -76,6 +76,16 @@ Open the deployed site, tap the gear icon, and fill in:
 
 Both are stored only in that browser's local storage.
 
+## Formatting and drawing
+
+Notes support bold, italic, underline, headings and lists, and you can draw
+straight over a note with the pen / highlighter tools (pencil-wave button in
+the editor toolbar). Both are stored inside the note's content — formatting as
+sanitized HTML next to the plain text, drawings as vector strokes — so locked
+notes keep them encrypted along with everything else. Drawings are positioned
+relative to the note's width; the text reflows but ink doesn't, so on a very
+different screen width ink can drift slightly off the words it was drawn over.
+
 ## Offline
 
 Keepsake keeps a copy of every note on the device (in IndexedDB), so the
