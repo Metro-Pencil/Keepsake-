@@ -387,6 +387,12 @@
     color: var(--ink);
   }
 
+  .card-title {
+    overflow-wrap: anywhere;
+  }
+
+  .card-title.is-placeholder { color: var(--ink-soft); font-weight: 500; }
+
   .card-snippet {
     font-size: 14px;
     color: var(--ink-soft);
@@ -591,6 +597,35 @@
     resize: vertical;
     line-height: 1.6;
     font-family: var(--font-display);
+  }
+
+  /* Show/hide-password field: the eye sits inside the input's trailing edge. */
+  .pw-field { position: relative; }
+
+  .field .pw-field > input[data-pw-enhanced] { padding-inline-end: 48px; }
+
+  .pw-toggle {
+    position: absolute;
+    inset-block: 0;
+    inset-inline-end: 0;
+    min-width: 44px;
+    min-height: 44px;
+    display: grid;
+    place-items: center;
+    color: var(--ink-soft);
+    border-radius: var(--radius-sm);
+  }
+
+  .pw-toggle svg { width: 20px; height: 20px; }
+  .pw-toggle:hover { color: var(--ink); }
+  .pw-toggle:active { background: var(--line); }
+  .pw-toggle[aria-pressed="true"] { color: var(--pine); }
+
+  .modal-note {
+    font-size: 0.8125rem;
+    color: var(--ink-soft);
+    line-height: 1.5;
+    margin: 0 0 var(--space-3);
   }
 
   .field .hint {
@@ -1056,7 +1091,7 @@
   <div class="top-inner">
     <div class="brand">
       <span class="brand-mark">Keepsake</span>
-      <span class="version-badge" id="version-badge">v1.4.0</span>
+      <span class="version-badge" id="version-badge">v1.4.2</span>
       <span class="sync-status hidden" id="sync-status" role="status" aria-live="polite"></span>
     </div>
     <div class="tabbar" role="tablist" aria-label="Note views">
@@ -1230,6 +1265,8 @@
         </button>
       </div>
 
+      <p class="modal-note">The note's title stays visible on its card so you can tell locked notes apart. Everything inside — text, photos and drawing — is encrypted.</p>
+
       <div id="quick-lock-fields" style="display:none;">
         <div class="field">
           <label for="quick-password">Password for this note</label>
@@ -1334,7 +1371,7 @@
 <script>
 // Bump this on EVERY change to the app, no matter how small — a typo fix,
 // a copy tweak, whatever. See CHANGELOG.md for the policy and history.
-window.KEEPSAKE_VERSION = "1.4.0";
+window.KEEPSAKE_VERSION = "1.4.2";
 </script>
 <script src="app.js"></script>
 </body>

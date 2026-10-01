@@ -7,6 +7,7 @@
  *
  * Data layout (all in the one KV namespace):
  *   meta:{id}    -> { id, createdAt, updatedAt, lockType, unlockAt, title, preview }
+ *                   (title is plain text even for locked notes; preview is null for them)
  *   content:{id} -> plain {title, body, html?, images, drawing?} OR encrypted {salt, iv, ciphertext}
  *   vault:{id}   -> password2 string (time-locked notes only)
  *
@@ -52,7 +53,11 @@ function metaFromBody(existing, body, now) {
     updatedAt: now,
     lockType,
     unlockAt: lockType === 'time' ? (body.unlockAt || null) : null,
-    title: lockType === 'none' ? String(body.title || '') : null,
+    // The title is stored in plain text for every note, locked or not, so a
+    // locked note can be recognised on its card on any device. Only the
+    // preview (a slice of the body) stays plain for unlocked notes alone —
+    // a locked note's text, photos and drawing are encrypted client-side.
+    title: String(body.title || '').slice(0, 200),
     preview: lockType === 'none' ? String(body.preview || '') : null,
   };
 }

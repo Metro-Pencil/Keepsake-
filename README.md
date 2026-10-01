@@ -120,8 +120,12 @@ offline, whichever syncs last overwrites the other.
 - `app.js` is split out from `index.html` rather than inlined, since this app
   runs long — merge them back into one file if you'd rather keep to a strict
   single-file convention.
-- Note titles and previews are only ever stored in plain text for *unlocked*
-  notes — locked notes (either type) store no plaintext at all server-side.
+- Previews (a slice of the body) are only ever stored in plain text for
+  *unlocked* notes — a locked note's content is never stored in plain text.
+  The one exception is a locked note's *title*, which is stored in plain text
+  so locked notes can be told apart on every device; its text, photos and
+  drawing are encrypted. Don't put anything sensitive in the title of a locked
+  note.
 - All three pieces of data — a note's content, its metadata, and (for
   time-locked notes) the vaulted second password — live in the same KV
   namespace under `content:{id}`, `meta:{id}`, and `vault:{id}`. If you ever

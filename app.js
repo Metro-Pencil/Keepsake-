@@ -343,7 +343,11 @@ async function listLocalDraftIds() {
  * Note cache — the local mirror every render/open/download reads from.
  * ------------------------------------------------------------------- */
 
-async function cacheNote(meta, content) {
+// `lockedTitle` is the title of a locked note, kept ONLY in this device's
+// cache — never sent to the server, which stores nothing readable about a
+// locked note. Pass undefined to keep whatever is already cached, a string
+// to set it, or null to clear it (e.g. the note was unlocked for good).
+async function cacheNote(meta, content, lockedTitle) {
   try {
     const db = await openKeepsakeDB();
     const existing = await idbGet(db, NOTE_CACHE_STORE, meta.id);
@@ -352,6 +356,7 @@ async function cacheNote(meta, content) {
       meta,
       content,
       contentUpdatedAt: meta.updatedAt, // which version of the note `content` is
+      lockedTitle: lockedTitle === undefined ? (existing ? existing.lockedTitle : undefined) : lockedTitle,
       vault: existing ? existing.vault : undefined,
       cachedAt: Date.now(),
     });
@@ -372,10 +377,32 @@ async function cacheNoteMetaOnly(meta) {
       meta,
       content: existing ? existing.content : null,
       contentUpdatedAt: existing ? existing.contentUpdatedAt : undefined,
+      lockedTitle: existing ? existing.lockedTitle : undefined,
       vault: existing ? existing.vault : undefined,
       cachedAt: Date.now(),
     });
   } catch (e) { /* best-effort */ }
+}
+
+// Remembers a locked note's title once it's been seen decrypted on this
+// device (after unlocking it). No-op if the note isn't cached yet.
+async function setLockedTitle(id, title) {
+  try {
+    const db = await openKeepsakeDB();
+    const existing = await idbGet(db, NOTE_CACHE_STORE, id);
+    if (!existing || existing.lockedTitle === title) return;
+    await idbPut(db, NOTE_CACHE_STORE, { ...existing, lockedTitle: title });
+    await rerenderFromLocal();
+  } catch (e) { /* best-effort */ }
+}
+
+// Older Workers return title:null for locked notes. Once any response shows
+// a string there, we know the Worker has been redeployed and it's worth
+// re-saving old locked notes (when they're next opened) to give them a title.
+function learnServerTitleSupport(metas) {
+  if (metas.some((m) => m && m.lockType !== 'none' && typeof m.title === 'string')) {
+    try { localStorage.setItem('ks_titlesOnServer', '1'); } catch (e) { /* private mode — harmless */ }
+  }
 }
 
 async function cacheVault(id, password2) {
@@ -413,7 +440,7 @@ async function removeCachedNote(id) {
 async function buildNotesCacheFromLocal() {
   const [cached, outboxItems] = await Promise.all([getAllCachedNotes(), getOutbox()]);
   const outboxIds = new Set(outboxItems.map((o) => o.id));
-  const metas = cached.map((c) => ({ ...c.meta, _pending: outboxIds.has(c.id) }));
+  const metas = cached.map((c) => ({ ...c.meta, _pending: outboxIds.has(c.id), _lockedTitle: c.lockedTitle || '' }));
   metas.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
   return metas;
 }
@@ -499,12 +526,63 @@ function toast(msg) {
 }
 
 function show(id) {
-  document.getElementById(id).classList.remove('hidden');
+  const el = document.getElementById(id);
+  enhancePasswordInputs(el); // also covers the unlock dialog, whose fields are built fresh each time
+  el.classList.remove('hidden');
   applyViewportFix();
 }
 function hide(id) {
-  document.getElementById(id).classList.add('hidden');
+  const el = document.getElementById(id);
+  el.classList.add('hidden');
+  setPasswordsHidden(el); // never leave a password showing behind a closed dialog
   applyViewportFix();
+}
+
+/* ---------------------------------------------------------------------
+ * Show/hide password (eye button)
+ *
+ * Every <input type="password"> gets an eye button the first time its
+ * dialog opens. Dialogs re-hide their passwords when they close.
+ * ------------------------------------------------------------------- */
+
+const EYE_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>';
+const EYE_OFF_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.9 5.2A10 10 0 0 1 12 5c6.4 0 10 7 10 7a17 17 0 0 1-3.2 4M6.6 6.6A16.5 16.5 0 0 0 2 12s3.6 7 10 7a9.7 9.7 0 0 0 4.4-1"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/><path d="M3 3l18 18"/></svg>';
+
+function setPasswordVisible(input, btn, visible) {
+  input.type = visible ? 'text' : 'password';
+  btn.setAttribute('aria-pressed', String(visible));
+  btn.setAttribute('aria-label', visible ? 'Hide password' : 'Show password');
+  btn.title = visible ? 'Hide password' : 'Show password';
+  btn.innerHTML = visible ? EYE_OFF_ICON : EYE_ICON;
+}
+
+function enhancePasswordInputs(root) {
+  root.querySelectorAll('input[type="password"]:not([data-pw-enhanced])').forEach((input) => {
+    input.dataset.pwEnhanced = '1';
+    // A revealed password shouldn't be autocorrected, capitalised or spell-checked.
+    input.setAttribute('autocapitalize', 'off');
+    input.setAttribute('autocorrect', 'off');
+    input.setAttribute('spellcheck', 'false');
+    const wrap = document.createElement('div');
+    wrap.className = 'pw-field';
+    input.parentNode.insertBefore(wrap, input);
+    wrap.appendChild(input);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'pw-toggle';
+    setPasswordVisible(input, btn, false);
+    // Keep focus (and the on-screen keyboard) in the field while toggling.
+    btn.addEventListener('mousedown', (e) => e.preventDefault());
+    btn.addEventListener('click', () => setPasswordVisible(input, btn, input.type === 'password'));
+    wrap.appendChild(btn);
+  });
+}
+
+function setPasswordsHidden(root) {
+  root.querySelectorAll('input[data-pw-enhanced]').forEach((input) => {
+    const btn = input.parentNode.querySelector('.pw-toggle');
+    if (btn && input.type !== 'password') setPasswordVisible(input, btn, false);
+  });
 }
 
 /* ---------------------------------------------------------------------
@@ -782,7 +860,12 @@ function cardHTML(meta) {
           <button class="icon-btn" data-action="delete" data-id="${meta.id}" title="Delete" aria-label="Delete">${trashGlyph}</button>
         </div>` : '';
 
-  const titleText = isLocked ? 'Locked note' : (meta.title || 'Untitled');
+  // The title comes from the server (stored in plain text, even for locked
+  // notes). Notes locked before titles were stored there fall back to a copy
+  // remembered on this device, then to a generic label.
+  const lockedTitle = isLocked ? (meta.title || meta._lockedTitle || '') : '';
+  const titleText = isLocked ? (lockedTitle || 'Locked note') : (meta.title || 'Untitled');
+  const titleClass = isLocked && !lockedTitle ? 'card-title is-placeholder' : 'card-title';
   let snippet = meta.preview || '';
   if (isLocked) {
     snippet = meta.lockType === 'time' && !fmtCountdown(meta.unlockAt)
@@ -794,7 +877,7 @@ function cardHTML(meta) {
     <article class="card ${typeClass}${revealedClass}">
       <div class="card-open" data-action="open" data-id="${meta.id}" role="button" tabindex="0">
         ${pill}${pendingBadge}
-        <div class="card-title">${escapeHTML(titleText)}</div>
+        <div class="${titleClass}">${escapeHTML(titleText)}</div>
         <div class="card-snippet">${escapeHTML(snippet)}</div>
       </div>
       <div class="card-footer">
@@ -828,14 +911,14 @@ setInterval(() => { if (notesCache.some((m) => m.lockType === 'time')) renderLoc
 // queued entry it supersedes, and redraws the grid — straight from the
 // response already in hand rather than re-fetching the whole list. This is
 // what makes a save actually feel instant in the list, not just the editor.
-async function applySavedNote(noteId, note, payload) {
+async function applySavedNote(noteId, note, payload, title) {
   const pending = (await getOutbox()).find((o) => o.id === noteId);
   // Deleted while this save was in flight — leave the queued delete alone
   // (it'll clear the server copy this request just wrote) instead of
   // resurrecting the note in the cache.
   if (pending && pending.op === 'delete') return;
   await clearOutbox(noteId);
-  await cacheNote(note, payload.content);
+  await cacheNote(note, payload.content, lockedTitleFor(payload, title));
   if (payload.lockType === 'time' && payload.password2) await cacheVault(noteId, payload.password2);
   await rerenderFromLocal();
 }
@@ -845,6 +928,10 @@ async function applySavedNote(noteId, note, payload) {
 // note is cached + queued for the next flush, and the grid shows it as a
 // normal card marked "Not synced". Queueing is a plain put keyed by note
 // id, so a later edit while still offline simply replaces this entry.
+function lockedTitleFor(payload, title) {
+  return payload.lockType === 'none' ? null : String(title || '');
+}
+
 function synthesizeMeta(id, payload) {
   const existing = notesCache.find((m) => m.id === id);
   const now = Date.now();
@@ -854,15 +941,15 @@ function synthesizeMeta(id, payload) {
     updatedAt: now,
     lockType: payload.lockType,
     unlockAt: payload.lockType === 'time' ? (payload.unlockAt || null) : null,
-    title: payload.lockType === 'none' ? String(payload.title || '') : null,
+    title: String(payload.title || ''),
     preview: payload.lockType === 'none' ? String(payload.preview || '') : null,
   };
 }
 
-async function applyOfflineSavedNote(noteId, payload) {
+async function applyOfflineSavedNote(noteId, payload, title) {
   const pending = (await getOutbox()).find((o) => o.id === noteId);
   if (pending && pending.op === 'delete') return; // deleted meanwhile — don't resurrect it
-  await cacheNote(synthesizeMeta(noteId, payload), payload.content);
+  await cacheNote(synthesizeMeta(noteId, payload), payload.content, lockedTitleFor(payload, title));
   if (payload.lockType === 'time' && payload.password2) await cacheVault(noteId, payload.password2);
   await queueOutbox(noteId, 'save', payload);
   // The outbox is now the durable local copy of this exact content, so the
@@ -892,6 +979,7 @@ async function syncFromServer() {
   }
   lastListErrorMessage = null;
   setOnline(true);
+  learnServerTitleSupport(notes);
 
   const outboxIds = new Set((await getOutbox()).map((o) => o.id));
   const serverIds = new Set(notes.map((n) => n.id));
@@ -1129,6 +1217,7 @@ function openEditorWithContent(meta, content) {
   document.getElementById('editor-heading').textContent = isExisting ? 'Edit note' : 'New note';
   setDrawMode(false);
   setEditorContent(content);
+  if (isExisting && meta.lockType && meta.lockType !== 'none') setLockedTitle(meta.id, String(content.title || ''));
   setExistingNoteButtons(noteExistsOnServer);
 
   pendingLock = (meta && meta.lockType && meta.lockType !== 'none')
@@ -1139,6 +1228,13 @@ function openEditorWithContent(meta, content) {
   // which carries the resolved lock passwords) or a locked note would always
   // look "changed" and get re-encrypted and re-uploaded just for being opened.
   lastAutosavedJSON = JSON.stringify(captureSnapshot());
+  // A note locked before titles were stored on the server has none there.
+  // Once the Worker supports it, make closing this note re-save it once so
+  // every device gets the title — no edit needed.
+  if (isExisting && meta.lockType !== 'none' && meta.title == null
+      && localStorage.getItem('ks_titlesOnServer') === '1') {
+    lastAutosavedJSON = null;
+  }
   seedSyncStateImages(editingNoteId, editorImages);
   show('overlay-editor');
   // No auto-focus here on purpose — opening a note (new or existing)
@@ -1232,11 +1328,11 @@ async function buildSavePayload(snapshot) {
   } else if (lock.type === 'quick') {
     if (!lock.password) throw new Error('missing password for quick lock');
     const record = await encryptNote(lock.password, content);
-    payload = { lockType: 'quick', content: record };
+    payload = { lockType: 'quick', title, content: record };
   } else if (lock.type === 'time') {
     if (!lock.password) throw new Error('missing password for time lock');
     const record = await encryptNote(combine(lock.password, lock.password2), content);
-    payload = { lockType: 'time', unlockAt: lock.unlockAt, password2: lock.password2, content: record };
+    payload = { lockType: 'time', title, unlockAt: lock.unlockAt, password2: lock.password2, content: record };
   }
 
   return { payload, hasImages: images.length > 0 };
@@ -1316,6 +1412,7 @@ async function syncRunOne(noteId, snapshot, state) {
     }
     const { note } = await API.saveNote(noteId, payload, onProgress);
     setOnline(true);
+    learnServerTitleSupport([note]);
     if (noteId === editingNoteId) {
       noteExistsOnServer = true;
       setExistingNoteButtons(true);
@@ -1324,7 +1421,7 @@ async function syncRunOne(noteId, snapshot, state) {
     }
     state.lastSyncedImagesJSON = imagesJSON;
     clearLocalDraft(noteId);
-    await applySavedNote(noteId, note, payload);
+    await applySavedNote(noteId, note, payload, snapshot.title);
     if (showInBar()) syncBarSuccess('Saved');
     flushOutbox(); // a working connection is the moment to drain anything else that's queued
   } catch (e) {
@@ -1333,7 +1430,7 @@ async function syncRunOne(noteId, snapshot, state) {
       // the note is cached locally as if it had saved, queued for the next
       // flush, and marked "Not synced" — no error toast, no retry prompt.
       setOnline(false);
-      await applyOfflineSavedNote(noteId, payload);
+      await applyOfflineSavedNote(noteId, payload, snapshot.title);
       if (noteId === editingNoteId) {
         noteExistsOnServer = true;
         setExistingNoteButtons(true);
@@ -1513,10 +1610,38 @@ function resetLockChooser() {
   document.getElementById('quick-lock-error').classList.add('visually-hidden');
   document.getElementById('time-lock-error').classList.add('visually-hidden');
   document.getElementById('time-unlock-at').min = localDatetimeInputMin();
+  document.getElementById('btn-confirm-quick-lock').textContent = 'Set quick lock';
+  document.getElementById('btn-confirm-time-lock').textContent = 'Set time lock';
+}
+
+// <input type="datetime-local"> wants local "YYYY-MM-DDTHH:mm", not a timestamp.
+function toLocalDatetimeInput(ts) {
+  const d = new Date(ts);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+// Reopening the dialog on a note that already has a lock shows that lock
+// (kind, password, date) instead of a blank form.
+function prefillLockChooser() {
+  const lock = pendingLock;
+  if (!lock || lock.type === 'none') return;
+  const kind = lock.type; // 'quick' | 'time'
+  // A lock set moments ago holds its password; one from unlocking an existing
+  // note has it in the unlock session instead.
+  const pw = lock.password || (currentUnlockCreds && currentUnlockCreds.password) || '';
+  document.getElementById('choice-' + kind).click(); // selects it and reveals its fields
+  document.getElementById(kind + '-password').value = pw;
+  document.getElementById(kind + '-password-confirm').value = pw;
+  if (kind === 'time' && lock.unlockAt && lock.unlockAt > Date.now()) {
+    document.getElementById('time-unlock-at').value = toLocalDatetimeInput(lock.unlockAt);
+  }
+  document.getElementById('btn-confirm-' + kind + '-lock').textContent = 'Update ' + kind + ' lock';
 }
 
 function openLockChooser() {
   resetLockChooser();
+  prefillLockChooser();
   show('overlay-lock-chooser');
 }
 
@@ -1781,7 +1906,7 @@ const FORCE_REFRESH_SHELL_FILES = [
 function openSettings() {
   document.getElementById('settings-api-base').value = Config.base();
   document.getElementById('settings-token').value = Config.token();
-  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.4.0';
+  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.4.2';
   show('overlay-settings');
 }
 
@@ -2574,7 +2699,7 @@ function init() {
   setupLightbox();
   setupRichText();
   setupInk();
-  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.4.0');
+  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.4.2');
 
   // Connectivity: react the moment the browser notices, and keep retrying
   // on a timer since navigator.onLine can't see a connection that's up but

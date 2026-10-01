@@ -6,6 +6,39 @@ All notable changes to this project are recorded here, following
 small — gets a version bump. If the version number hasn't moved,
 nothing changed; that's the whole point of keeping one.
 
+## v1.4.2 — 2026-10-01
+
+- **Locked-note titles now live on the server, so every device shows them.**
+  The title is stored in plain text alongside the note (capped at 200
+  characters); the text, photos and drawing inside stay encrypted, and a
+  locked note's preview is still never stored. The lock dialog says so.
+  **Requires redeploying the Worker** (`wrangler deploy`). Until then the
+  app keeps working and falls back to the v1.4.1 behaviour (titles
+  remembered on the device). Notes locked before this release get their
+  title pushed automatically: once the Worker is redeployed, open each one
+  (unlock, then close) a single time and it re-saves with its title.
+- **The lock dialog remembers what you entered.** Reopening it on a note
+  with a lock set — whether moments ago or from unlocking it — now shows the
+  chosen lock type, password, confirmation and unlock date instead of a
+  blank form, and the button reads "Update quick/time lock".
+- **Show/hide password eye** on every password field (lock dialogs, unlock
+  dialogs, and the Settings access token). It's a 44px target, keeps the
+  keyboard open while you tap it, and passwords re-hide whenever a dialog
+  closes.
+- Bumped the service worker's cache name.
+
+## v1.4.1 — 2026-10-01
+
+- **Locked notes now show their title on the card**, so a stack of locked
+  notes (quick or time) can be told apart at a glance. The title is kept
+  **only on the device** — the server still stores nothing readable about a
+  locked note, exactly as before. It's remembered whenever you save or
+  unlock a locked note, so: notes locked from now on show it straight away;
+  notes that were already locked show it after you unlock them once on each
+  device (until then they read "Locked note", in a lighter shade). A device
+  you've never unlocked a note on won't know its title.
+- No Worker redeploy needed.
+
 ## v1.4.0 — 2026-09-30
 
 - **Fixed "Not synced" staying on forever.** The Worker answers a delete
