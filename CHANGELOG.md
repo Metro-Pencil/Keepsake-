@@ -6,6 +6,183 @@ All notable changes to this project are recorded here, following
 small — gets a version bump. If the version number hasn't moved,
 nothing changed; that's the whole point of keeping one.
 
+## v1.6.0 — 2026-10-09
+
+**Photos and audio in Backblaze B2 (optional)**
+
+- **Connect a Backblaze B2 bucket and a note's photos and audio are stored there** instead
+  of inside the note. Files can be up to about 90 MB each and a note can carry about 150 MB
+  of them; they no longer count toward the 25 MB note limit or the 1 GB KV allowance. Leave
+  the four new Worker settings empty and nothing changes: everything stays inside notes as
+  in v1.5.0.
+- **The browser only talks to your Worker**, which signs requests to the (private) bucket.
+  No CORS rules and no public bucket needed.
+- **Locked notes stay locked:** media is encrypted on the device with a random per-note key
+  that is kept inside the note's encrypted content, so the bucket only holds ciphertext for
+  them. Unlocked notes' media is stored as it is.
+- **New Settings → Photos & audio storage** shows whether the Worker has Backblaze set up
+  and has a switch to turn it off. Settings → Storage shows how much is in Backblaze.
+- The size meter, the recorder and the "add photo / attach audio" checks use the new limits
+  when it is on, and the size breakdown lists photos & audio as stored in Backblaze.
+- **Offline still works:** media is fetched when a note is opened or synced and kept on the
+  device (about 300 MB, least-recently-used dropped first). A note saved offline keeps its
+  media on the device and uploads it, with the note, once you are back online.
+- **Download includes the media** (still encrypted for locked notes), so the file is a
+  complete backup. If a note's media is bigger than 200 MB the file points to the bucket
+  instead.
+- **Housekeeping:** deleting a note deletes its files; photos removed from a note are
+  deleted from the bucket after an hour (so an in-flight save never loses a file).
+- Notes saved before this keep their media inside until you next save them.
+
+**Under the hood**
+
+- New `media.js` (browser side, with its own small local database) and new Worker routes
+  `/api/media-config` and `/api/media/{noteId}/{file}`, with AWS Signature V4 signing checked
+  against Amazon's published test vectors. `sw.js` cache bumped to v13 and `media.js` added
+  to the app shell.
+
+## v1.5.0 — 2026-10-03
+
+**Audio in notes**
+
+- **Record or attach audio and place it anywhere in the text** — between two
+  sentences or two words. A clip shows as a small inline player: tap ▶ to listen
+  (the pill fills as it plays), tap ⋯ for the clip on its own, where you can listen,
+  **download just that clip**, or delete it. A file you attach is stored byte-for-byte;
+  a recording is saved in whatever format the browser records (WebM/Opus, M4A on Safari).
+- Locked notes encrypt their audio with everything else. Cards and plain-text copies
+  show a 🎙 0:12 marker where a clip sits.
+- Recording shows a live timer, a level meter and what the clip will add to the note's
+  size, stops itself before the note would go over 25 MB, and can't be dismissed by an
+  accidental tap or Escape (closing asks first). A blocked microphone gets a clear
+  message, and attaching a file is always available.
+
+**Quality**
+
+- **New Settings → Media quality.** Photos: Standard (1600px) / High (2560px, the new
+  default) / Original (untouched file). Recordings: 64 / 128 (default) / 256 kbps.
+  Original photos keep their location data, and the setting says so.
+
+**Size meter and storage**
+
+- **The editor shows the note's size against the 25 MB limit** (top bar, next to Save),
+  with a warning level — comfortable, getting heavy (12 MB), close to the limit (20 MB),
+  over the limit — each with its own icon and wording rather than colour alone. Tap it for
+  a breakdown (text / photos / audio / drawing / lock encryption), advice, and what each
+  level means. The estimate matched the stored size within 0.01% in testing.
+- Photos or clips that would push a note over 25 MB are refused with a message instead of
+  failing later at save time; a locked note's extra ≈ 33% is counted.
+- **Settings → Storage** adds up every note against your account limit (1,000 MB by
+  default, editable), warns at 70% and 90% with a bar, lists your biggest notes, and a
+  small "Storage NN%" pill appears in the header from 70%. Note cards show their size.
+
+**Speed**
+
+- **Opening a note and entering a password are much faster.** A note whose copy on this
+  device is current opens straight from it instead of downloading the whole note again
+  on every tap. Measured on six photo-heavy notes (4.4 MB each) over an ~8 Mbit/s link:
+  opening 4.8 s → 0.02 s, unlocking 6.5 s → 0.1 s. (v1.4.2 and v1.4.3 measured the
+  same — the cost had always been there and grows with note size.) What remains of an
+  unlock is mostly the password key-derivation, which is deliberate.
+- The list is refreshed when you come back to the app, so a note edited on another device
+  is still noticed.
+- The local cache keeps a note's heavy content apart from its small details, so updating a
+  title, password or flag no longer re-reads and re-writes megabytes. Existing data is
+  migrated automatically on first launch. Other speed-ups: one shared database connection,
+  faster base64 conversion, a time-lock's second password and the note fetched together,
+  thumbnails drawn from a small decoded copy (important with Original photos), and
+  "has anything changed?" checks that no longer serialise every photo on each autosave.
+- Autosave waits a little longer between saves on heavy notes (it re-sends the whole note).
+
+**Bugs fixed**
+
+- **Locked-card buttons never went away.** The Download / Delete buttons that appear on the
+  first tap now tuck away after 5 seconds, when you tap anywhere else, switch tabs or press
+  Escape; touching them keeps them around. Two causes: nothing ever dismissed them, and a
+  tapped button kept focus, which held them open indefinitely.
+- Large dialogs' explanatory text had no style outside form fields; fixed.
+
+**Worker (optional redeploy)**
+
+- The Worker records each note's `size`, rejects a save with no content, and returns stored
+  content as-is instead of parsing and re-serialising it (less CPU/memory for big notes).
+  Everything works against the old Worker too — the storage total just takes longer to fill.
+
+**CSS / accessibility**
+
+- Every new control is at least 44px; new colours were checked for contrast; the size,
+  storage and recording notices pair a distinct icon with words; the editor top bar and
+  toolbar fit from 320 to 768px (the toolbar wraps at 320); progress bars use `role="meter"`.
+
+## v1.4.3 — 2026-10-02
+
+**Lock dialog**
+
+- **Fixed the lock dialog coming up blank for a time lock whose date had
+  passed.** The date field was only filled in while the date was still in the
+  future, so reopening the lock on a note after its time lock ended showed an
+  empty "Unlock at" and "Update time lock" then refused with "Pick a date and
+  time". The passed date is now shown, with a line explaining that the note
+  already opens with just your password. Keeping that date as it is is allowed;
+  only a *changed* date must be in the future.
+- The padlock in the editor now reads "Change lock" and lights up while a lock
+  is on. The summary line says which lock is set and how to change it, and
+  tells you when a time lock has ended.
+- Quick lock / Time lock choices expose their selected state to screen readers
+  and show a check mark, so selection isn't carried by colour alone. The two
+  choice titles now line up.
+- **Removing a lock now asks first.** One stray tap on the unlocked-padlock icon
+  used to strip the lock and autosave the note unencrypted two seconds later.
+
+**Bugs fixed**
+
+- **Deleting a note from the editor could bring it back.** An autosave scheduled
+  a moment earlier landed after the delete and re-created the note on the server.
+- **Emptying an existing note didn't stick.** Clearing the title and text and
+  closing reopened the note with its old text. An existing note that you empty
+  is now saved as empty; a brand-new empty note is still just dropped.
+- **Photos could be attached to the wrong note.** Picking several large photos
+  and opening another note before they finished processing added them to that
+  other note. They are now dropped, with a message.
+- **Pressing Escape in the photo viewer also closed the editor** behind it.
+- **Enter now submits dialogs** (unlock, lock chooser). It did nothing before.
+- **A server error was reported as "Wrong password."** Unlock now tells a bad
+  token, a sealed-by-the-server note (check the device clock), and a network
+  problem apart from a wrong password, and shows "Opening…" while it works.
+- **An offline edit could be hidden behind an older server copy.** While a note
+  has an unsynced change, opening or downloading it now uses the local version.
+- **Transparent PNGs turned solid black** when compressed to JPEG; they now get
+  a white backdrop.
+- **Locked notes no longer write a plain-text draft to the device.** The
+  encrypted copy still reaches the outbox/server a couple of seconds after you
+  stop typing. Trade-off: abruptly closing the app within about two seconds of
+  typing in a locked note can lose that last stretch.
+- "Resume" on a recovered draft of a locked note now goes through the normal
+  unlock; opening it directly left a note that could never be saved.
+- The sync bar's spinner stops once it says "Saved".
+- Card ids and photo sources are escaped/validated before going into markup.
+
+**CSS / accessibility**
+
+- Text colours that failed contrast now pass 4.5:1: the grey for dates, hints
+  and the composer (2.9:1 → 4.9:1) and the amber for time-lock pills, banners
+  and warnings (3.4:1 → 5.2:1). Form field edges are now visible (3:1).
+- Every control is at least 44px: header tabs and gear, card download/delete,
+  Save, dialog buttons and inputs, the photo "×" (now 32px, hanging off the
+  corner), and the lightbox close button.
+- The editor's Delete button is back at the far edge of the toolbar — `.spacer`
+  was used but never defined.
+- Lightbox arrows no longer jump down while pressed (the pressed-button
+  transform overwrote their vertical centring).
+- The header wraps into two tidy rows on phones (brand + gear, then full-width
+  tabs) instead of stranding the gear on its own line. The composer spans the
+  full width.
+- Text sizes are in `rem` so the device's text-size setting applies; side
+  padding respects landscape notches; the toast clears the home indicator;
+  forced-colors mode keeps ink swatches distinct; dialogs have proper roles and
+  labels.
+- Bumped the service worker's cache name. No Worker redeploy needed.
+
 ## v1.4.2 — 2026-10-01
 
 - **Locked-note titles now live on the server, so every device shows them.**

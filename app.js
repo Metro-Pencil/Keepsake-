@@ -11,12 +11,19 @@ const SEP = '\u241F'; // unit separator — combines password1 + password2 for t
 const PBKDF2_ITERATIONS = 250000;
 
 function bytesToB64(bytes) {
+  if (bytes.toBase64) return bytes.toBase64(); // native, where the browser has it
+  // Build the binary string in chunks: one-character-at-a-time concatenation
+  // over a multi-megabyte note was a measurable slice of every save and open.
   let binary = '';
-  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
   return btoa(binary);
 }
 
 function b64ToBytes(str) {
+  if (Uint8Array.fromBase64) return Uint8Array.fromBase64(str);
   const binary = atob(str);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
@@ -74,12 +81,33 @@ async function decryptNote(passphrase, record) {
  * Config + API client
  * ------------------------------------------------------------------- */
 
+// Photo / audio quality presets (Settings → Media quality). The size hints are
+// rough: they depend on the picture or the voice, and a locked note stores
+// everything about a third larger again (encryption is kept as text).
+const PHOTO_QUALITY = {
+  standard: { label: 'Standard', maxDim: 1600, quality: 0.82, hint: 'Resized to 1600px. Roughly 0.3\u20130.7 MB per photo.' },
+  high:     { label: 'High',     maxDim: 2560, quality: 0.92, hint: 'Resized to 2560px, light compression. Roughly 1\u20132.5 MB per photo.' },
+  original: { label: 'Original', maxDim: 0,    quality: 1,    hint: 'Kept exactly as taken \u2014 no resizing or re-compression. Often 3\u20138 MB per photo, and it keeps the photo\u2019s location data.' },
+};
+const AUDIO_QUALITY = {
+  standard: { label: 'Standard', bps: 64000,  hint: 'Clear for voice. About 0.6 MB per minute.' },
+  high:     { label: 'High',     bps: 128000, hint: 'Good for voice and music. About 1.3 MB per minute.' },
+  max:      { label: 'Maximum',  bps: 256000, hint: 'Best the browser offers. About 2.6 MB per minute.' },
+};
+
 const Config = {
   base() { return localStorage.getItem('ks_apiBase') || ''; },
   token() { return localStorage.getItem('ks_token') || ''; },
   setBase(v) { localStorage.setItem('ks_apiBase', v.trim().replace(/\/+$/, '')); },
   setToken(v) { localStorage.setItem('ks_token', v.trim()); },
   configured() { return !!(this.base() && this.token()); },
+  photoQuality() { const v = localStorage.getItem('ks_photoQuality'); return PHOTO_QUALITY[v] ? v : 'high'; },
+  setPhotoQuality(v) { localStorage.setItem('ks_photoQuality', v); },
+  audioQuality() { const v = localStorage.getItem('ks_audioQuality'); return AUDIO_QUALITY[v] ? v : 'high'; },
+  setAudioQuality(v) { localStorage.setItem('ks_audioQuality', v); },
+  // Free plan: 1 GB for the whole account. People on a paid Workers plan can raise it.
+  storageLimitMB() { const n = Number(localStorage.getItem('ks_storageLimitMB')); return n >= 50 ? n : 1000; },
+  setStorageLimitMB(n) { localStorage.setItem('ks_storageLimitMB', String(Math.round(n))); },
 };
 
 const API = {
@@ -156,7 +184,16 @@ const API = {
   // every save after it go through the exact same idempotent path, so
   // retrying a save that looked like it failed can never create a
   // duplicate note — it just overwrites the same one.
-  saveNote(id, payload, onProgress) { return this.requestWithProgress('/api/notes/' + id, 'PUT', payload, onProgress); },
+  // Photos and audio that were moved out to Backblaze (see media.js) go up first, through the
+  // Worker; the note itself \u2014 by then just text and references \u2014 follows. Both the editor's
+  // saves and the offline queue come through here, so a queued note uploads its media too.
+  async saveNote(id, payload, onProgress) {
+    let uploaded = 0;
+    if (payload && payload.mediaKeep && payload.mediaKeep.length && window.KSMedia) {
+      uploaded = await KSMedia.uploadPending(id, payload.mediaKeep, onProgress);
+    }
+    return this.requestWithProgress('/api/notes/' + id, 'PUT', payload, uploaded ? null : onProgress);
+  },
   deleteNote(id) { return this.request('/api/notes/' + id, { method: 'DELETE' }); },
   getVault(id) { return this.request('/api/notes/' + id + '/vault'); },
   exportNote(id) { return this.request('/api/notes/' + id + '/export'); },
@@ -188,22 +225,137 @@ async function fileToCompressedDataURL(file, maxDim = 1600, quality = 0.82) {
   canvas.width = width;
   canvas.height = height;
   const ctx = canvas.getContext('2d');
+  // JPEG has no alpha: without a backdrop, transparent areas (PNG logos,
+  // screenshots, stickers) come out solid black.
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, width, height);
   ctx.drawImage(img, 0, 0, width, height);
   return canvas.toDataURL('image/jpeg', quality);
 }
 
-// Workers KV caps each value at 25MB (see README) — content:{id} holds the
-// note's title + body + every photo, so this is the ceiling for all of it
-// combined, not per photo.
-const NOTE_SIZE_LIMIT = 25 * 1024 * 1024;
+function readFileAsDataURL(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(file);
+  });
+}
 
-function estimateContentBytes() {
-  const title = document.getElementById('editor-title').value || '';
-  // HTML + the plain-text copy stored beside it, roughly.
-  let total = title.length + document.getElementById('editor-body').innerHTML.length * 2;
-  for (const src of editorImages) total += estimateImageBytes(src);
-  total += inkEstimateBytes();
-  return total;
+// Stores a photo at the quality chosen in Settings. "Original" keeps the
+// file's own bytes (after checking this browser can actually display it).
+async function fileToStoredDataURL(file) {
+  const q = PHOTO_QUALITY[Config.photoQuality()];
+  if (!q.maxDim) {
+    await loadImageFromFile(file);
+    return readFileAsDataURL(file);
+  }
+  return fileToCompressedDataURL(file, q.maxDim, q.quality);
+}
+
+/* ---------------------------------------------------------------------
+ * Size limits.
+ *   25 MB   Workers KV's hard cap on one value — content:{id} holds a note's
+ *           text, photos, audio and drawing together, so this is the ceiling
+ *           for all of it combined.
+ *   12 MB   from here a note is slow to open and sync, especially on mobile data.
+ *   20 MB   the Worker holds a note in memory several times over while it
+ *           handles it (128 MB per request), and the Free plan allows only
+ *           10 ms of CPU per request — so risk of a failed save rises here.
+ *           (12 and 20 are this app's own cautious lines, not Cloudflare's.)
+ * ------------------------------------------------------------------- */
+const NOTE_SIZE_LIMIT = 25 * 1024 * 1024;
+const NOTE_HEAVY_BYTES = 12 * 1024 * 1024;
+const NOTE_DANGER_BYTES = 20 * 1024 * 1024;
+// With Backblaze set up (media.js), photos and audio no longer count toward the 25 MB above —
+// the note only keeps small references. They are still held in memory while a note is open,
+// so there is a ceiling on how much one note carries. (Sizes here are base64 text lengths.)
+const MEDIA_ITEM_MAX_CHARS = 120 * 1024 * 1024;  // one file, about 90 MB of real data
+const MEDIA_NOTE_MAX_CHARS = 200 * 1024 * 1024;  // all of a note's photos + audio, about 150 MB
+function limitWord() { return mediaOffloadOn() ? 'its 150 MB of photos and audio' : '25 MB'; }
+function mediaOffloadOn() { return !!(window.KSMedia && KSMedia.enabled()); }
+function mediaZone(chars) {
+  const r = chars / MEDIA_NOTE_MAX_CHARS;
+  return r > 1 ? 'over' : r >= 0.85 ? 'danger' : r >= 0.6 ? 'heavy' : 'ok';
+}
+const STORAGE_WARN_RATIO = 0.7;
+const STORAGE_DANGER_RATIO = 0.9;
+
+function noteSizeZone(bytes) {
+  if (bytes > NOTE_SIZE_LIMIT) return 'over';
+  if (bytes >= NOTE_DANGER_BYTES) return 'danger';
+  if (bytes >= NOTE_HEAVY_BYTES) return 'heavy';
+  return 'ok';
+}
+
+// What the note open in the editor will take up once saved — from string
+// lengths, so it is cheap enough to run as you type. A locked note is bigger
+// than its contents: the encrypted bytes are stored as base64 text.
+function noteSizeBreakdown() {
+  const body = document.getElementById('editor-body');
+  const text = utf8Len(document.getElementById('editor-title').value) + utf8Len(body.innerHTML) * 2; // html + its plain-text copy
+  let photos = 0;
+  for (const src of editorImages) photos += src.length + 4;
+  let audio = 0;
+  let clips = 0;
+  const seen = new Set();
+  body.querySelectorAll('ks-audio').forEach((el) => {
+    const id = el.getAttribute('data-id');
+    if (seen.has(id) || !editorAudio[id]) return;
+    seen.add(id);
+    audio += editorAudio[id].data.length + 120;
+    clips++;
+  });
+  const drawing = inkEstimateBytes();
+  // Offloaded media: only a reference + manifest entry stays in the note.
+  const mediaChars = photos + audio;
+  const offload = mediaOffloadOn();
+  let offloaded = 0;
+  if (offload) {
+    offloaded = Math.round(mediaChars * 3 / 4);
+    photos = editorImages.length * 160;
+    audio = clips * 260;
+  }
+  let total = 160 + text + photos + audio + drawing;
+  const locked = lockIsActive();
+  let lockExtra = 0;
+  if (locked) {
+    const encrypted = Math.ceil((total + 16) * 4 / 3) + 80;
+    lockExtra = encrypted - total;
+    total = encrypted;
+  }
+  return { text, photos, photoCount: editorImages.length, audio, clips, drawing, lockExtra, locked, total, offload, offloaded, mediaChars };
+}
+
+function estimateContentBytes() { return noteSizeBreakdown().total; }
+
+// Cheap fingerprint of a big base64 string (length + 48 sampled characters),
+// so "did the photos/audio change?" doesn't mean comparing megabytes of text.
+function mediaSig(str) {
+  str = String(str || '');
+  let sig = str.length + ':';
+  const step = Math.max(1, Math.floor(str.length / 48));
+  for (let i = 0; i < str.length; i += step) sig += str[i];
+  return sig + str.slice(-16);
+}
+
+// Identity of a snapshot's photos + audio — what decides "Saving photos…".
+function mediaKey(snapshot) {
+  const audio = snapshot.audio || {};
+  return JSON.stringify([
+    (snapshot.images || []).map(mediaSig),
+    Object.keys(audio).sort().map((id) => id + mediaSig(audio[id].data)),
+  ]);
+}
+
+// Same as JSON.stringify(snapshot) for "has anything changed?" purposes, but
+// with the big media fingerprinted instead of copied.
+function snapshotKey(snapshot) {
+  const audio = {};
+  for (const id of Object.keys(snapshot.audio || {}).sort()) {
+    audio[id] = mediaSig(snapshot.audio[id].data) + '|' + snapshot.audio[id].dur + '|' + snapshot.audio[id].name;
+  }
+  return JSON.stringify({ ...snapshot, images: (snapshot.images || []).map(mediaSig), audio });
 }
 
 // Precise-enough byte size of one compressed photo, straight from its
@@ -224,91 +376,170 @@ function formatBytes(bytes) {
 }
 
 /* ---------------------------------------------------------------------
- * IndexedDB — one database, three stores:
+ * Size accounting — how many bytes a note takes up in Workers KV. Measured
+ * from string lengths (photos and audio are base64 text), not by
+ * serialising, so it is cheap enough to run while you type.
+ * ------------------------------------------------------------------- */
+
+function utf8Len(s) {
+  s = String(s || '');
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) n += 1;
+    else if (c < 0x800) n += 2;
+    else if (c >= 0xD800 && c <= 0xDBFF) { n += 4; i++; }
+    else n += 3;
+  }
+  return n;
+}
+
+// The size of a content object as the server stores it.
+function contentStoredBytes(c) {
+  if (!c) return 0;
+  if (typeof c.ciphertext === 'string') {
+    return c.ciphertext.length + String(c.salt || '').length + String(c.iv || '').length + 80;
+  }
+  let n = 160;
+  n += utf8Len(c.title) + utf8Len(c.body) + utf8Len(c.html);
+  for (const src of c.images || []) n += typeof src === 'string' ? src.length + 4 : 0;
+  if (c.audio) for (const k in c.audio) n += (c.audio[k] && typeof c.audio[k].data === 'string' ? c.audio[k].data.length : 0) + 120;
+  if (c.drawing && Array.isArray(c.drawing.strokes)) for (const s of c.drawing.strokes) n += (s.p ? s.p.length : 0) * 7 + 40;
+  return n;
+}
+
+/* ---------------------------------------------------------------------
+ * IndexedDB — one database. Light records and heavy records live in
+ * SEPARATE stores, because IndexedDB can only read or write a record whole:
+ * keeping a note's multi-megabyte content next to its title meant every
+ * little update (a title, a password, a "last seen" stamp) re-read and
+ * re-wrote all of it. That was the main reason opening a note felt slow.
  *
- *   drafts     - a same-device safety net for an *abrupt* close only
- *                (crash, dead battery, a swiped-away tab). Cleared the
- *                moment its content actually reaches the server OR the
- *                outbox below (either one is durable enough to retire it).
- *   noteCache  - a full local mirror of every note: the exact metadata
- *                and content (encrypted or plain, same shape the server
- *                stores) the list/editor/download flows need. This is
- *                what the grid actually renders from — a live fetch just
- *                refreshes it — which is what makes every note, locked
- *                or not, still open with no connection at all.
- *   outbox     - notes with a local change the server hasn't seen yet:
- *                a save (the exact PUT payload, already built/encrypted)
- *                or a delete. Flushed whenever a connection is available;
- *                see flushOutbox.
+ *   drafts         - a same-device safety net for an *abrupt* close only
+ *                    (crash, dead battery, a swiped-away tab). Cleared the
+ *                    moment its content reaches the server OR the outbox.
+ *   noteCache      - LIGHT: one small record per note — its metadata, the
+ *                    cached locked title / second password, flags and sizes.
+ *                    The grid renders from this alone.
+ *   noteContent    - HEAVY: the note's content (encrypted or plain, exactly
+ *                    as the server stores it). Touched only when a note is
+ *                    opened, downloaded or its content actually changes.
+ *   outbox         - LIGHT: { id, op, queuedAt } for every note with a local
+ *                    change the server hasn't seen (a save or a delete).
+ *   outboxPayload  - HEAVY: the exact PUT payload for a queued save.
  * ------------------------------------------------------------------- */
 
 const KEEPSAKE_DB_NAME = 'keepsake-drafts'; // unchanged so existing installs upgrade in place
-const KEEPSAKE_DB_VERSION = 2;
+const KEEPSAKE_DB_VERSION = 3;
 const DRAFT_STORE = 'drafts';
 const NOTE_CACHE_STORE = 'noteCache';
+const NOTE_CONTENT_STORE = 'noteContent';
 const OUTBOX_STORE = 'outbox';
+const OUTBOX_PAYLOAD_STORE = 'outboxPayload';
+
+// One shared connection instead of opening a fresh one for every little read.
+let dbPromise = null;
+
+function migrateToV3(tx) {
+  // v2 kept content inside the noteCache records and payloads inside outbox
+  // records. Move the heavy part out, once, and leave a light record behind.
+  const cache = tx.objectStore(NOTE_CACHE_STORE);
+  const content = tx.objectStore(NOTE_CONTENT_STORE);
+  cache.openCursor().onsuccess = (e) => {
+    const cur = e.target.result;
+    if (!cur) return;
+    const v = cur.value || {};
+    const light = { ...v, hasContent: !!v.content };
+    if (v.content) {
+      content.put({ id: v.id, content: v.content });
+      light.bytes = contentStoredBytes(v.content);
+    }
+    if (v.vault) light.vaultUpdatedAt = v.meta ? v.meta.updatedAt : undefined;
+    delete light.content;
+    cur.update(light);
+    cur.continue();
+  };
+  const outbox = tx.objectStore(OUTBOX_STORE);
+  const payloads = tx.objectStore(OUTBOX_PAYLOAD_STORE);
+  outbox.openCursor().onsuccess = (e) => {
+    const cur = e.target.result;
+    if (!cur) return;
+    const v = cur.value || {};
+    if (v.payload) payloads.put({ id: v.id, payload: v.payload });
+    cur.update({ id: v.id, op: v.op, queuedAt: v.queuedAt });
+    cur.continue();
+  };
+}
 
 function openKeepsakeDB() {
-  return new Promise((resolve, reject) => {
-    if (!window.indexedDB) { reject(new Error('IndexedDB unavailable')); return; }
+  if (dbPromise) return dbPromise;
+  dbPromise = new Promise((resolve, reject) => {
+    if (!window.indexedDB) { dbPromise = null; reject(new Error('IndexedDB unavailable')); return; }
     const req = indexedDB.open(KEEPSAKE_DB_NAME, KEEPSAKE_DB_VERSION);
-    req.onupgradeneeded = () => {
+    req.onupgradeneeded = (ev) => {
       const db = req.result;
-      if (!db.objectStoreNames.contains(DRAFT_STORE)) db.createObjectStore(DRAFT_STORE, { keyPath: 'id' });
-      if (!db.objectStoreNames.contains(NOTE_CACHE_STORE)) db.createObjectStore(NOTE_CACHE_STORE, { keyPath: 'id' });
-      if (!db.objectStoreNames.contains(OUTBOX_STORE)) db.createObjectStore(OUTBOX_STORE, { keyPath: 'id' });
+      for (const [name, keyPath] of [
+        [DRAFT_STORE, 'id'], [NOTE_CACHE_STORE, 'id'], [NOTE_CONTENT_STORE, 'id'],
+        [OUTBOX_STORE, 'id'], [OUTBOX_PAYLOAD_STORE, 'id'],
+      ]) {
+        if (!db.objectStoreNames.contains(name)) db.createObjectStore(name, { keyPath });
+      }
+      if (ev.oldVersion > 0 && ev.oldVersion < 3) migrateToV3(req.transaction);
     };
+    req.onsuccess = () => {
+      const db = req.result;
+      db.onversionchange = () => { db.close(); dbPromise = null; };
+      db.onclose = () => { dbPromise = null; };
+      resolve(db);
+    };
+    req.onerror = () => { dbPromise = null; reject(req.error); };
+  });
+  return dbPromise;
+}
+
+// Runs fn(tx) in one transaction and resolves when it has committed.
+function idbRun(db, stores, mode, fn) {
+  return new Promise((resolve, reject) => {
+    let tx;
+    try { tx = db.transaction(stores, mode); } catch (e) { reject(e); return; }
+    let result;
+    try { result = fn(tx); } catch (e) { try { tx.abort(); } catch (e2) { /* already done */ } reject(e); return; }
+    tx.oncomplete = () => resolve(result);
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error('Transaction aborted'));
+  });
+}
+
+function idbPut(db, store, value) { return idbRun(db, store, 'readwrite', (tx) => { tx.objectStore(store).put(value); }); }
+function idbDelete(db, store, key) { return idbRun(db, store, 'readwrite', (tx) => { tx.objectStore(store).delete(key); }); }
+function idbPutMany(db, entries) {
+  return idbRun(db, [...new Set(entries.map((e) => e[0]))], 'readwrite', (tx) => {
+    for (const [store, value] of entries) tx.objectStore(store).put(value);
+  });
+}
+function idbDeleteMany(db, entries) {
+  return idbRun(db, [...new Set(entries.map((e) => e[0]))], 'readwrite', (tx) => {
+    for (const [store, key] of entries) tx.objectStore(store).delete(key);
+  });
+}
+
+function idbRequest(db, store, method, arg) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readonly');
+    const req = tx.objectStore(store)[method](arg);
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
 }
+async function idbGet(db, store, key) { return (await idbRequest(db, store, 'get', key)) || null; }
+async function idbGetAll(db, store) { return (await idbRequest(db, store, 'getAll')) || []; }
+async function idbGetAllKeys(db, store) { return (await idbRequest(db, store, 'getAllKeys')) || []; }
 
-function idbPut(db, store, value) {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(store, 'readwrite');
-    tx.objectStore(store).put(value);
-    tx.oncomplete = resolve;
-    tx.onerror = () => reject(tx.error);
-  });
-}
-function idbGet(db, store, key) {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(store, 'readonly');
-    const req = tx.objectStore(store).get(key);
-    req.onsuccess = () => resolve(req.result || null);
-    req.onerror = () => reject(req.error);
-  });
-}
-function idbGetAll(db, store) {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(store, 'readonly');
-    const req = tx.objectStore(store).getAll();
-    req.onsuccess = () => resolve(req.result || []);
-    req.onerror = () => reject(req.error);
-  });
-}
-function idbGetAllKeys(db, store) {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(store, 'readonly');
-    const req = tx.objectStore(store).getAllKeys();
-    req.onsuccess = () => resolve(req.result || []);
-    req.onerror = () => reject(req.error);
-  });
-}
-function idbDelete(db, store, key) {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(store, 'readwrite');
-    tx.objectStore(store).delete(key);
-    tx.oncomplete = resolve;
-    tx.onerror = () => reject(tx.error);
-  });
-}
-
-async function saveLocalDraft(id, title, body, images, html, drawing) {
+async function saveLocalDraft(id, title, body, images, html, drawing, audio) {
   if (!id) return;
   try {
     const db = await openKeepsakeDB();
-    await idbPut(db, DRAFT_STORE, { id, title, body, images, html, drawing, savedAt: Date.now() });
+    await idbPut(db, DRAFT_STORE, { id, title, body, images, html, drawing, audio, savedAt: Date.now() });
   } catch (e) {
     // Best-effort only — local caching should never interrupt the editor.
   }
@@ -343,42 +574,47 @@ async function listLocalDraftIds() {
  * Note cache — the local mirror every render/open/download reads from.
  * ------------------------------------------------------------------- */
 
-// `lockedTitle` is the title of a locked note, kept ONLY in this device's
-// cache — never sent to the server, which stores nothing readable about a
-// locked note. Pass undefined to keep whatever is already cached, a string
-// to set it, or null to clear it (e.g. the note was unlocked for good).
+// `lockedTitle` is the title of a locked note as last seen decrypted on this
+// device (older notes have no title on the server). Pass undefined to keep
+// whatever is already cached, a string to set it, or null to clear it.
 async function cacheNote(meta, content, lockedTitle) {
   try {
     const db = await openKeepsakeDB();
     const existing = await idbGet(db, NOTE_CACHE_STORE, meta.id);
-    await idbPut(db, NOTE_CACHE_STORE, {
+    const light = {
       id: meta.id,
       meta,
-      content,
-      contentUpdatedAt: meta.updatedAt, // which version of the note `content` is
+      contentUpdatedAt: meta.updatedAt, // which version of the note the cached content is
+      hasContent: true,
+      bytes: contentStoredBytes(content),
       lockedTitle: lockedTitle === undefined ? (existing ? existing.lockedTitle : undefined) : lockedTitle,
       vault: existing ? existing.vault : undefined,
+      vaultUpdatedAt: existing ? existing.vaultUpdatedAt : undefined,
       cachedAt: Date.now(),
-    });
+    };
+    await idbPutMany(db, [[NOTE_CACHE_STORE, light], [NOTE_CONTENT_STORE, { id: meta.id, content }]]);
   } catch (e) { /* best-effort — a failed cache write just means this one note won't be available offline yet */ }
 }
 
 // Used when only fresh *metadata* is on hand (the list endpoint doesn't
-// return content) — keeps whatever content/vault is already cached for
-// this note rather than clobbering it with nothing. contentUpdatedAt is
-// deliberately carried over unchanged, so a newer meta.updatedAt shows up
-// as "cached content is out of date" to prefetchOfflineData.
+// return content). The cached content stays exactly where it is; its
+// contentUpdatedAt is deliberately left alone, so a newer meta.updatedAt
+// shows up as "cached content is out of date" to prefetchOfflineData and to
+// fetchNoteContent.
 async function cacheNoteMetaOnly(meta) {
   try {
     const db = await openKeepsakeDB();
     const existing = await idbGet(db, NOTE_CACHE_STORE, meta.id);
+    if (existing && JSON.stringify(existing.meta) === JSON.stringify(meta)) return; // nothing new to write
     await idbPut(db, NOTE_CACHE_STORE, {
       id: meta.id,
       meta,
-      content: existing ? existing.content : null,
       contentUpdatedAt: existing ? existing.contentUpdatedAt : undefined,
+      hasContent: !!(existing && existing.hasContent),
+      bytes: existing ? existing.bytes : undefined,
       lockedTitle: existing ? existing.lockedTitle : undefined,
       vault: existing ? existing.vault : undefined,
+      vaultUpdatedAt: existing ? existing.vaultUpdatedAt : undefined,
       cachedAt: Date.now(),
     });
   } catch (e) { /* best-effort */ }
@@ -405,22 +641,47 @@ function learnServerTitleSupport(metas) {
   }
 }
 
-async function cacheVault(id, password2) {
+// `forUpdatedAt` is the version of the note this second password belongs to,
+// so a copy from before the note was re-locked elsewhere is never trusted.
+async function cacheVault(id, password2, forUpdatedAt) {
   try {
     const db = await openKeepsakeDB();
     const existing = await idbGet(db, NOTE_CACHE_STORE, id);
-    if (!existing) return; // no meta/content for this note yet — nothing to attach it to
-    await idbPut(db, NOTE_CACHE_STORE, { ...existing, vault: password2, cachedAt: Date.now() });
+    if (!existing) return; // no meta for this note yet — nothing to attach it to
+    await idbPut(db, NOTE_CACHE_STORE, {
+      ...existing,
+      vault: password2,
+      vaultUpdatedAt: forUpdatedAt != null ? forUpdatedAt : (existing.meta ? existing.meta.updatedAt : undefined),
+      cachedAt: Date.now(),
+    });
   } catch (e) { /* best-effort */ }
 }
 
-async function getCachedNote(id) {
+// Light record only (no content) — cheap.
+async function getCachedMeta(id) {
   try {
     const db = await openKeepsakeDB();
     return await idbGet(db, NOTE_CACHE_STORE, id);
   } catch (e) { return null; }
 }
 
+async function getCachedContent(id) {
+  try {
+    const db = await openKeepsakeDB();
+    const rec = await idbGet(db, NOTE_CONTENT_STORE, id);
+    return rec ? rec.content : null;
+  } catch (e) { return null; }
+}
+
+// Light record + content, joined (downloads and offline fallbacks).
+async function getCachedNote(id) {
+  try {
+    const [light, content] = await Promise.all([getCachedMeta(id), getCachedContent(id)]);
+    return light ? { ...light, content } : null;
+  } catch (e) { return null; }
+}
+
+// Light records only — never loads any note's content.
 async function getAllCachedNotes() {
   try {
     const db = await openKeepsakeDB();
@@ -431,17 +692,25 @@ async function getAllCachedNotes() {
 async function removeCachedNote(id) {
   try {
     const db = await openKeepsakeDB();
-    await idbDelete(db, NOTE_CACHE_STORE, id);
+    await idbDeleteMany(db, [[NOTE_CACHE_STORE, id], [NOTE_CONTENT_STORE, id]]);
   } catch (e) { /* best-effort */ }
+  if (window.KSMedia) { try { await KSMedia.dropNote(id); } catch (e) { /* best-effort */ } }
 }
 
-// The list the grid actually renders: every cached note's metadata,
-// flagged _pending when it has a queued-but-not-yet-synced change.
+// The list the grid actually renders: every cached note's metadata, flagged
+// _pending when it has a queued-but-not-yet-synced change, with the size we
+// know for it (from the server if it says, else measured from the cached copy).
 async function buildNotesCacheFromLocal() {
-  const [cached, outboxItems] = await Promise.all([getAllCachedNotes(), getOutbox()]);
-  const outboxIds = new Set(outboxItems.map((o) => o.id));
-  const metas = cached.map((c) => ({ ...c.meta, _pending: outboxIds.has(c.id), _lockedTitle: c.lockedTitle || '' }));
-  metas.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  const [cached, outboxIds] = await Promise.all([getAllCachedNotes(), getOutboxIds()]);
+  const pending = new Set(outboxIds);
+  const metas = cached.map((c) => ({
+    ...c.meta,
+    _pending: pending.has(c.id),
+    _lockedTitle: c.lockedTitle || '',
+    _bytes: typeof c.meta.size === 'number' ? c.meta.size : (typeof c.bytes === 'number' ? c.bytes : null),
+    _media: typeof c.meta.mediaSize === 'number' ? c.meta.mediaSize : 0, // photos + audio held in Backblaze
+  }));
+  metas.sort((x, y) => (y.updatedAt || 0) - (x.updatedAt || 0));
   return metas;
 }
 
@@ -452,7 +721,11 @@ async function buildNotesCacheFromLocal() {
 async function queueOutbox(id, op, payload) {
   try {
     const db = await openKeepsakeDB();
-    await idbPut(db, OUTBOX_STORE, { id, op, payload: payload || null, queuedAt: Date.now() });
+    await idbRun(db, [OUTBOX_STORE, OUTBOX_PAYLOAD_STORE], 'readwrite', (tx) => {
+      tx.objectStore(OUTBOX_STORE).put({ id, op, queuedAt: Date.now() });
+      const payloads = tx.objectStore(OUTBOX_PAYLOAD_STORE);
+      if (op === 'save' && payload) payloads.put({ id, payload }); else payloads.delete(id);
+    });
   } catch (e) { /* best-effort */ }
   await refreshOutboxCount();
 }
@@ -460,16 +733,38 @@ async function queueOutbox(id, op, payload) {
 async function clearOutbox(id) {
   try {
     const db = await openKeepsakeDB();
-    await idbDelete(db, OUTBOX_STORE, id);
+    await idbDeleteMany(db, [[OUTBOX_STORE, id], [OUTBOX_PAYLOAD_STORE, id]]);
   } catch (e) { /* best-effort */ }
   await refreshOutboxCount();
 }
 
-async function getOutbox() {
+async function getOutbox() { // light entries only: { id, op, queuedAt }
   try {
     const db = await openKeepsakeDB();
     return await idbGetAll(db, OUTBOX_STORE);
   } catch (e) { return []; }
+}
+
+async function getOutboxIds() {
+  try {
+    const db = await openKeepsakeDB();
+    return await idbGetAllKeys(db, OUTBOX_STORE);
+  } catch (e) { return []; }
+}
+
+async function getOutboxItem(id) {
+  try {
+    const db = await openKeepsakeDB();
+    return await idbGet(db, OUTBOX_STORE, id);
+  } catch (e) { return null; }
+}
+
+async function getOutboxPayload(id) {
+  try {
+    const db = await openKeepsakeDB();
+    const rec = await idbGet(db, OUTBOX_PAYLOAD_STORE, id);
+    return rec ? rec.payload : null;
+  } catch (e) { return null; }
 }
 
 /* ---------------------------------------------------------------------
@@ -534,6 +829,9 @@ function show(id) {
 function hide(id) {
   const el = document.getElementById(id);
   el.classList.add('hidden');
+  if (id === 'overlay-record') recorderTeardown();
+  if (id === 'overlay-clip') pauseClipPreview();
+  if (id === 'overlay-editor') { clearAudioUrls(); clearThumbUrls(); }
   setPasswordsHidden(el); // never leave a password showing behind a closed dialog
   applyViewportFix();
 }
@@ -642,7 +940,7 @@ let syncBarHideTimer = null;
 function syncBarSet(label, fraction /* number 0..1, or null for indeterminate */) {
   clearTimeout(syncBarHideTimer);
   const bar = document.getElementById('sync-bar');
-  bar.classList.remove('error');
+  bar.classList.remove('error', 'done');
   bar.classList.add('show');
   document.getElementById('sync-bar-label').textContent = label;
   document.getElementById('sync-bar-retry').classList.add('hidden');
@@ -665,12 +963,14 @@ function syncBarHideSoon(delay = 1100) {
 
 function syncBarSuccess(label = 'Saved') {
   syncBarSet(label, 1);
+  document.getElementById('sync-bar').classList.add('done'); // finished — stop the spinner
   syncBarHideSoon();
 }
 
 function syncBarError(label, onRetry) {
   clearTimeout(syncBarHideTimer);
   const bar = document.getElementById('sync-bar');
+  bar.classList.remove('done');
   bar.classList.add('show', 'error');
   document.getElementById('sync-bar-label').textContent = label;
   const retryBtn = document.getElementById('sync-bar-retry');
@@ -718,7 +1018,7 @@ function setOnline(value) {
 }
 
 async function refreshOutboxCount() {
-  outboxCount = (await getOutbox()).length;
+  outboxCount = (await getOutboxIds()).length;
   updateSyncStatusUI();
 }
 
@@ -726,6 +1026,8 @@ async function rerenderFromLocal() {
   notesCache = await buildNotesCacheFromLocal();
   renderNotes();
   renderLocked();
+  updateStoragePill();
+  renderStorageSection();
 }
 
 // Pushes every queued save/delete to the server, oldest first. Stops at the
@@ -743,6 +1045,7 @@ async function flushOutbox() {
       if (st && st.inFlight) continue;
       try {
         let result = null;
+        let payload = null;
         if (item.op === 'delete') {
           try {
             await API.deleteNote(item.id);
@@ -754,20 +1057,22 @@ async function flushOutbox() {
             if (delErr.status !== 404) throw delErr;
           }
         } else {
-          result = await API.saveNote(item.id, item.payload);
+          payload = await getOutboxPayload(item.id);
+          if (!payload) { await clearOutbox(item.id); continue; } // nothing left to send
+          result = await API.saveNote(item.id, payload);
         }
         setOnline(true);
         // If the note was edited again while this request was in flight, a
         // newer entry replaced this one in the outbox — leave that newer
         // one (and its cached copy) alone; the next flush sends it.
-        const latest = (await getOutbox()).find((o) => o.id === item.id);
+        const latest = await getOutboxItem(item.id);
         if (latest && latest.queuedAt !== item.queuedAt) continue;
         if (item.op === 'delete') {
           await removeCachedNote(item.id);
         } else {
-          await cacheNote(result.note, item.payload.content);
-          if (item.payload.lockType === 'time' && item.payload.password2) {
-            await cacheVault(item.id, item.payload.password2);
+          await cacheNote(result.note, payload.content);
+          if (payload.lockType === 'time' && payload.password2) {
+            await cacheVault(item.id, payload.password2, result.note.updatedAt);
           }
         }
         await clearOutbox(item.id);
@@ -801,10 +1106,52 @@ let currentView = 'notes';
 // Locked cards whose download/delete buttons have been revealed by a tap
 // this session (see handleOpenCard) — in-memory only, resets on reload,
 // which is fine: it's meant as light friction, not a saved preference.
+// A locked card's download/delete buttons appear on the first tap and tuck
+// themselves away again: after a few seconds, when you tap anywhere else,
+// switch tabs, or press Escape. (They used to stay out until the page reloaded.)
+const REVEAL_MS = 5000;
 const revealedLockedCards = new Set();
+const revealTimers = new Map();
+
+function cardElFor(id) {
+  const open = document.querySelector(`.card-open[data-id="${CSS.escape(id)}"]`);
+  return open ? open.closest('.card') : null;
+}
+
+function keepRevealed(id) { // (re)starts the countdown — touching the buttons keeps them around
+  clearTimeout(revealTimers.get(id));
+  revealTimers.set(id, setTimeout(() => unrevealCard(id), REVEAL_MS));
+}
+
+function unrevealCard(id) {
+  clearTimeout(revealTimers.get(id));
+  revealTimers.delete(id);
+  revealedLockedCards.delete(id);
+  const el = cardElFor(id);
+  if (!el) return;
+  el.classList.remove('revealed');
+  // After a tap, the button you pressed keeps focus, and :focus-within then
+  // holds the row open forever. Let go of it — unless it's keyboard focus,
+  // where staying visible is the whole point of that rule.
+  const ae = document.activeElement;
+  if (ae && ae !== document.body && el.contains(ae) && !ae.matches(':focus-visible')) ae.blur();
+}
+
+function hideRevealedCards(exceptId) {
+  for (const id of [...revealedLockedCards]) if (id !== exceptId) unrevealCard(id);
+}
+
+function revealLockedCard(id) {
+  hideRevealedCards(id);
+  revealedLockedCards.add(id);
+  const el = cardElFor(id);
+  if (el) el.classList.add('revealed');
+  keepRevealed(id);
+}
 let editingNoteId = null;        // generated client-side the moment the editor opens — see openEditorWithContent
 let noteExistsOnServer = false;  // false until this note's first background save actually succeeds
 let editorImages = [];
+let editorAudio = {};            // clip id -> { data (audio data: URL), dur (seconds), name }
 let lightboxIndex = 0;
 let pendingLock = null;          // { type: 'quick'|'time', password?, password2?, unlockAt?, existing? }
 let currentUnlockCreds = null;   // { password, password2? } — kept only for this editing session
@@ -856,8 +1203,8 @@ function cardHTML(meta) {
   // a time-locked note before its date, and that has to work while sealed.
   const actions = isLocked ? `
         <div class="card-actions">
-          <button class="icon-btn" data-action="download" data-id="${meta.id}" title="Download" aria-label="Download">${downloadGlyph}</button>
-          <button class="icon-btn" data-action="delete" data-id="${meta.id}" title="Delete" aria-label="Delete">${trashGlyph}</button>
+          <button class="icon-btn" data-action="download" data-id="${escapeHTML(meta.id)}" title="Download" aria-label="Download">${downloadGlyph}</button>
+          <button class="icon-btn" data-action="delete" data-id="${escapeHTML(meta.id)}" title="Delete" aria-label="Delete">${trashGlyph}</button>
         </div>` : '';
 
   // The title comes from the server (stored in plain text, even for locked
@@ -875,13 +1222,13 @@ function cardHTML(meta) {
 
   return `
     <article class="card ${typeClass}${revealedClass}">
-      <div class="card-open" data-action="open" data-id="${meta.id}" role="button" tabindex="0">
+      <div class="card-open" data-action="open" data-id="${escapeHTML(meta.id)}" role="button" tabindex="0">
         ${pill}${pendingBadge}
         <div class="${titleClass}">${escapeHTML(titleText)}</div>
         <div class="card-snippet">${escapeHTML(snippet)}</div>
       </div>
       <div class="card-footer">
-        <span class="card-meta">${fmtDate(meta.updatedAt || meta.createdAt)}</span>
+        <span class="card-meta">${fmtDate(meta.updatedAt || meta.createdAt)}${typeof meta._bytes === 'number' ? ' \u00b7 ' + formatBytes(meta._bytes + (meta._media || 0)) : ''}</span>
         ${actions}
       </div>
     </article>`;
@@ -912,14 +1259,16 @@ setInterval(() => { if (notesCache.some((m) => m.lockType === 'time')) renderLoc
 // response already in hand rather than re-fetching the whole list. This is
 // what makes a save actually feel instant in the list, not just the editor.
 async function applySavedNote(noteId, note, payload, title) {
-  const pending = (await getOutbox()).find((o) => o.id === noteId);
+  const pending = await getOutboxItem(noteId);
   // Deleted while this save was in flight — leave the queued delete alone
   // (it'll clear the server copy this request just wrote) instead of
   // resurrecting the note in the cache.
   if (pending && pending.op === 'delete') return;
   await clearOutbox(noteId);
   await cacheNote(note, payload.content, lockedTitleFor(payload, title));
-  if (payload.lockType === 'time' && payload.password2) await cacheVault(noteId, payload.password2);
+  if (payload.lockType === 'time' && payload.password2) await cacheVault(noteId, payload.password2, note.updatedAt);
+  // Forget this device's copies of photos/audio the saved note no longer refers to.
+  if (payload.mediaKeep && window.KSMedia) { try { await KSMedia.reconcile(noteId, payload.mediaKeep); } catch (e) { /* best-effort */ } }
   await rerenderFromLocal();
 }
 
@@ -943,15 +1292,19 @@ function synthesizeMeta(id, payload) {
     unlockAt: payload.lockType === 'time' ? (payload.unlockAt || null) : null,
     title: String(payload.title || ''),
     preview: payload.lockType === 'none' ? String(payload.preview || '') : null,
+    size: contentStoredBytes(payload.content),
+    mediaSize: payload.mediaBytes > 0 ? payload.mediaBytes : undefined,
   };
 }
 
 async function applyOfflineSavedNote(noteId, payload, title) {
-  const pending = (await getOutbox()).find((o) => o.id === noteId);
+  const pending = await getOutboxItem(noteId);
   if (pending && pending.op === 'delete') return; // deleted meanwhile — don't resurrect it
-  await cacheNote(synthesizeMeta(noteId, payload), payload.content, lockedTitleFor(payload, title));
-  if (payload.lockType === 'time' && payload.password2) await cacheVault(noteId, payload.password2);
+  const meta = synthesizeMeta(noteId, payload);
+  await cacheNote(meta, payload.content, lockedTitleFor(payload, title));
+  if (payload.lockType === 'time' && payload.password2) await cacheVault(noteId, payload.password2, meta.updatedAt);
   await queueOutbox(noteId, 'save', payload);
+  if (payload.mediaKeep && window.KSMedia) { try { await KSMedia.reconcile(noteId, payload.mediaKeep); } catch (e) { /* best-effort */ } }
   // The outbox is now the durable local copy of this exact content, so the
   // abrupt-close draft would just be a duplicate of it.
   clearLocalDraft(noteId);
@@ -959,6 +1312,7 @@ async function applyOfflineSavedNote(noteId, payload, title) {
 }
 
 let lastListErrorMessage = null;
+let lastServerSyncAt = 0;
 
 // Refreshes the local cache from the server (when reachable), then pushes
 // anything queued. Never throws and never blanks the grid: whatever is
@@ -978,10 +1332,12 @@ async function syncFromServer() {
     return;
   }
   lastListErrorMessage = null;
+  lastServerSyncAt = Date.now();
   setOnline(true);
   learnServerTitleSupport(notes);
+  if (window.KSMedia) KSMedia.refreshConfig(); // learns whether the Worker has Backblaze set up (not awaited)
 
-  const outboxIds = new Set((await getOutbox()).map((o) => o.id));
+  const outboxIds = new Set(await getOutboxIds());
   const serverIds = new Set(notes.map((n) => n.id));
   // A note with a queued local change keeps its local version — a possibly
   // stale server copy must not overwrite work the server hasn't seen yet.
@@ -1011,19 +1367,23 @@ async function prefetchOfflineData(metas) {
   for (const meta of metas) {
     if (!navigator.onLine) return;
     try {
-      const cached = await getCachedNote(meta.id);
-      const needContent = !cached || !cached.content || cached.contentUpdatedAt !== meta.updatedAt;
+      const cached = await getCachedMeta(meta.id);
+      const needContent = !cached || !cached.hasContent || cached.contentUpdatedAt !== meta.updatedAt;
       if (needContent) {
         const { content } = await API.getNote(meta.id);
         await cacheNote(meta, content);
       }
       const unlocked = meta.lockType === 'time' && meta.unlockAt && Date.now() >= meta.unlockAt;
-      if (unlocked && !(cached && cached.vault)) {
+      const vaultFresh = !!(cached && cached.vault && cached.vaultUpdatedAt === meta.updatedAt);
+      if (unlocked && !vaultFresh) {
         try {
           const { password2 } = await API.getVault(meta.id);
-          if (password2) await cacheVault(meta.id, password2);
+          if (password2) await cacheVault(meta.id, password2, meta.updatedAt);
         } catch (e) { if (e.isNetworkError) return; }
       }
+      // Photos and audio kept in Backblaze: bring them along too (while there's room on this
+      // device), so the note opens offline like every other.
+      if (meta.mediaSize > 0 && window.KSMedia) await KSMedia.prefetchNote(meta.id, meta.mediaSize);
     } catch (e) {
       if (e.isNetworkError) { setOnline(false); return; }
       // Anything else (e.g. one note's content missing server-side) —
@@ -1066,6 +1426,7 @@ async function refreshNotes() {
 }
 
 function switchView(view) {
+  hideRevealedCards();
   currentView = view;
   document.getElementById('tab-notes').setAttribute('aria-selected', String(view === 'notes'));
   document.getElementById('tab-locked').setAttribute('aria-selected', String(view === 'locked'));
@@ -1077,24 +1438,71 @@ function switchView(view) {
  * Editor
  * ------------------------------------------------------------------- */
 
+// A 72px thumbnail used to be the full-size photo scaled down by CSS — so a
+// note with a few "Original"-quality photos made the browser decode several
+// 12-megapixel images just to draw a thumbnail strip. Draw from a small
+// decoded copy instead (made once per photo, kept only while the editor is open).
+const thumbUrls = new Map(); // fingerprint -> object URL
+
+function clearThumbUrls() {
+  for (const url of thumbUrls.values()) if (url.startsWith('blob:')) URL.revokeObjectURL(url);
+  thumbUrls.clear();
+}
+
+async function makeThumbURL(src) {
+  const sig = mediaSig(src);
+  if (thumbUrls.has(sig)) return thumbUrls.get(sig);
+  let url = src; // fallback: the photo itself
+  try {
+    const blob = await (await fetch(src)).blob();
+    let bitmap;
+    try { bitmap = await createImageBitmap(blob, { resizeWidth: 160, resizeQuality: 'medium' }); }
+    catch (e) { bitmap = await createImageBitmap(blob); }
+    const scale = Math.min(1, 160 / Math.max(bitmap.width, bitmap.height));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    if (bitmap.close) bitmap.close();
+    const small = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.8));
+    if (small) url = URL.createObjectURL(small);
+  } catch (e) { /* keep the fallback */ }
+  thumbUrls.set(sig, url);
+  return url;
+}
+
 function renderEditorThumbs() {
   const wrap = document.getElementById('editor-thumbs');
-  wrap.innerHTML = editorImages.map((src, i) => `
-    <div class="thumb">
-      <img src="${src}" alt="" data-idx="${i}">
-      <span class="thumb-size">${formatBytes(estimateImageBytes(src))}</span>
-      <button class="thumb-remove" data-idx="${i}" aria-label="Remove image">×</button>
-    </div>`).join('');
-  wrap.querySelectorAll('.thumb-remove').forEach((btn) => {
-    btn.addEventListener('click', (e) => {
+  wrap.textContent = '';
+  editorImages.forEach((src, i) => {
+    const thumb = document.createElement('div');
+    thumb.className = 'thumb';
+    const img = document.createElement('img');
+    img.alt = '';
+    img.dataset.idx = String(i);
+    const cached = thumbUrls.get(mediaSig(src));
+    if (cached) img.src = cached;
+    else makeThumbURL(src).then((url) => { if (img.isConnected && editorImages[Number(img.dataset.idx)] === src) img.src = url; });
+    img.addEventListener('click', () => openLightbox(Number(img.dataset.idx)));
+    const size = document.createElement('span');
+    size.className = 'thumb-size';
+    size.textContent = formatBytes(estimateImageBytes(src));
+    const remove = document.createElement('button');
+    remove.className = 'thumb-remove';
+    remove.setAttribute('aria-label', 'Remove image');
+    remove.textContent = '\u00d7';
+    remove.addEventListener('click', (e) => {
       e.stopPropagation();
-      editorImages.splice(Number(btn.dataset.idx), 1);
+      editorImages.splice(Number(img.dataset.idx), 1);
       renderEditorThumbs();
+      updateSizeMeter();
       onEditorContentChanged();
     });
-  });
-  wrap.querySelectorAll('img').forEach((img) => {
-    img.addEventListener('click', () => openLightbox(Number(img.dataset.idx)));
+    thumb.append(img, size, remove);
+    wrap.appendChild(thumb);
   });
 }
 
@@ -1168,21 +1576,41 @@ function setupLightbox() {
   }, { passive: true });
 }
 
+function lockIsActive() { return !!(pendingLock && pendingLock.type !== 'none'); }
+
 function renderLockSummary() {
   const el = document.getElementById('editor-lock-summary');
   const removeBtn = document.getElementById('btn-remove-lock');
-  const active = pendingLock && pendingLock.type !== 'none';
+  const lockBtn = document.getElementById('btn-open-lock-chooser');
+  const active = lockIsActive();
   if (removeBtn) removeBtn.style.display = active ? '' : 'none';
+  // The padlock is the way back into the lock settings, so it says so — and
+  // lights up while a lock is on, instead of looking identical either way.
+  if (lockBtn) {
+    const label = active ? 'Change lock' : 'Lock this note';
+    lockBtn.title = label;
+    lockBtn.setAttribute('aria-label', label);
+    lockBtn.setAttribute('aria-pressed', String(active));
+  }
   if (!active) { el.innerHTML = ''; return; }
-  el.innerHTML = pendingLock.type === 'quick'
-    ? `<p class="hint">Quick lock will be applied when you save.</p>`
-    : `<p class="hint">Time-locked until ${fmtDateTime(pendingLock.unlockAt)}.</p>`;
+  let text;
+  if (pendingLock.type === 'quick') {
+    text = 'Quick lock on \u2014 tap the padlock to change it.';
+  } else if (!pendingLock.unlockAt) {
+    text = 'Time lock on \u2014 tap the padlock to change it.';
+  } else if (pendingLock.unlockAt > Date.now()) {
+    text = `Time-locked until ${fmtDateTime(pendingLock.unlockAt)}. Tap the padlock to change it.`;
+  } else {
+    text = `Time lock ended ${fmtDateTime(pendingLock.unlockAt)} \u2014 this note opens with your password.`;
+  }
+  el.innerHTML = `<p class="hint">${escapeHTML(text)}</p>`;
 }
 
 function noteHasContent() {
   const title = document.getElementById('editor-title').value.trim();
   const body = document.getElementById('editor-body').textContent.trim();
-  return !!(title || body || editorImages.length || Ink.strokes.length);
+  return !!(title || body || editorImages.length || Ink.strokes.length
+    || document.getElementById('editor-body').querySelector('ks-audio'));
 }
 
 // The Download / Delete buttons in the editor only make sense once the
@@ -1196,11 +1624,16 @@ function setExistingNoteButtons(exists) {
 // have plain `body` text; newer ones also carry `html` and `drawing`.
 function setEditorContent(content) {
   document.getElementById('editor-title').value = content.title || '';
-  document.getElementById('editor-body').innerHTML =
-    content.html ? sanitizeHTML(content.html) : textToHTML(content.body);
-  editorImages = (content.images || []).slice();
+  clearAudioUrls();
+  editorAudio = sanitizeAudioMap(content.audio);
+  const bodyEl = document.getElementById('editor-body');
+  bodyEl.innerHTML = content.html ? sanitizeHTML(content.html) : textToHTML(content.body);
+  hydrateAudioChips(bodyEl);
+  // Only real data: URLs ever reach the <img> markup.
+  editorImages = (content.images || []).filter((s) => typeof s === 'string' && /^data:image\//.test(s));
   renderEditorThumbs();
   inkLoad(content.drawing);
+  updateSizeMeter();
 }
 
 function openEditorWithContent(meta, content) {
@@ -1227,7 +1660,8 @@ function openEditorWithContent(meta, content) {
   // Baseline must be built the same way later snapshots are (captureSnapshot,
   // which carries the resolved lock passwords) or a locked note would always
   // look "changed" and get re-encrypted and re-uploaded just for being opened.
-  lastAutosavedJSON = JSON.stringify(captureSnapshot());
+  const openedSnapshot = captureSnapshot();
+  lastAutosavedJSON = snapshotKey(openedSnapshot);
   // A note locked before titles were stored on the server has none there.
   // Once the Worker supports it, make closing this note re-save it once so
   // every device gets the title — no edit needed.
@@ -1235,7 +1669,7 @@ function openEditorWithContent(meta, content) {
       && localStorage.getItem('ks_titlesOnServer') === '1') {
     lastAutosavedJSON = null;
   }
-  seedSyncStateImages(editingNoteId, editorImages);
+  seedSyncStateImages(editingNoteId, openedSnapshot);
   show('overlay-editor');
   // No auto-focus here on purpose — opening a note (new or existing)
   // should never force the keyboard open by itself. It comes up only
@@ -1254,7 +1688,8 @@ async function maybeOfferDraftRestore(noteId, serverContent) {
   const contentKey = (c) => JSON.stringify({
     title: c.title || '',
     html: sanitizeHTML(c.html || textToHTML(c.body)),
-    images: c.images || [],
+    images: (c.images || []).map(mediaSig),
+    audio: Object.keys(c.audio || {}).sort(),
     drawing: (c.drawing && c.drawing.strokes && c.drawing.strokes.length) ? c.drawing.strokes : null,
   });
   const draftKey = contentKey(draft);
@@ -1312,30 +1747,72 @@ function captureSnapshot() {
     body: htmlToText(html), // plain-text copy: previews, search, and readers that predate formatting
     html,
     images: editorImages.slice(),
+    audio: snapshotAudio(html),
     drawing: inkGetData(),
     lock: resolveLockForSnapshot(),
   };
 }
 
-async function buildSavePayload(snapshot) {
+// Only clips that are still in the text get saved — a clip you deleted (or
+// undid) doesn't linger in the note's data.
+function snapshotAudio(html) {
+  const out = {};
+  for (const m of html.matchAll(/<ks-audio data-id="([a-z0-9]+)"><\/ks-audio>/g)) {
+    if (editorAudio[m[1]]) out[m[1]] = editorAudio[m[1]];
+  }
+  return out;
+}
+
+// Same, for the local-draft safety net.
+function saveDraftNow(noteId) {
+  const html = sanitizeHTML(document.getElementById('editor-body').innerHTML);
+  saveLocalDraft(noteId, document.getElementById('editor-title').value, htmlToText(html),
+    editorImages.slice(), html, inkGetData(), snapshotAudio(html));
+}
+
+async function buildSavePayload(snapshot, noteId) {
   const { title, body, html, images, drawing, lock } = snapshot;
+  const audio = snapshot.audio || {};
   const content = { title, body, html, images };
+  if (Object.keys(audio).length) content.audio = audio;
   if (drawing) content.drawing = drawing;
+
+  // With Backblaze set up, photos and audio leave the note here \u2014 before any locking, so a
+  // locked note's media is encrypted too. `stored` is what actually gets saved (and encrypted).
+  let stored = content;
+  let mediaKeep = null;
+  let mediaBytes = 0;
+  if (noteId && window.KSMedia && KSMedia.available()) {
+    try {
+      const ext = await KSMedia.externalize(noteId, content, !!(lock && lock.type !== 'none'));
+      stored = ext.content;
+      mediaKeep = ext.keep;
+      mediaBytes = ext.bytes;
+    } catch (e) {
+      if (e && e.tooBig) throw e;
+      // Couldn't move the media out (say this browser won't keep it locally): fall back to
+      // keeping it inside the note, exactly as before.
+      stored = content; mediaKeep = null; mediaBytes = 0;
+    }
+  }
   let payload;
 
   if (!lock || lock.type === 'none') {
-    payload = { lockType: 'none', title, preview: makePreview(body) || (drawing ? 'Drawing' : ''), content };
+    payload = { lockType: 'none', title, preview: makePreview(body) || (drawing ? 'Drawing' : ''), content: stored };
   } else if (lock.type === 'quick') {
     if (!lock.password) throw new Error('missing password for quick lock');
-    const record = await encryptNote(lock.password, content);
+    const record = await encryptNote(lock.password, stored);
     payload = { lockType: 'quick', title, content: record };
   } else if (lock.type === 'time') {
     if (!lock.password) throw new Error('missing password for time lock');
-    const record = await encryptNote(combine(lock.password, lock.password2), content);
+    const record = await encryptNote(combine(lock.password, lock.password2), stored);
     payload = { lockType: 'time', title, unlockAt: lock.unlockAt, password2: lock.password2, content: record };
   }
+  if (mediaKeep) { payload.mediaKeep = mediaKeep; payload.mediaBytes = mediaBytes; }
 
-  return { payload, hasImages: images.length > 0 };
+  const hasAudio = Object.keys(audio).length > 0;
+  const mediaWhat = hasAudio ? (images.length ? 'photos & audio' : 'audio') : 'photos';
+  return { payload, hasImages: images.length > 0 || hasAudio, mediaWhat };
 }
 
 /* ---------------------------------------------------------------------
@@ -1351,10 +1828,10 @@ async function buildSavePayload(snapshot) {
 // actually changed since the server last saw them?" check below has a
 // real baseline from the start — otherwise the very first autosave of an
 // existing, already-synced note would look like a fresh photo upload.
-function seedSyncStateImages(noteId, images) {
+function seedSyncStateImages(noteId, snapshot) {
   let state = syncStateByNote.get(noteId);
   if (!state) { state = { inFlight: false, queued: null }; syncStateByNote.set(noteId, state); }
-  state.lastSyncedImagesJSON = JSON.stringify(images);
+  state.lastSyncedImagesJSON = mediaKey(snapshot);
 }
 
 function runSync(noteId, snapshot) {
@@ -1377,16 +1854,17 @@ async function syncRunOne(noteId, snapshot, state) {
 
   let built;
   try {
-    built = await buildSavePayload(snapshot);
+    built = await buildSavePayload(snapshot, noteId);
   } catch (e) {
     state.inFlight = false;
-    toast('Could not lock note — try setting the lock again.');
-    if (showInBar()) syncBarError('Couldn\u2019t save — check the lock', () => runSync(noteId, snapshot));
+    const tooBig = !!(e && e.tooBig);
+    toast(tooBig ? e.message : 'Could not lock note — try setting the lock again.');
+    if (showInBar()) syncBarError(tooBig ? 'Couldn\u2019t save — a file is too big' : 'Couldn\u2019t save — check the lock', () => runSync(noteId, snapshot));
     maybeContinueQueued(noteId, state);
     return;
   }
 
-  const { payload, hasImages } = built;
+  const { payload, hasImages, mediaWhat } = built;
 
   // The note's photos are stored together with its text in one blob (see
   // worker.js), so every save necessarily re-sends all of it — but that's
@@ -1394,13 +1872,13 @@ async function syncRunOne(noteId, snapshot, state) {
   // part of what changed. Otherwise a plain text edit on a photo-heavy
   // note would misleadingly claim to be re-saving pictures on every
   // autosave tick.
-  const imagesJSON = JSON.stringify(snapshot.images);
+  const imagesJSON = mediaKey(snapshot);
   const imagesChanged = hasImages && imagesJSON !== state.lastSyncedImagesJSON;
 
   const onProgress = imagesChanged && showInBar()
-    ? (fraction) => syncBarSet(`Saving photos… ${Math.round(fraction * 100)}%`, fraction)
+    ? (fraction) => syncBarSet(`Saving ${mediaWhat}… ${Math.round(fraction * 100)}%`, fraction)
     : null;
-  if (showInBar()) syncBarSet(imagesChanged ? 'Saving photos… 0%' : 'Saving…', imagesChanged ? 0 : null);
+  if (showInBar()) syncBarSet(imagesChanged ? `Saving ${mediaWhat}… 0%` : 'Saving…', imagesChanged ? 0 : null);
 
   try {
     if (!navigator.onLine) {
@@ -1417,7 +1895,7 @@ async function syncRunOne(noteId, snapshot, state) {
       noteExistsOnServer = true;
       setExistingNoteButtons(true);
       document.getElementById('editor-heading').textContent = 'Edit note';
-      lastAutosavedJSON = JSON.stringify(snapshot);
+      lastAutosavedJSON = snapshotKey(snapshot);
     }
     state.lastSyncedImagesJSON = imagesJSON;
     clearLocalDraft(noteId);
@@ -1435,7 +1913,7 @@ async function syncRunOne(noteId, snapshot, state) {
         noteExistsOnServer = true;
         setExistingNoteButtons(true);
         document.getElementById('editor-heading').textContent = 'Edit note';
-        lastAutosavedJSON = JSON.stringify(snapshot);
+        lastAutosavedJSON = snapshotKey(snapshot);
       }
       state.lastSyncedImagesJSON = imagesJSON;
       if (showInBar()) syncBarSuccess('Saved on this device — will sync later');
@@ -1469,26 +1947,23 @@ function maybeContinueQueued(noteId, state) {
 
 function onEditorContentChanged() {
   if (!editingNoteId) return;
+  scheduleSizeMeter();
 
   if (!localDraftThrottle) {
     localDraftThrottle = setTimeout(() => {
       localDraftThrottle = null;
-      if (noteHasContent()) {
-        const html = sanitizeHTML(document.getElementById('editor-body').innerHTML);
-        saveLocalDraft(
-          editingNoteId,
-          document.getElementById('editor-title').value,
-          htmlToText(html),
-          editorImages.slice(),
-          html,
-          inkGetData()
-        );
-      }
+      // Never write a locked note's text to the device in plain form. Its
+      // encrypted copy reaches the outbox/server seconds later anyway.
+      if (editingNoteId && noteHasContent() && !lockIsActive()) saveDraftNow(editingNoteId);
     }, 1000);
   }
 
+  // Every save re-sends the whole note, so a heavy note waits a little
+  // longer between autosaves (it also saves Workers KV's 1,000-writes-a-day
+  // allowance on the Free plan).
+  const delay = Math.min(10000, 2000 + Math.floor(lastNoteBytes / 1048576) * 1000);
   clearTimeout(serverSyncDebounce);
-  serverSyncDebounce = setTimeout(triggerAutosave, 2000);
+  serverSyncDebounce = setTimeout(triggerAutosave, delay);
 
   if (!serverSyncSafetyInterval) {
     serverSyncSafetyInterval = setInterval(triggerAutosave, 15000);
@@ -1496,9 +1971,9 @@ function onEditorContentChanged() {
 }
 
 function triggerAutosave() {
-  if (!editingNoteId || !noteHasContent()) return;
+  if (!editingNoteId || (!noteHasContent() && !noteExistsOnServer)) return;
   const snapshot = captureSnapshot();
-  const key = JSON.stringify(snapshot);
+  const key = snapshotKey(snapshot);
   if (key === lastAutosavedJSON) return; // nothing's changed since the last successful save
   runSync(editingNoteId, snapshot);
 }
@@ -1520,17 +1995,20 @@ function stopAutosaveTimers() {
 
 function closeEditorAndSync(isExplicitSave) {
   const noteId = editingNoteId;
-  const overLimit = estimateContentBytes() > NOTE_SIZE_LIMIT;
+  const overLimit = noteSizeBreakdown().total > NOTE_SIZE_LIMIT;
 
   if (overLimit && isExplicitSave) {
-    toast('This note is over the 25MB limit — remove a photo before saving.');
+    toast('This note is over the 25 MB limit — remove a photo or an audio clip before saving.');
     return;
   }
 
   stopAutosaveTimers();
   setDrawMode(false);
 
-  if (!noteHasContent()) {
+  // A brand-new, still-empty note is simply dropped. A note that already
+  // exists is different: emptying it is a real edit and must be saved, not
+  // silently thrown away (it used to pop back with its old text).
+  if (!noteHasContent() && !noteExistsOnServer) {
     clearLocalDraft(noteId);
     hide('overlay-editor');
     currentUnlockCreds = null;
@@ -1541,14 +2019,17 @@ function closeEditorAndSync(isExplicitSave) {
     // Closing (not explicitly saving) with an oversized note: the local
     // draft cache already has it, so nothing is lost — just skip sending a
     // request to the server that KV would reject anyway.
+    // Nothing else holds this version (it can't be sent), so keep a local
+    // draft now \u2014 even for a locked note, since the alternative is losing it.
+    saveDraftNow(noteId);
     hide('overlay-editor');
     currentUnlockCreds = null;
-    toast('Kept on this device only — this note is over the 25MB limit. Remove a photo to sync it.');
+    toast('Kept on this device only — this note is over the 25 MB limit. Remove a photo or clip to sync it.');
     return;
   }
 
   const snapshot = captureSnapshot();
-  const key = JSON.stringify(snapshot);
+  const key = snapshotKey(snapshot);
   hide('overlay-editor'); // instant — the real work continues below, in the background
   currentUnlockCreds = null;
 
@@ -1561,12 +2042,22 @@ function attemptCloseEditor() { closeEditorAndSync(false); }
 
 function confirmDelete(id, fromEditor) {
   openConfirm('Delete this note?', 'This can\u2019t be undone.', async () => {
+    // Cancel anything still waiting to autosave this note \u2014 otherwise a save
+    // queued a moment ago lands after the delete and brings the note back.
+    if (fromEditor && editingNoteId === id) {
+      stopAutosaveTimers();
+      setDrawMode(false);
+      editingNoteId = null;
+      lastAutosavedJSON = null;
+    }
+    const doomed = syncStateByNote.get(id);
+    if (doomed) doomed.queued = null;
     // Local-first: it disappears from the cache and grid right away, and the
     // server delete is queued in the outbox so it still happens if there's
     // no connection right now (or the request fails).
     await removeCachedNote(id);
     clearLocalDraft(id);
-    revealedLockedCards.delete(id);
+    unrevealCard(id);
     if (fromEditor) hide('overlay-editor');
     await queueOutbox(id, 'delete', null);
     await rerenderFromLocal();
@@ -1612,6 +2103,11 @@ function resetLockChooser() {
   document.getElementById('time-unlock-at').min = localDatetimeInputMin();
   document.getElementById('btn-confirm-quick-lock').textContent = 'Set quick lock';
   document.getElementById('btn-confirm-time-lock').textContent = 'Set time lock';
+  document.getElementById('choice-quick').setAttribute('aria-pressed', 'false');
+  document.getElementById('choice-time').setAttribute('aria-pressed', 'false');
+  const status = document.getElementById('time-lock-status');
+  status.textContent = '';
+  status.hidden = true;
 }
 
 // <input type="datetime-local"> wants local "YYYY-MM-DDTHH:mm", not a timestamp.
@@ -1633,8 +2129,16 @@ function prefillLockChooser() {
   document.getElementById('choice-' + kind).click(); // selects it and reveals its fields
   document.getElementById(kind + '-password').value = pw;
   document.getElementById(kind + '-password-confirm').value = pw;
-  if (kind === 'time' && lock.unlockAt && lock.unlockAt > Date.now()) {
+  if (kind === 'time' && lock.unlockAt) {
+    // Show the date that is actually set \u2014 including one that has already
+    // passed (the usual case when reopening a note after its time lock ended;
+    // it used to come up blank, and "Update" then demanded a new date).
     document.getElementById('time-unlock-at').value = toLocalDatetimeInput(lock.unlockAt);
+    const status = document.getElementById('time-lock-status');
+    status.textContent = lock.unlockAt > Date.now()
+      ? `Currently set to unlock ${fmtDateTime(lock.unlockAt)}.`
+      : `This lock\u2019s date (${fmtDateTime(lock.unlockAt)}) has passed, so the note opens with just your password. Pick a new future date to seal it again, or keep it as it is.`;
+    status.hidden = false;
   }
   document.getElementById('btn-confirm-' + kind + '-lock').textContent = 'Update ' + kind + ' lock';
 }
@@ -1667,18 +2171,24 @@ function openUnlockFlow(meta) {
       </div>`;
     show('overlay-unlock');
     document.getElementById('unlock-password').focus();
-    document.getElementById('btn-do-unlock').addEventListener('click', async () => {
+    document.getElementById('btn-do-unlock').addEventListener('click', async (ev) => {
+      const btn = ev.currentTarget;
+      if (btn.disabled) return;
       const pw = document.getElementById('unlock-password').value;
+      const err = document.getElementById('unlock-error');
+      err.style.display = 'none';
+      setBusy(btn, true, 'Opening\u2026');
       try {
         const record = await fetchNoteContent(meta);
-        const content = await decryptNote(pw, record);
+        const content = await inflateForOpen(meta, await decryptNote(pw, record));
         currentUnlockCreds = { password: pw };
         hide('overlay-unlock');
         openEditorWithContent(meta, content);
       } catch (e) {
-        const err = document.getElementById('unlock-error');
-        err.textContent = e.notCached ? e.message : 'Wrong password.';
+        err.textContent = unlockErrorText(e, 'Wrong password.');
         err.style.display = '';
+      } finally {
+        setBusy(btn, false);
       }
     });
     return;
@@ -1701,19 +2211,24 @@ function openUnlockFlow(meta) {
       </div>`;
     show('overlay-unlock');
     document.getElementById('unlock-password').focus();
-    document.getElementById('btn-do-unlock').addEventListener('click', async () => {
+    document.getElementById('btn-do-unlock').addEventListener('click', async (ev) => {
+      const btn = ev.currentTarget;
+      if (btn.disabled) return;
       const pw = document.getElementById('unlock-password').value;
       const err = document.getElementById('unlock-error');
+      err.style.display = 'none';
+      setBusy(btn, true, 'Opening\u2026');
       try {
-        const password2 = await fetchVaultPassword2(meta);
-        const record = await fetchNoteContent(meta);
-        const content = await decryptNote(combine(pw, password2), record);
+        const [password2, record] = await Promise.all([fetchVaultPassword2(meta), fetchNoteContent(meta)]);
+        const content = await inflateForOpen(meta, await decryptNote(combine(pw, password2), record));
         currentUnlockCreds = { password: pw, password2 };
         hide('overlay-unlock');
         openEditorWithContent(meta, content);
       } catch (e) {
-        err.textContent = e.notCached ? e.message : 'Wrong password.';
+        err.textContent = unlockErrorText(e, 'Wrong password.');
         err.style.display = '';
+      } finally {
+        setBusy(btn, false);
       }
     });
     return;
@@ -1745,21 +2260,43 @@ function openUnlockFlow(meta) {
     document.getElementById('unlock-password').focus();
   });
 
-  document.getElementById('btn-do-unlock').addEventListener('click', async () => {
+  document.getElementById('btn-do-unlock').addEventListener('click', async (ev) => {
+    const btn = ev.currentTarget;
+    if (btn.disabled) return;
     const pw = document.getElementById('unlock-password').value;
     const pw2 = document.getElementById('unlock-password2').value;
     const err = document.getElementById('unlock-error');
+    err.style.display = 'none';
+    setBusy(btn, true, 'Opening\u2026');
     try {
       const record = await fetchNoteContent(meta);
-      const content = await decryptNote(combine(pw, pw2), record);
+      const content = await inflateForOpen(meta, await decryptNote(combine(pw, pw2), record));
       currentUnlockCreds = { password: pw, password2: pw2 };
       hide('overlay-unlock');
       openEditorWithContent(meta, content);
     } catch (e) {
-      err.textContent = e.notCached ? e.message : 'Couldn\u2019t unlock — check both passwords.';
+      err.textContent = unlockErrorText(e, 'Couldn\u2019t unlock \u2014 check both passwords.');
       err.style.display = '';
+    } finally {
+      setBusy(btn, false);
     }
   });
+}
+
+// A wrong password is a failed decrypt. Anything else (server down, bad
+// token, clock skew) used to be reported as \"Wrong password.\" too.
+function unlockErrorText(e, wrongPasswordText) {
+  if (e && e.notCached) return e.message;
+  if (e && e.status === 403) return 'The server says this note is still sealed \u2014 check this device\u2019s date and time.';
+  if (e && e.status === 401) return 'The server rejected your access token \u2014 check Settings.';
+  if (e && (e.status || e.isNetworkError)) return e.message;
+  return wrongPasswordText;
+}
+
+// Key derivation takes a moment on a phone; show it, and ignore a second tap.
+function setBusy(btn, busy, label) {
+  if (busy) { btn.dataset.label = btn.textContent; btn.textContent = label; } else if (btn.dataset.label) { btn.textContent = btn.dataset.label; }
+  btn.disabled = busy;
 }
 
 function notCachedError() {
@@ -1772,43 +2309,71 @@ function notCachedError() {
 // also refreshes the local copy), otherwise from the local cache. This is
 // what lets any note — locked (still encrypted) or not — open with no
 // connection at all.
+// True while this note has a save/delete the server hasn't acknowledged. The
+// local copy is then the newest version, and the server's must not replace it.
+async function hasPendingChange(id) {
+  return !!(await getOutboxItem(id));
+}
+
+// Opens from this device's copy whenever that copy is known to be current —
+// it matches the version the note list reports, or it holds an edit the
+// server hasn't received yet. Re-downloading the whole note (photos, audio
+// and all) on every tap, even though an identical copy was already sitting in
+// IndexedDB, was the slow part of opening a note. The list is refreshed on
+// launch, after saves and whenever the app comes back to the foreground, so a
+// note edited elsewhere still shows up as out-of-date here and is fetched.
 async function fetchNoteContent(meta) {
-  if (navigator.onLine) {
+  const [light, pending] = await Promise.all([getCachedMeta(meta.id), hasPendingChange(meta.id)]);
+  const cacheIsCurrent = !!(light && light.hasContent && light.contentUpdatedAt === meta.updatedAt);
+  if (cacheIsCurrent || pending) {
+    const cached = await getCachedContent(meta.id);
+    if (cached) return cached;
+  }
+  if (navigator.onLine && !pending) {
     try {
       const { content } = await API.getNote(meta.id);
       setOnline(true);
-      await cacheNote(meta, content);
+      cacheNote(meta, content); // not awaited — writing it to disk shouldn't hold up opening the note
       return content;
     } catch (e) {
       if (!e.isNetworkError) throw e;
       setOnline(false);
     }
   }
-  const cached = await getCachedNote(meta.id);
-  if (!cached || !cached.content) throw notCachedError();
-  return cached.content;
+  const cached = await getCachedContent(meta.id);
+  if (!cached) throw notCachedError();
+  return cached;
+}
+
+// Brings a note's photos and audio back from Backblaze (media.js) once its content is readable.
+// A note that keeps its media inline passes straight through. Throws, rather than opening
+// a note with something missing, if a file can't be fetched \u2014 saving that would lose it.
+function inflateForOpen(meta, content) {
+  if (!window.KSMedia) return content;
+  return KSMedia.inflate(meta.id, content, { onDownload: () => toast('Loading photos and audio\u2026') });
 }
 
 // Same idea for the released second password of a time-locked note.
 async function fetchVaultPassword2(meta) {
+  const light = await getCachedMeta(meta.id);
+  if (light && light.vault && light.vaultUpdatedAt === meta.updatedAt) return light.vault;
   if (navigator.onLine) {
     try {
       const { password2 } = await API.getVault(meta.id);
       setOnline(true);
-      await cacheVault(meta.id, password2);
+      cacheVault(meta.id, password2, meta.updatedAt);
       return password2;
     } catch (e) {
       if (!e.isNetworkError) throw e;
       setOnline(false);
     }
   }
-  const cached = await getCachedNote(meta.id);
-  if (!cached || !cached.vault) {
+  if (!light || !light.vault) {
     const err = new Error('Needs a connection — the second password is released by the server.');
     err.notCached = true;
     throw err;
   }
-  return cached.vault;
+  return light.vault;
 }
 
 async function handleOpenCard(id) {
@@ -1816,7 +2381,7 @@ async function handleOpenCard(id) {
   if (!meta) return;
   if (meta.lockType === 'none') {
     try {
-      const content = await fetchNoteContent(meta);
+      const content = await inflateForOpen(meta, await fetchNoteContent(meta));
       currentUnlockCreds = null;
       openEditorWithContent(meta, content);
     } catch (e) {
@@ -1827,10 +2392,10 @@ async function handleOpenCard(id) {
   // Locked card: the first tap only reveals its download/delete buttons;
   // a tap once they're showing goes on to the unlock prompt as usual.
   if (!revealedLockedCards.has(id)) {
-    revealedLockedCards.add(id);
-    renderLocked();
+    revealLockedCard(id);
     return;
   }
+  unrevealCard(id);
   currentUnlockCreds = null;
   openUnlockFlow(meta);
 }
@@ -1838,12 +2403,12 @@ async function handleOpenCard(id) {
 async function downloadNote(id) {
   try {
     let bundle = null;
-    if (navigator.onLine) {
+    if (navigator.onLine && !(await hasPendingChange(id))) {
       try {
         bundle = await API.exportNote(id);
         setOnline(true);
         await cacheNote(bundle.meta, bundle.content);
-        if (bundle.password2) await cacheVault(id, bundle.password2);
+        if (bundle.password2) await cacheVault(id, bundle.password2, bundle.meta.updatedAt);
       } catch (e) {
         if (!e.isNetworkError) throw e;
         setOnline(false);
@@ -1854,6 +2419,10 @@ async function downloadNote(id) {
       const cached = await getCachedNote(id);
       if (!cached || !cached.content) throw notCachedError();
       bundle = { meta: cached.meta, content: cached.content, password2: cached.vault || null };
+    }
+    // Photos and audio kept in Backblaze are added to the file, so it is still a complete copy.
+    if (window.KSMedia && bundle.meta && bundle.meta.mediaSize > 0) {
+      bundle = await KSMedia.attachToBundle(id, bundle, { onDownload: () => toast('Gathering photos and audio\u2026') });
     }
     const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
@@ -1898,6 +2467,7 @@ function openConfirm(title, message, onYes, yesLabel = 'Delete') {
 const FORCE_REFRESH_SHELL_FILES = [
   './index.html',
   './app.js',
+  './media.js',
   './manifest.json',
   './icon-192.png',
   './icon-512.png',
@@ -1906,8 +2476,27 @@ const FORCE_REFRESH_SHELL_FILES = [
 function openSettings() {
   document.getElementById('settings-api-base').value = Config.base();
   document.getElementById('settings-token').value = Config.token();
-  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.4.2';
+  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.6.0';
+  fillQualitySettings();
+  fillMediaSettings();
   show('overlay-settings');
+  renderStorageSection();
+  if (window.KSMedia && Config.configured()) KSMedia.refreshConfig().then(() => { fillMediaSettings(); renderStorageSection(); });
+}
+
+// The Backblaze row in Settings: whether the Worker has it set up, and a switch.
+function fillMediaSettings() {
+  const box = document.getElementById('settings-media-on');
+  const status = document.getElementById('settings-media-status');
+  if (!box || !status) return;
+  const avail = !!(window.KSMedia && KSMedia.available());
+  box.disabled = !avail;
+  box.checked = avail && KSMedia.enabled();
+  status.textContent = avail
+    ? (box.checked
+        ? 'On. New and edited notes keep their photos and audio in your Backblaze bucket (up to about 90 MB a file), so they no longer count toward the 25 MB note limit. Locked notes\u2019 media is encrypted first. Notes saved before this keep theirs inside until you next save them.'
+        : 'Off. Photos and audio stay inside each note (25 MB limit per note).')
+    : 'Not set up on your Worker, so photos and audio stay inside each note (25 MB limit per note). See the README to connect a Backblaze bucket.';
 }
 
 // Clears the installed service worker + its cached app shell, then reloads.
@@ -1970,15 +2559,20 @@ function wireStaticEvents() {
     if (btn) hide(btn.dataset.close);
   });
   document.querySelectorAll('.overlay').forEach((ov) => {
-    ov.addEventListener('click', (e) => { if (e.target === ov) hide(ov.id); });
+    ov.addEventListener('click', (e) => { if (e.target === ov && !overlayIsProtected(ov.id)) hide(ov.id); });
   });
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
+    hideRevealedCards();
+    // The photo viewer handles its own Escape (see setupLightbox) \u2014 don't let
+    // the same keypress also close the editor behind it.
+    if (!document.getElementById('overlay-lightbox').classList.contains('hidden')) return;
     const openModals = document.querySelectorAll('.overlay:not(.hidden)');
     if (openModals.length) {
       // A modal (settings, lock chooser, unlock, confirm) is on top — close
-      // just that, and leave the full-screen editor underneath it alone.
-      openModals.forEach((ov) => hide(ov.id));
+      // just that, and leave the full-screen editor underneath it alone. A
+      // recording in progress is protected: it ends only through its own buttons.
+      openModals.forEach((ov) => { if (!overlayIsProtected(ov.id)) hide(ov.id); });
       return;
     }
     if (!document.getElementById('overlay-editor').classList.contains('hidden')) {
@@ -1988,12 +2582,34 @@ function wireStaticEvents() {
   });
 
   document.addEventListener('click', (e) => {
+    // Any tap outside the card whose buttons are showing tucks them away;
+    // a tap on that card (or its buttons) just restarts the countdown.
+    // (Only real taps count: the hidden link the download starts by
+    // clicking is a script-made click and must not dismiss the card.)
+    if (e.isTrusted) {
+      const revealedCard = e.target.closest('.card.revealed');
+      if (revealedCard) {
+        const openEl = revealedCard.querySelector('.card-open');
+        if (openEl) keepRevealed(openEl.dataset.id);
+      } else {
+        hideRevealedCards();
+      }
+    }
     const el = e.target.closest('[data-action]');
     if (!el) return;
     const { action, id } = el.dataset;
     if (action === 'open') handleOpenCard(id);
     if (action === 'download') downloadNote(id);
     if (action === 'delete') confirmDelete(id, false);
+  });
+
+  // Enter in a dialog field presses that dialog's primary button (there are no
+  // <form>s here, so it did nothing before \u2014 on a phone keyboard too).
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' || e.isComposing || !e.target.matches || !e.target.matches('.modal input')) return;
+    const scope = e.target.closest('#early-fields, #quick-lock-fields, #time-lock-fields, #unlock-body, .modal-body');
+    const primary = scope && scope.querySelector('.btn-primary:not(:disabled)');
+    if (primary) { e.preventDefault(); primary.click(); }
   });
 
   document.addEventListener('keydown', (e) => {
@@ -2036,13 +2652,21 @@ function wireStaticEvents() {
     const attachBtn = document.getElementById('btn-attach-image');
     attachBtn.disabled = true;
     let failed = 0;
+    let dropped = 0;
+    let refused = 0;
+    const targetNoteId = editingNoteId; // photos belong to the note they were picked for
 
     for (let i = 0; i < files.length; i++) {
       syncBarSet(`Adding photo ${i + 1} of ${files.length}…`, i / files.length);
       try {
-        const dataUrl = await fileToCompressedDataURL(files[i]);
+        const dataUrl = await fileToStoredDataURL(files[i]);
+        // Compression is slow; if you've since opened a different note, these
+        // must not be attached to it.
+        if (editingNoteId !== targetNoteId) { dropped++; continue; }
+        if (!canFitMedia(dataUrl.length + 4).ok) { refused++; continue; }
         editorImages.push(dataUrl);
         renderEditorThumbs(); // show each photo as soon as it's ready, not all at once at the end
+        updateSizeMeter();
         onEditorContentChanged();
       } catch (err) {
         failed++;
@@ -2054,11 +2678,16 @@ function wireStaticEvents() {
     attachBtn.disabled = false;
     e.target.value = '';
 
+    if (dropped) {
+      toast(dropped === 1 ? 'A photo wasn\u2019t added \u2014 you left that note first' : `${dropped} photos weren\u2019t added \u2014 you left that note first`);
+    }
     if (failed) {
       toast(failed === 1 ? 'Couldn\u2019t read one of those photos' : `Couldn\u2019t read ${failed} of those photos`);
     }
-    if (estimateContentBytes() > NOTE_SIZE_LIMIT) {
-      toast('This note is now over the 25MB limit — remove a photo or it won\u2019t save.');
+    if (refused) {
+      toast(refused === 1 ? `A photo wasn\u2019t added \u2014 it would push this note over ${limitWord()}` : `${refused} photos weren\u2019t added \u2014 they would push this note over ${limitWord()}`);
+    } else {
+      warnIfHeavy();
     }
   });
 
@@ -2067,12 +2696,16 @@ function wireStaticEvents() {
   document.getElementById('choice-quick').addEventListener('click', () => {
     document.getElementById('choice-quick').classList.add('selected');
     document.getElementById('choice-time').classList.remove('selected');
+    document.getElementById('choice-quick').setAttribute('aria-pressed', 'true');
+    document.getElementById('choice-time').setAttribute('aria-pressed', 'false');
     document.getElementById('quick-lock-fields').style.display = '';
     document.getElementById('time-lock-fields').style.display = 'none';
   });
   document.getElementById('choice-time').addEventListener('click', () => {
     document.getElementById('choice-time').classList.add('selected');
     document.getElementById('choice-quick').classList.remove('selected');
+    document.getElementById('choice-time').setAttribute('aria-pressed', 'true');
+    document.getElementById('choice-quick').setAttribute('aria-pressed', 'false');
     document.getElementById('time-lock-fields').style.display = '';
     document.getElementById('quick-lock-fields').style.display = 'none';
   });
@@ -2098,17 +2731,26 @@ function wireStaticEvents() {
     if (pw !== confirmPw) { err.textContent = 'Passwords don\u2019t match.'; err.classList.remove('visually-hidden'); return; }
     if (!unlockVal) { err.textContent = 'Pick a date and time.'; err.classList.remove('visually-hidden'); return; }
     const unlockAt = new Date(unlockVal).getTime();
-    if (unlockAt <= Date.now()) { err.textContent = 'Pick a time in the future.'; err.classList.remove('visually-hidden'); return; }
-    pendingLock = { type: 'time', password: pw, unlockAt, existing: false };
+    // Leaving an existing lock's date untouched is fine even if it has passed
+    // (the note just stays \"ready to open\"); any *changed* date must be in the future.
+    const keepsDate = !!(pendingLock && pendingLock.type === 'time' && pendingLock.unlockAt
+      && Math.floor(pendingLock.unlockAt / 60000) === Math.floor(unlockAt / 60000));
+    if (unlockAt <= Date.now() && !keepsDate) { err.textContent = 'Pick a time in the future.'; err.classList.remove('visually-hidden'); return; }
+    pendingLock = { type: 'time', password: pw, unlockAt: keepsDate ? pendingLock.unlockAt : unlockAt, existing: false };
     hide('overlay-lock-chooser');
     renderLockSummary();
     onEditorContentChanged();
   });
 
   document.getElementById('btn-remove-lock').addEventListener('click', () => {
-    pendingLock = null;
-    renderLockSummary();
-    onEditorContentChanged();
+    const doRemove = () => { pendingLock = null; renderLockSummary(); onEditorContentChanged(); };
+    // One stray tap used to strip the lock and autosave the note unencrypted
+    // two seconds later. If the server already holds an encrypted copy, ask first.
+    if (pendingLock && (pendingLock.existing || noteExistsOnServer)) {
+      openConfirm('Remove this lock?', 'The note will be saved without a password, and its text, photos and drawing will no longer be encrypted.', doRemove, 'Remove lock');
+    } else {
+      doRemove();
+    }
   });
 }
 
@@ -2147,6 +2789,11 @@ function sanitizeHTML(html) {
       if (child.nodeType === 3) { out += escapeHTML(child.nodeValue); return; }
       if (child.nodeType !== 1) return;
       const tag = child.tagName.toUpperCase();
+      if (tag === 'KS-AUDIO') { // an inline audio clip: only its id survives (see ks-audio in the editor)
+        const clipId = child.getAttribute('data-id') || '';
+        if (AUDIO_ID_RE.test(clipId)) out += '<ks-audio data-id="' + clipId + '"></ks-audio>';
+        return;
+      }
       if (RICH_DROP_TAGS.has(tag)) return;
       if (tag === 'BR') { out += '<br>'; return; }
       const inner = walk(child);
@@ -2178,6 +2825,12 @@ function htmlToText(html) {
       if (child.nodeType === 3) { cur += child.nodeValue; return; }
       if (child.nodeType !== 1) return;
       const tag = child.tagName.toUpperCase();
+      if (tag === 'KS-AUDIO') { // shows in previews and plain-text readers as a marker
+        const clip = editorAudio[child.getAttribute('data-id')];
+        if (cur && !/\s$/.test(cur)) cur += ' ';
+        cur += '\u{1F399} ' + (clip && clip.dur > 0 ? mmss(clip.dur) : 'audio');
+        return;
+      }
       if (tag === 'BR') {
         // A <br> that just holds an otherwise-empty block open (<div><br></div>) is a blank line.
         lines.push(cur); cur = ''; return;
@@ -2258,6 +2911,756 @@ function runFormat(cmd) {
   }
   updateFormatState();
   onEditorContentChanged();
+}
+
+/* ---------------------------------------------------------------------
+ * Size meter — how big this note is against the limits, with warnings.
+ * Each level has its own icon shape and a word, so it never relies on colour.
+ * ------------------------------------------------------------------- */
+
+const ZONE_ICON = {
+  ok: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M8 12.5l2.7 2.7L16 9.5"/></svg>',
+  heavy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5l9.5 16.5h-19z"/><path d="M12 10v4.5M12 17.4v.1"/></svg>',
+  danger: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8.2 3h7.6L21 8.2v7.6L15.8 21H8.2L3 15.8V8.2z"/><path d="M12 8v5M12 16.4v.1"/></svg>',
+  over: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9 9l6 6M15 9l-6 6"/></svg>',
+};
+const ZONE_WORD = { ok: 'Comfortable', heavy: 'Getting heavy', danger: 'Close to the limit', over: 'Over the limit' };
+
+let lastNoteBytes = 0;
+let sizeMeterTimer = null;
+let lastWarnedZone = 'ok';
+
+function mb1(bytes) { return (bytes / 1048576).toFixed(1); }
+
+function scheduleSizeMeter() {
+  clearTimeout(sizeMeterTimer);
+  sizeMeterTimer = setTimeout(updateSizeMeter, 300);
+}
+
+function updateSizeMeter() {
+  clearTimeout(sizeMeterTimer);
+  const btn = document.getElementById('btn-size');
+  if (!btn) return;
+  const b = noteSizeBreakdown();
+  lastNoteBytes = b.total;
+  const zone = noteSizeZone(b.total);
+  btn.dataset.zone = zone;
+  document.getElementById('size-icon').innerHTML = ZONE_ICON[zone];
+  document.getElementById('size-text').textContent = `${mb1(b.total)} / 25 MB`;
+  document.getElementById('size-fill').style.transform = `scaleX(${Math.min(1, b.total / NOTE_SIZE_LIMIT).toFixed(4)})`;
+  btn.setAttribute('aria-label', `Note size: ${mb1(b.total)} of 25 megabytes. ${ZONE_WORD[zone]}. Open details.`);
+  if (!document.getElementById('overlay-size').classList.contains('hidden')) renderSizeDialog(b);
+}
+
+// A toast only when a note first crosses into a worse level — not on every keystroke.
+function warnIfHeavy() {
+  const zone = noteSizeZone(noteSizeBreakdown().total);
+  const order = ['ok', 'heavy', 'danger', 'over'];
+  if (order.indexOf(zone) > order.indexOf(lastWarnedZone)) {
+    if (zone === 'heavy') toast('This note is getting heavy \u2014 see the size indicator at the top.');
+    if (zone === 'danger') toast('This note is close to the size limit. Saving may fail \u2014 consider moving some media elsewhere.');
+    if (zone === 'over') toast('This note is over the 25 MB limit and can\u2019t be saved until you remove something.');
+  }
+  lastWarnedZone = zone;
+}
+
+function renderSizeDialog(b) {
+  b = b || noteSizeBreakdown();
+  const zone = noteSizeZone(b.total);
+  document.getElementById('size-status').innerHTML =
+    `<span class="size-badge" data-zone="${zone}">${ZONE_ICON[zone]}<span>${ZONE_WORD[zone]}</span></span>` +
+    `<span class="size-figure">${mb1(b.total)} MB of 25 MB</span>`;
+  const meter = document.getElementById('size-dialog-meter');
+  meter.dataset.zone = zone;
+  meter.setAttribute('aria-valuenow', String(Math.round(b.total / 1048576 * 10) / 10));
+  document.getElementById('size-dialog-fill').style.transform = `scaleX(${Math.min(1, b.total / NOTE_SIZE_LIMIT).toFixed(4)})`;
+
+  const rows = [['Text', b.text]];
+  if (b.offload) {
+    if (b.photoCount || b.clips) rows.push([`Photos & audio (${b.photoCount + b.clips}) \u2014 in Backblaze`, b.offloaded, true]);
+  } else {
+    if (b.photoCount) rows.push([`Photos (${b.photoCount})`, b.photos]);
+    if (b.clips) rows.push([`Audio (${b.clips} clip${b.clips === 1 ? '' : 's'})`, b.audio]);
+  }
+  if (b.drawing) rows.push(['Drawing', b.drawing]);
+  if (b.locked) rows.push(['Lock encryption', b.lockExtra]);
+  document.getElementById('size-rows').innerHTML = rows.map(([label, bytes, noBar]) =>
+    `<li><span class="size-row-label">${escapeHTML(label)}</span>` +
+    `<span class="size-row-bar" aria-hidden="true"><span style="transform:scaleX(${noBar ? '0' : Math.min(1, bytes / Math.max(1, b.total)).toFixed(3)})"></span></span>` +
+    `<span class="size-row-value">${formatBytes(bytes)}</span></li>`).join('');
+
+  const advice = {
+    ok: 'Plenty of room.',
+    heavy: 'This note is getting heavy. It will be slower to open and to sync, especially on mobile data. Moving some photos or recordings into another note keeps each one quick.',
+    danger: 'This note is close to the limit. Above about 20 MB the Worker is more likely to run out of memory or time while saving it, and the free plan is the first to struggle. Remove or split some media before adding more.',
+    over: 'This note is over the 25 MB limit and can\u2019t be saved. Remove a photo or audio clip \u2014 or lower the quality in Settings and add them again.',
+  };
+  let text = advice[zone];
+  if (b.offload && b.offloaded) text += ` ${mb1(b.offloaded)} MB of photos and audio is stored in Backblaze and doesn\u2019t count toward this limit.`;
+  if (b.locked) text += ' Locked notes are about a third bigger than their contents, because encrypted data is stored as text.';
+  document.getElementById('size-advice').textContent = text;
+  document.getElementById('size-advice-icon').innerHTML = ZONE_ICON[zone];
+  document.getElementById('size-advice-box').dataset.zone = zone;
+}
+
+/* ---------------------------------------------------------------------
+ * Storage — every note against the account's total allowance.
+ * ------------------------------------------------------------------- */
+
+function storageUsage() {
+  const limit = Config.storageLimitMB() * 1024 * 1024;
+  let used = 0;
+  let unknown = 0;
+  let media = 0;
+  const sized = [];
+  for (const m of notesCache) {
+    media += m._media || 0;
+    if (typeof m._bytes === 'number') {
+      used += m._bytes;
+      sized.push({ title: m.title || m._lockedTitle || 'Untitled', bytes: m._bytes, locked: m.lockType !== 'none' });
+    } else unknown++;
+  }
+  sized.sort((x, y) => y.bytes - x.bytes);
+  const ratio = limit ? used / limit : 0;
+  const zone = ratio > 1 ? 'over' : ratio >= STORAGE_DANGER_RATIO ? 'danger' : ratio >= STORAGE_WARN_RATIO ? 'heavy' : 'ok';
+  return { used, limit, ratio, zone, unknown, media, count: notesCache.length, top: sized.slice(0, 3) };
+}
+
+function renderStorageSection() {
+  const card = document.getElementById('storage-card');
+  if (!card || document.getElementById('overlay-settings').classList.contains('hidden')) return;
+  const u = storageUsage();
+  const pct = Math.round(u.ratio * 100);
+  card.dataset.zone = u.zone;
+  const badgeWord = { ok: 'Plenty of room', heavy: 'Filling up', danger: 'Almost full', over: 'Over the limit' }[u.zone];
+  document.getElementById('storage-badge').dataset.zone = u.zone;
+  document.getElementById('storage-badge').innerHTML = `${ZONE_ICON[u.zone]}<span>${badgeWord}</span>`;
+  document.getElementById('storage-figures').textContent = `${formatBytes(u.used)} of ${Config.storageLimitMB().toLocaleString()} MB (${pct}%)`;
+  const meter = document.getElementById('storage-meter');
+  meter.dataset.zone = u.zone;
+  meter.setAttribute('aria-valuenow', String(Math.min(100, pct)));
+  document.getElementById('storage-fill').style.transform = `scaleX(${Math.min(1, u.ratio).toFixed(4)})`;
+  const msg = {
+    ok: '',
+    heavy: 'You\u2019ve used over 70% of your storage. Consider downloading and deleting notes you no longer need.',
+    danger: 'You\u2019ve used over 90% of your storage. Once it\u2019s full, saving will fail. Free up space by deleting or downloading big notes.',
+    over: 'Storage is over the limit you set. Saving may fail until you free up space.',
+  }[u.zone];
+  let extra = `${u.count} note${u.count === 1 ? '' : 's'}`;
+  if (u.unknown) extra += ` \u00b7 ${u.unknown} not measured yet (counted once they\u2019ve synced to this device)`;
+  document.getElementById('storage-message').textContent = (msg ? msg + ' ' : '') + extra + '.';
+  document.getElementById('storage-top').innerHTML = u.top.length
+    ? u.top.map((t) => `<li><span class="storage-top-title">${escapeHTML(t.title)}</span><span>${formatBytes(t.bytes)}</span></li>`).join('')
+    : '';
+  document.getElementById('storage-top-label').hidden = !u.top.length;
+  const mediaLine = document.getElementById('storage-media');
+  if (mediaLine) {
+    mediaLine.hidden = !(u.media > 0 || (window.KSMedia && KSMedia.available()));
+    mediaLine.textContent = `Photos and audio in Backblaze: ${formatBytes(u.media)} of the 10 GB its free plan includes.`;
+  }
+}
+
+function updateStoragePill() {
+  const pill = document.getElementById('storage-pill');
+  if (!pill) return;
+  const u = storageUsage();
+  if (u.ratio < STORAGE_WARN_RATIO) { pill.hidden = true; return; }
+  pill.hidden = false;
+  pill.dataset.zone = u.zone;
+  document.getElementById('storage-pill-icon').innerHTML = ZONE_ICON[u.zone];
+  document.getElementById('storage-pill-text').textContent = `Storage ${Math.round(u.ratio * 100)}%`;
+  pill.setAttribute('aria-label', `Storage ${Math.round(u.ratio * 100)} percent full. Open settings for details.`);
+}
+
+function fillQualitySettings() {
+  const photo = document.getElementById('settings-photo-quality');
+  const audio = document.getElementById('settings-audio-quality');
+  photo.value = Config.photoQuality();
+  audio.value = Config.audioQuality();
+  document.getElementById('settings-photo-hint').textContent = PHOTO_QUALITY[photo.value].hint;
+  document.getElementById('settings-audio-hint').textContent = AUDIO_QUALITY[audio.value].hint;
+  document.getElementById('settings-storage-limit').value = Config.storageLimitMB();
+}
+
+/* ---------------------------------------------------------------------
+ * Audio clips — recorded in the app or attached from a file, placed in the
+ * text wherever the caret was (between sentences, or between two words).
+ * Each clip lives in content.audio[id]; the text holds <ks-audio data-id>
+ * where it belongs. Everything is encrypted along with the note if it's locked.
+ * ------------------------------------------------------------------- */
+
+const AUDIO_ID_RE = /^[a-z0-9]{6,32}$/;
+const AUDIO_EXT = {
+  'audio/webm': 'webm', 'video/webm': 'webm', 'audio/ogg': 'ogg', 'audio/opus': 'opus', 'audio/mp4': 'm4a',
+  'audio/x-m4a': 'm4a', 'audio/m4a': 'm4a', 'audio/aac': 'aac', 'audio/mpeg': 'mp3', 'audio/mp3': 'mp3',
+  'audio/wav': 'wav', 'audio/x-wav': 'wav', 'audio/wave': 'wav', 'audio/flac': 'flac', 'audio/x-flac': 'flac',
+};
+const EXT_MIME = {
+  mp3: 'audio/mpeg', m4a: 'audio/mp4', aac: 'audio/aac', wav: 'audio/wav', ogg: 'audio/ogg', oga: 'audio/ogg',
+  opus: 'audio/ogg', flac: 'audio/flac', webm: 'audio/webm', weba: 'audio/webm',
+};
+
+function newAudioId() {
+  const bytes = crypto.getRandomValues(new Uint8Array(8));
+  return 'a' + Array.from(bytes, (x) => x.toString(16).padStart(2, '0')).join('');
+}
+
+function mmss(sec) {
+  sec = Math.max(0, Math.round(Number(sec) || 0));
+  return Math.floor(sec / 60) + ':' + String(sec % 60).padStart(2, '0');
+}
+
+function fmtDur(sec) { return Number(sec) > 0 ? mmss(sec) : '\u2013:\u2013\u2013'; }
+
+function audioMime(dataUrl) {
+  const m = /^data:([^;,]+)/.exec(dataUrl || '');
+  return m ? m[1].toLowerCase() : '';
+}
+
+function audioExtFor(clip) {
+  const byMime = AUDIO_EXT[audioMime(clip.data)];
+  if (byMime) return byMime;
+  const m = /\.([a-z0-9]{2,5})$/i.exec(clip.name || '');
+  return m ? m[1].toLowerCase() : 'audio';
+}
+
+// Only well-formed clips with audio data: URLs are ever loaded.
+function sanitizeAudioMap(map) {
+  const out = {};
+  if (!map || typeof map !== 'object') return out;
+  for (const id of Object.keys(map)) {
+    const a = map[id];
+    if (!AUDIO_ID_RE.test(id) || !a || typeof a.data !== 'string' || !/^data:audio\//.test(a.data)) continue;
+    out[id] = {
+      data: a.data,
+      dur: Math.min(Math.max(Number(a.dur) || 0, 0), 86400),
+      name: typeof a.name === 'string' ? a.name.slice(0, 120) : '',
+    };
+  }
+  return out;
+}
+
+function clipIndex(id) {
+  const ids = Array.from(document.querySelectorAll('#editor-body ks-audio')).map((el) => el.getAttribute('data-id'));
+  const i = ids.indexOf(id);
+  return i < 0 ? 1 : i + 1;
+}
+
+// ---- the chip in the text ----
+
+function audioChipHTML(id) {
+  const clip = editorAudio[id];
+  if (!clip) return '<span class="audio-chip is-missing" role="img" aria-label="Audio clip missing">Clip missing</span>';
+  const t = fmtDur(clip.dur);
+  const label = clip.dur > 0 ? `Play audio clip, ${t}` : 'Play audio clip';
+  return `<span class="audio-chip" data-id="${id}">` +
+    `<button type="button" class="audio-play" aria-label="${label}" aria-pressed="false"></button>` +
+    `<span class="audio-time" aria-hidden="true">${t}</span>` +
+    `<button type="button" class="audio-more" aria-label="Clip options" aria-haspopup="dialog"></button></span>`;
+}
+
+function hydrateAudioChips(root) {
+  root.querySelectorAll('ks-audio').forEach((el) => {
+    el.setAttribute('contenteditable', 'false');
+    el.innerHTML = audioChipHTML(el.getAttribute('data-id'));
+  });
+}
+
+function insertAudioChip(id) {
+  const body = document.getElementById('editor-body');
+  const chip = document.createElement('ks-audio');
+  chip.setAttribute('data-id', id);
+  chip.setAttribute('contenteditable', 'false');
+  chip.innerHTML = audioChipHTML(id);
+  const space = document.createTextNode('\u00a0'); // somewhere for the caret to land after the clip
+  let range = null;
+  if (savedBodyRange && body.contains(savedBodyRange.startContainer) && body.contains(savedBodyRange.endContainer)) {
+    range = savedBodyRange.cloneRange();
+  } else {
+    range = document.createRange();
+    range.selectNodeContents(body);
+    range.collapse(false);
+  }
+  range.deleteContents();
+  range.insertNode(space);
+  space.parentNode.insertBefore(chip, space);
+  const sel = window.getSelection();
+  const after = document.createRange();
+  after.setStartAfter(space);
+  after.collapse(true);
+  sel.removeAllRanges();
+  sel.addRange(after);
+  savedBodyRange = after.cloneRange();
+  if (chip.scrollIntoView) chip.scrollIntoView({ block: 'nearest' });
+  body.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+function addAudioClip(clip) {
+  const id = newAudioId();
+  editorAudio[id] = { data: clip.data, dur: Math.max(0, Number(clip.dur) || 0), name: clip.name || '' };
+  insertAudioChip(id);
+  updateSizeMeter();
+  warnIfHeavy();
+  return id;
+}
+
+// Would this much more stored data still fit in the note?
+function canFitMedia(storedLen) {
+  const b = noteSizeBreakdown();
+  if (b.offload) {
+    const itemOk = storedLen <= MEDIA_ITEM_MAX_CHARS;
+    return {
+      ok: itemOk && b.mediaChars + storedLen <= MEDIA_NOTE_MAX_CHARS,
+      projected: b.total + 300,
+      message: itemOk ? 'That would make this note\u2019s photos and audio more than 150 MB.' : 'That file is over the 90 MB limit.',
+    };
+  }
+  const projected = b.total + Math.ceil(storedLen * (b.locked ? 4 / 3 : 1));
+  return {
+    ok: projected <= NOTE_SIZE_LIMIT,
+    projected,
+    message: `That would make this note ${mb1(projected)} MB \u2014 over the 25 MB limit.`,
+  };
+}
+
+// ---- playback ----
+
+const Player = { el: null, id: null };
+const audioUrls = new Map(); // clip id -> blob: URL
+
+function ensurePlayer() {
+  if (Player.el) return Player.el;
+  const el = new Audio();
+  el.preload = 'auto';
+  ['play', 'pause', 'ended', 'timeupdate'].forEach((ev) => el.addEventListener(ev, syncChipStates));
+  Player.el = el;
+  return el;
+}
+
+async function audioUrl(id) {
+  if (audioUrls.has(id)) return audioUrls.get(id);
+  const clip = editorAudio[id];
+  if (!clip) return null;
+  const blob = await (await fetch(clip.data)).blob();
+  const url = URL.createObjectURL(blob);
+  audioUrls.set(id, url);
+  return url;
+}
+
+function clearAudioUrls() {
+  if (Player.el) { Player.el.pause(); Player.el.removeAttribute('src'); Player.el.load(); }
+  Player.id = null;
+  for (const url of audioUrls.values()) URL.revokeObjectURL(url);
+  audioUrls.clear();
+  const clipEl = document.getElementById('clip-audio');
+  if (clipEl) { clipEl.pause(); clipEl.removeAttribute('src'); }
+}
+
+function syncChipStates() {
+  const el = Player.el;
+  document.querySelectorAll('#editor-body .audio-chip').forEach((chip) => {
+    const mine = chip.dataset.id === Player.id;
+    const playing = !!(mine && el && !el.paused && !el.ended);
+    chip.classList.toggle('is-playing', playing);
+    const btn = chip.querySelector('.audio-play');
+    if (btn) btn.setAttribute('aria-pressed', String(playing));
+    const d = el && el.duration;
+    chip.style.setProperty('--p', mine && d && isFinite(d) ? Math.min(1, el.currentTime / d).toFixed(3) : '0');
+  });
+}
+
+async function toggleClipPlayback(id) {
+  const el = ensurePlayer();
+  if (Player.id === id && !el.paused) { el.pause(); return; }
+  try {
+    const url = await audioUrl(id);
+    if (!url) return;
+    if (Player.id !== id || !el.src) { el.src = url; Player.id = id; }
+    else if (el.ended) el.currentTime = 0;
+    await el.play();
+  } catch (e) {
+    toast('Couldn\u2019t play this clip');
+  }
+}
+
+// ---- clip options dialog ----
+
+let clipDialogId = null;
+
+async function openClipDialog(id) {
+  const clip = editorAudio[id];
+  if (!clip) return;
+  if (Player.el) Player.el.pause();
+  clipDialogId = id;
+  document.getElementById('clip-heading').textContent = `Audio clip ${clipIndex(id)}`;
+  document.getElementById('clip-meta').textContent = [
+    fmtDur(clip.dur), formatBytes(estimateImageBytes(clip.data)), audioExtFor(clip).toUpperCase(), clip.name,
+  ].filter(Boolean).join(' \u00b7 ');
+  const url = await audioUrl(id);
+  document.getElementById('clip-audio').src = url || '';
+  show('overlay-clip');
+}
+
+function pauseClipPreview() {
+  const el = document.getElementById('clip-audio');
+  if (el) el.pause();
+}
+
+function clipFileName(id) {
+  const clip = editorAudio[id];
+  const ext = audioExtFor(clip);
+  const cleanName = (clip.name || '').replace(/\.[a-z0-9]{2,5}$/i, '').replace(/[^\w\- ]+/g, '').trim();
+  const title = (document.getElementById('editor-title').value || 'note').replace(/[^\w\- ]+/g, '').trim().slice(0, 40) || 'note';
+  return `${cleanName || `${title} - clip ${clipIndex(id)}`}.${ext}`.replace(/\s+/g, '-');
+}
+
+async function downloadClip(id) {
+  try {
+    const url = await audioUrl(id);
+    if (!url) throw new Error('missing');
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = clipFileName(id);
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    toast('Downloaded');
+  } catch (e) {
+    toast('Couldn\u2019t download this clip');
+  }
+}
+
+function deleteClip(id) {
+  document.querySelectorAll(`#editor-body ks-audio[data-id="${id}"]`).forEach((el) => el.remove());
+  if (Player.id === id && Player.el) { Player.el.pause(); Player.id = null; }
+  hide('overlay-clip');
+  updateSizeMeter();
+  onEditorContentChanged();
+}
+
+// ---- attaching audio files ----
+
+function probeAudioDuration(url) {
+  return new Promise((resolve) => {
+    const a = new Audio();
+    a.preload = 'metadata';
+    let done = false;
+    const finish = (d) => { if (done) return; done = true; a.removeAttribute('src'); resolve(isFinite(d) && d > 0 ? d : 0); };
+    a.onloadedmetadata = () => {
+      if (isFinite(a.duration)) { finish(a.duration); return; }
+      a.currentTime = 1e101; // some webm files report Infinity until you seek to the end
+      a.ontimeupdate = () => { a.ontimeupdate = null; finish(a.duration); };
+    };
+    a.onerror = () => finish(0);
+    setTimeout(() => finish(0), 8000);
+    a.src = url;
+  });
+}
+
+async function attachAudioFiles(files) {
+  const targetNoteId = editingNoteId;
+  let added = 0;
+  let refused = 0;
+  let unreadable = 0;
+  for (const file of files) {
+    const ext = ((/\.([a-z0-9]+)$/i.exec(file.name) || [])[1] || '').toLowerCase();
+    if (!/^audio\//.test(file.type) && !EXT_MIME[ext]) { unreadable++; continue; }
+    if (!canFitMedia(Math.ceil(file.size * 4 / 3) + 40).ok) { refused++; continue; }
+    try {
+      let data = await readFileAsDataURL(file);
+      if (!/^data:audio\//.test(data)) data = data.replace(/^data:[^;,]*/, 'data:' + (EXT_MIME[ext] || 'audio/mpeg'));
+      if (editingNoteId !== targetNoteId) break;
+      const url = URL.createObjectURL(file);
+      const dur = await probeAudioDuration(url);
+      URL.revokeObjectURL(url);
+      if (editingNoteId !== targetNoteId) break;
+      if (!canFitMedia(data.length + 4).ok) { refused++; continue; }
+      addAudioClip({ data, dur, name: file.name });
+      added++;
+    } catch (e) { unreadable++; }
+  }
+  if (refused) toast(refused === 1 ? `A file wasn\u2019t added \u2014 it would push this note over ${limitWord()}` : `${refused} files weren\u2019t added \u2014 they would push this note over ${limitWord()}`);
+  else if (unreadable) toast(unreadable === 1 ? 'Couldn\u2019t read that file as audio' : `Couldn\u2019t read ${unreadable} of those files as audio`);
+  return added;
+}
+
+// ---- recording ----
+
+const Rec = {
+  state: 'idle', stream: null, recorder: null, chunks: [], bytes: 0, t0: 0, stopAt: 0, tick: 0,
+  ctx: null, analyser: null, buf: null, blob: null, dur: 0, previewUrl: null, discard: false,
+  baseBytes: 0, autoStopped: false,
+};
+
+function recorderSupported() {
+  return !!(window.isSecureContext && navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
+}
+
+function setRecState(state) {
+  Rec.state = state;
+  document.querySelectorAll('#overlay-record .rec-panel').forEach((p) => { p.hidden = p.dataset.panel !== state; });
+}
+
+function showRecError(msg) { const el = document.getElementById('record-error'); el.textContent = msg; el.hidden = !msg; }
+
+function micErrorText(e) {
+  const n = e && e.name;
+  if (n === 'NotAllowedError' || n === 'SecurityError') return 'Microphone access is blocked. Allow it in your browser\u2019s site settings and try again \u2014 or attach an audio file instead.';
+  if (n === 'NotFoundError' || n === 'OverconstrainedError') return 'No microphone was found on this device.';
+  if (n === 'NotReadableError') return 'The microphone is being used by another app.';
+  return 'Couldn\u2019t start the microphone.';
+}
+
+function overlayIsProtected(id) { return id === 'overlay-record' && Rec.state !== 'idle'; }
+
+function openRecorder() {
+  recorderTeardown();
+  setRecState('idle');
+  const q = AUDIO_QUALITY[Config.audioQuality()];
+  document.getElementById('record-quality').textContent = `Quality: ${q.label}. ${q.hint} Change it in Settings.`;
+  showRecError('');
+  const ok = recorderSupported();
+  document.getElementById('btn-record-start').disabled = !ok;
+  if (!ok) showRecError(window.isSecureContext
+    ? 'Recording isn\u2019t supported in this browser. You can still attach an audio file.'
+    : 'Recording needs a secure (https) connection. You can still attach an audio file.');
+  show('overlay-record');
+}
+
+function pickRecorderMime() {
+  const candidates = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm', 'audio/ogg;codecs=opus'];
+  return candidates.find((t) => MediaRecorder.isTypeSupported(t)) || '';
+}
+
+function stopMicAndMeter() {
+  if (Rec.stream) { Rec.stream.getTracks().forEach((t) => { t.onended = null; t.stop(); }); Rec.stream = null; }
+  if (Rec.ctx) { try { Rec.ctx.close(); } catch (e) { /* already closed */ } Rec.ctx = null; }
+  Rec.analyser = null;
+}
+
+function recorderTeardown() {
+  clearInterval(Rec.tick);
+  if (Rec.recorder && Rec.recorder.state !== 'inactive') {
+    Rec.discard = true;
+    try { Rec.recorder.stop(); } catch (e) { /* already stopped */ }
+  }
+  Rec.recorder = null;
+  stopMicAndMeter();
+  if (Rec.previewUrl) { URL.revokeObjectURL(Rec.previewUrl); Rec.previewUrl = null; }
+  const prev = document.getElementById('record-preview');
+  if (prev) { prev.pause(); prev.removeAttribute('src'); }
+  Rec.chunks = []; Rec.blob = null; Rec.bytes = 0; Rec.autoStopped = false;
+  Rec.state = 'idle';
+}
+
+function startMeter(stream) {
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    Rec.ctx = new AC();
+    const src = Rec.ctx.createMediaStreamSource(stream);
+    Rec.analyser = Rec.ctx.createAnalyser();
+    Rec.analyser.fftSize = 512;
+    src.connect(Rec.analyser);
+    Rec.buf = new Uint8Array(Rec.analyser.fftSize);
+  } catch (e) { Rec.analyser = null; }
+}
+
+function readLevel() {
+  if (!Rec.analyser) return 0;
+  Rec.analyser.getByteTimeDomainData(Rec.buf);
+  let sum = 0;
+  for (let i = 0; i < Rec.buf.length; i++) { const d = (Rec.buf[i] - 128) / 128; sum += d * d; }
+  return Math.min(1, Math.sqrt(sum / Rec.buf.length) * 3);
+}
+
+function projectedStored(bytesSoFar) { // what a clip of this many raw bytes adds to the note
+  if (mediaOffloadOn()) return Math.ceil(bytesSoFar * 4 / 3); // stored in Backblaze: just its base64 length, locked or not
+  return Math.ceil(bytesSoFar * 4 / 3 * (lockIsActive() ? 4 / 3 : 1));
+}
+
+function updateRecUI() {
+  if (Rec.state !== 'recording') return;
+  const q = AUDIO_QUALITY[Config.audioQuality()];
+  const elapsed = (performance.now() - Rec.t0) / 1000;
+  document.getElementById('record-timer').textContent = mmss(elapsed);
+  document.getElementById('record-level').style.setProperty('--level', readLevel().toFixed(2));
+  const clipBytes = projectedStored(Math.max(Rec.bytes, q.bps / 8 * elapsed));
+  const projected = Rec.baseBytes + clipBytes;
+  const off = mediaOffloadOn();
+  const zone = off ? mediaZone(projected) : noteSizeZone(projected);
+  const box = document.getElementById('record-projection');
+  box.dataset.zone = zone;
+  box.innerHTML = off
+    ? `${ZONE_ICON[zone]}<span>This clip \u2248 ${formatBytes(Math.round(clipBytes * 3 / 4))} \u00b7 photos and audio would be ${mb1(projected * 3 / 4)} / 150 MB</span>`
+    : `${ZONE_ICON[zone]}<span>This clip \u2248 ${formatBytes(clipBytes)} \u00b7 note would be ${mb1(projected)} / 25 MB</span>`;
+}
+
+function guardRecordingSize() {
+  if (Rec.baseBytes + projectedStored(Rec.bytes) > (mediaOffloadOn() ? MEDIA_NOTE_MAX_CHARS : NOTE_SIZE_LIMIT) - 256 * 1024) {
+    Rec.autoStopped = true;
+    stopRecording();
+  }
+}
+
+async function startRecording() {
+  showRecError('');
+  if (!recorderSupported()) { showRecError('Recording isn\u2019t available here. You can still attach an audio file.'); return; }
+  let stream;
+  try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+  catch (e) { showRecError(micErrorText(e)); return; }
+  if (document.getElementById('overlay-record').classList.contains('hidden')) { stream.getTracks().forEach((t) => t.stop()); return; }
+  const mime = pickRecorderMime();
+  const q = AUDIO_QUALITY[Config.audioQuality()];
+  let recorder;
+  try { recorder = new MediaRecorder(stream, { ...(mime ? { mimeType: mime } : {}), audioBitsPerSecond: q.bps }); }
+  catch (e) { try { recorder = new MediaRecorder(stream); } catch (e2) { stream.getTracks().forEach((t) => t.stop()); showRecError('Couldn\u2019t start recording in this browser.'); return; } }
+  Rec.stream = stream;
+  Rec.recorder = recorder;
+  Rec.chunks = [];
+  Rec.bytes = 0;
+  Rec.discard = false;
+  Rec.autoStopped = false;
+  { const b0 = noteSizeBreakdown(); Rec.baseBytes = b0.offload ? b0.mediaChars : b0.total; }
+  recorder.ondataavailable = (ev) => {
+    if (!ev.data || !ev.data.size) return;
+    Rec.chunks.push(ev.data);
+    Rec.bytes += ev.data.size;
+    guardRecordingSize();
+  };
+  recorder.onstop = finishRecording;
+  recorder.onerror = () => { showRecError('The recording stopped unexpectedly.'); stopRecording(); };
+  stream.getAudioTracks().forEach((t) => { t.onended = () => stopRecording(); });
+  startMeter(stream);
+  Rec.t0 = performance.now();
+  recorder.start(1000);
+  setRecState('recording');
+  clearInterval(Rec.tick);
+  Rec.tick = setInterval(updateRecUI, 150);
+  updateRecUI();
+}
+
+function stopRecording() {
+  if (Rec.state !== 'recording' || !Rec.recorder || Rec.recorder.state === 'inactive') return;
+  Rec.stopAt = performance.now();
+  try { Rec.recorder.stop(); } catch (e) { /* onstop still follows */ }
+}
+
+function finishRecording() {
+  clearInterval(Rec.tick);
+  stopMicAndMeter();
+  if (Rec.discard) { Rec.discard = false; return; }
+  const type = (Rec.recorder && Rec.recorder.mimeType) || 'audio/webm';
+  const blob = new Blob(Rec.chunks, { type });
+  Rec.chunks = [];
+  if (!blob.size) { showRecError('Nothing was recorded \u2014 check that your microphone is working.'); setRecState('idle'); return; }
+  Rec.blob = blob;
+  Rec.dur = ((Rec.stopAt || performance.now()) - Rec.t0) / 1000;
+  if (Rec.previewUrl) URL.revokeObjectURL(Rec.previewUrl);
+  Rec.previewUrl = URL.createObjectURL(blob);
+  document.getElementById('record-preview').src = Rec.previewUrl;
+  document.getElementById('record-result').textContent =
+    `${mmss(Rec.dur)} \u00b7 ${formatBytes(blob.size)}${Rec.autoStopped ? ' \u00b7 stopped at the size limit' : ''}`;
+  const fit = canFitMedia(Math.ceil(blob.size * 4 / 3) + 40);
+  const off = mediaOffloadOn();
+  const zone = off ? (fit.ok ? 'ok' : 'over') : noteSizeZone(fit.projected);
+  const box = document.getElementById('record-review-note');
+  box.dataset.zone = zone;
+  box.innerHTML = `${ZONE_ICON[zone]}<span>${fit.ok ? (off ? `This clip will be stored in Backblaze, so it doesn\u2019t count toward the note\u2019s 25 MB.` : `Adding this makes the note ${mb1(fit.projected)} / 25 MB.`) : fit.message + ' Discard it, or record something shorter.'}</span>`;
+  document.getElementById('btn-record-add').disabled = !fit.ok;
+  showRecError('');
+  setRecState('review');
+}
+
+async function addRecordingToNote() {
+  if (!Rec.blob) return;
+  const btn = document.getElementById('btn-record-add');
+  setBusy(btn, true, 'Adding\u2026');
+  try {
+    const data = await readFileAsDataURL(Rec.blob);
+    const fit = canFitMedia(data.length + 4);
+    if (!fit.ok) { showRecError(fit.message); return; }
+    addAudioClip({ data, dur: Rec.dur, name: '' });
+    hide('overlay-record');
+  } catch (e) {
+    showRecError('Couldn\u2019t add the recording.');
+  } finally {
+    setBusy(btn, false);
+  }
+}
+
+function requestCloseRecorder() {
+  if (Rec.state === 'idle') { hide('overlay-record'); return; }
+  openConfirm('Discard this recording?',
+    Rec.state === 'recording' ? 'The audio recorded so far will be thrown away.' : 'This recording hasn\u2019t been added to the note yet.',
+    () => hide('overlay-record'), 'Discard');
+}
+
+/* ---------------------------------------------------------------------
+ * Wiring for everything above.
+ * ------------------------------------------------------------------- */
+
+function setupMedia() {
+  document.querySelectorAll('[data-zone-icon]').forEach((el) => { el.innerHTML = ZONE_ICON[el.dataset.zoneIcon]; });
+  const body = document.getElementById('editor-body');
+  body.addEventListener('mousedown', (e) => { if (e.target.closest('.audio-chip button')) e.preventDefault(); }); // keep the caret where it was
+  body.addEventListener('click', (e) => {
+    const chip = e.target.closest('.audio-chip');
+    if (!chip || !chip.dataset.id) return;
+    e.preventDefault();
+    if (e.target.closest('.audio-more')) openClipDialog(chip.dataset.id);
+    else if (e.target.closest('.audio-play, .audio-time')) toggleClipPlayback(chip.dataset.id);
+  });
+
+  document.getElementById('btn-size').addEventListener('click', () => { renderSizeDialog(); show('overlay-size'); });
+  document.getElementById('btn-add-audio').addEventListener('click', openRecorder);
+  document.getElementById('btn-record-start').addEventListener('click', startRecording);
+  document.getElementById('btn-record-stop').addEventListener('click', stopRecording);
+  document.getElementById('btn-record-cancel').addEventListener('click', requestCloseRecorder);
+  document.getElementById('btn-record-close').addEventListener('click', requestCloseRecorder);
+  document.getElementById('btn-record-again').addEventListener('click', () => { recorderTeardown(); openRecorder(); });
+  document.getElementById('btn-record-discard').addEventListener('click', requestCloseRecorder);
+  document.getElementById('btn-record-add').addEventListener('click', addRecordingToNote);
+  document.getElementById('btn-record-attach').addEventListener('click', () => document.getElementById('input-audio').click());
+  document.getElementById('input-audio').addEventListener('change', async (e) => {
+    const files = Array.from(e.target.files || []);
+    e.target.value = '';
+    if (!files.length) return;
+    const added = await attachAudioFiles(files);
+    if (added && !document.getElementById('overlay-record').classList.contains('hidden')) hide('overlay-record');
+  });
+
+  document.getElementById('btn-clip-download').addEventListener('click', () => { if (clipDialogId) downloadClip(clipDialogId); });
+  document.getElementById('btn-clip-delete').addEventListener('click', () => {
+    const id = clipDialogId;
+    if (!id) return;
+    openConfirm('Delete this clip?', 'It will be removed from the note.', () => deleteClip(id), 'Delete clip');
+  });
+
+  document.getElementById('storage-pill').addEventListener('click', openSettings);
+  const photoSel = document.getElementById('settings-photo-quality');
+  const audioSel = document.getElementById('settings-audio-quality');
+  photoSel.addEventListener('change', () => { Config.setPhotoQuality(photoSel.value); document.getElementById('settings-photo-hint').textContent = PHOTO_QUALITY[photoSel.value].hint; });
+  audioSel.addEventListener('change', () => { Config.setAudioQuality(audioSel.value); document.getElementById('settings-audio-hint').textContent = AUDIO_QUALITY[audioSel.value].hint; });
+  document.getElementById('settings-media-on').addEventListener('change', (e) => {
+    if (window.KSMedia) KSMedia.setUserEnabled(e.target.checked);
+    fillMediaSettings();
+    if (!document.getElementById('overlay-editor').classList.contains('hidden')) updateSizeMeter();
+  });
+  document.getElementById('settings-storage-limit').addEventListener('change', (e) => {
+    const n = Number(e.target.value);
+    if (n >= 50) Config.setStorageLimitMB(n);
+    e.target.value = Config.storageLimitMB();
+    renderStorageSection();
+    updateStoragePill();
+  });
+
+  // Coming back to the app after a while: refresh the list so a note edited
+  // on another device is noticed (opening notes now trusts this device's copy
+  // whenever it matches the list).
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && Config.configured() && Date.now() - lastServerSyncAt > 60000) refreshNotes();
+  });
 }
 
 function setupRichText() {
@@ -2674,7 +4077,15 @@ async function checkForRecoverableDrafts() {
   document.getElementById('draft-banner-resume').onclick = () => {
     banner.classList.add('hidden');
     const meta = notesCache.find((m) => m.id === id) || null;
-    openEditorWithContent(meta, { title: draft.title, body: draft.body, html: draft.html, images: draft.images || [], drawing: draft.drawing });
+    if (meta && meta.lockType !== 'none') {
+      // A locked note's password isn't known here, so opening the draft directly
+      // left a note that could never be saved. Unlock it the normal way; once it
+      // opens, the usual "Restore unsaved draft?" prompt offers these changes.
+      currentUnlockCreds = null;
+      openUnlockFlow(meta);
+      return;
+    }
+    openEditorWithContent(meta, { title: draft.title, body: draft.body, html: draft.html, images: draft.images || [], drawing: draft.drawing, audio: draft.audio });
     // If the note this draft belonged to no longer exists server-side,
     // openEditorWithContent treats it as a new note under a new id — so
     // this old entry is now orphaned and needs clearing explicitly, or
@@ -2698,8 +4109,9 @@ function init() {
   setupKeyboardViewportFix();
   setupLightbox();
   setupRichText();
+  setupMedia();
   setupInk();
-  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.4.2');
+  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.6.0');
 
   // Connectivity: react the moment the browser notices, and keep retrying
   // on a timer since navigator.onLine can't see a connection that's up but

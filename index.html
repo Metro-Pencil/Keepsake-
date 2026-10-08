@@ -21,13 +21,14 @@
     --card-2: #F3EFE6;
     --ink: #23241F;
     --ink-soft: #6B6A60;
-    --ink-faint: #97958A;
-    --amber: #A9762F;
+    --ink-faint: #6F6D62; /* was #97958A (2.9:1) — now passes 4.5:1 on cards */
+    --amber: #85591A; /* was #A9762F (3.4:1 on --amber-bg) */
     --amber-bg: #F6ECDA;
     --violet: #5B4B8A;
     --violet-bg: #ECE8F5;
     --brick: #A23B3B;
     --line: #DEDACD;
+    --line-strong: #8C8A7E; /* form-control edges: 3:1 non-text contrast */
     --shadow: 0 1px 2px rgba(35,36,31,0.06), 0 4px 14px rgba(35,36,31,0.06);
     --font-display: 'Source Serif 4', Georgia, serif;
     --font-body: 'Inter', system-ui, -apple-system, sans-serif;
@@ -41,6 +42,9 @@
     --z-modal: 100;
     --z-toast: 200;
     --z-lightbox: 400;
+    --gutter-l: max(20px, env(safe-area-inset-left, 0px));
+    --gutter-r: max(20px, env(safe-area-inset-right, 0px));
+    color-scheme: light;
   }
 
   * { box-sizing: border-box; }
@@ -125,11 +129,11 @@
     width: 100%; /* a grid item with auto margins otherwise shrink-wraps, collapsing the track */
     max-width: 980px;
     margin: 0 auto;
-    padding: 8px 20px;
+    padding: 8px var(--gutter-r) 8px var(--gutter-l);
     display: flex;
     align-items: center;
     gap: 10px;
-    font-size: 12.5px;
+    font-size: 0.7812rem;
     font-weight: 500;
     color: var(--ink-soft);
   }
@@ -145,7 +149,8 @@
     animation: sync-spin 0.7s linear infinite;
   }
 
-  .sync-bar.error .sync-bar-spin { display: none; }
+  .sync-bar.error .sync-bar-spin,
+  .sync-bar.done .sync-bar-spin { display: none; }
 
   @keyframes sync-spin { to { transform: rotate(360deg); } }
 
@@ -182,7 +187,9 @@
 
   .sync-bar-retry {
     flex-shrink: 0;
-    font-size: 12.5px;
+    margin: -10px -6px; /* grows the tap area to ~44px without making the bar taller */
+    padding: 10px 6px;
+    font-size: 0.7812rem;
     font-weight: 700;
     color: var(--brick);
     text-decoration: underline;
@@ -202,7 +209,7 @@
     display: flex;
     align-items: center;
     gap: 10px;
-    font-size: 13.5px;
+    font-size: 0.8438rem;
     color: var(--amber);
   }
 
@@ -223,7 +230,7 @@
   .top-inner {
     max-width: 980px;
     margin: 0 auto;
-    padding: 14px 20px;
+    padding: 14px var(--gutter-r) 14px var(--gutter-l);
     display: flex;
     align-items: center;
     gap: 12px;
@@ -232,21 +239,22 @@
   .brand {
     display: flex;
     align-items: baseline;
-    gap: 8px;
+    flex-wrap: wrap;
+    gap: 2px 8px;
     margin-right: auto;
   }
 
   .brand-mark {
     font-family: var(--font-display);
     font-weight: 600;
-    font-size: 22px;
+    font-size: 1.375rem;
     color: var(--pine);
     letter-spacing: 0.2px;
   }
 
   .version-badge {
     font-family: var(--font-body);
-    font-size: 11px;
+    font-size: 0.6875rem;
     font-weight: 600;
     color: var(--pine);
     background: var(--card-2);
@@ -265,7 +273,7 @@
     display: inline-flex;
     align-items: center;
     gap: 5px;
-    font-size: 11px;
+    font-size: 0.6875rem;
     font-weight: 600;
     border-radius: 999px;
     padding: 2px 9px 2px 7px;
@@ -295,9 +303,10 @@
   }
 
   .tabbar button {
-    padding: 7px 14px;
+    min-height: 44px;
+    padding: 0 16px;
     border-radius: 8px;
-    font-size: 14px;
+    font-size: 0.875rem;
     font-weight: 500;
     color: var(--ink-soft);
   }
@@ -311,8 +320,8 @@
   .tabbar button:active { transform: scale(0.95); }
 
   .icon-btn {
-    width: 38px;
-    height: 38px;
+    width: 44px;
+    height: 44px;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -330,10 +339,14 @@
   main {
     max-width: 980px;
     margin: 0 auto;
-    padding: 24px 20px 60px;
+    padding: 24px var(--gutter-r) 60px var(--gutter-l);
   }
 
   .composer {
+    display: block;
+    width: 100%;
+    min-height: 48px;
+    text-align: left;
     max-width: 620px;
     margin: 0 auto 32px;
     background: var(--card);
@@ -342,7 +355,7 @@
     box-shadow: var(--shadow);
     padding: 14px 18px;
     color: var(--ink-faint);
-    font-size: 15px;
+    font-size: 0.9375rem;
   }
 
   .composer:hover { border-color: #cfc9b6; }
@@ -381,7 +394,7 @@
 
   .card-title {
     font-family: var(--font-display);
-    font-size: 17px;
+    font-size: 1.0625rem;
     font-weight: 600;
     margin: 0 0 6px;
     color: var(--ink);
@@ -394,12 +407,13 @@
   .card-title.is-placeholder { color: var(--ink-soft); font-weight: 500; }
 
   .card-snippet {
-    font-size: 14px;
+    font-size: 0.875rem;
     color: var(--ink-soft);
     line-height: 1.5;
     margin: 0 0 10px;
     display: -webkit-box;
     -webkit-line-clamp: 6;
+    line-clamp: 6;
     -webkit-box-orient: vertical;
     overflow: hidden;
   }
@@ -422,7 +436,7 @@
     display: inline-flex;
     align-items: center;
     gap: 5px;
-    font-size: 12px;
+    font-size: 0.75rem;
     font-weight: 600;
     padding: 3px 9px;
     border-radius: 999px;
@@ -434,7 +448,7 @@
   .lock-pill svg { width: 11px; height: 11px; }
 
   .card-meta {
-    font-size: 12px;
+    font-size: 0.75rem;
     color: var(--ink-faint);
     margin: 0;
   }
@@ -461,7 +475,7 @@
 
   /* A little larger than the old 32px footer icons — still compact enough
      for a card this size, but a better touch target. */
-  .card-actions .icon-btn { width: 36px; height: 36px; }
+  .card-actions .icon-btn { width: 44px; height: 44px; }
   .card-actions .icon-btn svg { width: 16px; height: 16px; }
 
   /* Locked notes keep these hidden until the card's been tapped once (see
@@ -488,7 +502,7 @@
     display: inline-flex;
     align-items: center;
     gap: 5px;
-    font-size: 11px;
+    font-size: 0.6875rem;
     font-weight: 600;
     color: var(--amber);
     background: var(--amber-bg);
@@ -508,14 +522,14 @@
   .empty-state {
     text-align: center;
     padding: 60px 20px;
-    color: var(--ink-faint);
+    color: var(--ink-soft);
   }
 
   .empty-state h2 {
     font-family: var(--font-display);
     font-weight: 600;
     color: var(--ink-soft);
-    font-size: 19px;
+    font-size: 1.1875rem;
     margin-bottom: 6px;
   }
 
@@ -557,7 +571,7 @@
 
   .modal-head h2 {
     font-family: var(--font-display);
-    font-size: 19px;
+    font-size: 1.1875rem;
     font-weight: 600;
     margin: 0;
     flex: 1;
@@ -572,7 +586,7 @@
 
   .field label {
     display: block;
-    font-size: 12.5px;
+    font-size: 0.7812rem;
     font-weight: 600;
     color: var(--ink-soft);
     margin-bottom: 6px;
@@ -582,9 +596,12 @@
   .field input[type="password"],
   .field input[type="datetime-local"],
   .field input[type="url"],
+  .field input[type="number"],
+  .field select,
   .field textarea {
     width: 100%;
-    border: 1px solid var(--line);
+    min-height: 44px;
+    border: 1px solid var(--line-strong);
     background: var(--card-2);
     border-radius: 10px;
     padding: 10px 12px;
@@ -629,14 +646,14 @@
   }
 
   .field .hint {
-    font-size: 12.5px;
+    font-size: 0.7812rem;
     color: var(--ink-faint);
     margin-top: 5px;
     line-height: 1.5;
   }
 
   .field .error {
-    font-size: 12.5px;
+    font-size: 0.7812rem;
     color: var(--brick);
     margin-top: 5px;
   }
@@ -658,17 +675,21 @@
     display: flex;
     align-items: center;
     gap: 10px;
-    padding: 12px 14px;
+    padding: 12px max(14px, env(safe-area-inset-right, 0px)) 12px max(14px, env(safe-area-inset-left, 0px));
     padding-top: max(12px, env(safe-area-inset-top));
     border-bottom: 1px solid var(--line);
     flex-shrink: 0;
   }
 
   .editor-topbar-title {
-    flex: 1;
+    flex: 1 1 0;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     font-family: var(--font-display);
     font-weight: 600;
-    font-size: 17px;
+    font-size: 1.0625rem;
     color: var(--ink);
   }
 
@@ -676,7 +697,7 @@
     flex: 1;
     min-height: 0;
     overflow-y: auto;
-    padding: 20px 22px 12px;
+    padding: 20px max(22px, env(safe-area-inset-right, 0px)) 12px max(22px, env(safe-area-inset-left, 0px));
     display: flex;
     flex-direction: column;
   }
@@ -757,12 +778,16 @@
   }
 
   .editor-lock-status:empty { display: none; }
+  .editor-lock-status .hint { margin: 6px 0; font-size: 0.8125rem; line-height: 1.4; color: var(--ink-soft); }
+
+  /* The trash button was meant to sit alone at the far edge, away from Download and Lock. */
+  .spacer { flex: 1; }
 
   .editor-toolbar {
     display: flex;
     align-items: center;
     gap: 2px;
-    padding: 8px 12px;
+    padding: 8px max(12px, env(safe-area-inset-right, 0px)) 8px max(12px, env(safe-area-inset-left, 0px));
     padding-bottom: max(8px, env(safe-area-inset-bottom));
     border-top: 1px solid var(--line);
     flex-shrink: 0;
@@ -852,11 +877,12 @@
     border: none;
     background: none;
     font-family: var(--font-display);
-    font-size: 20px;
+    font-size: 1.25rem;
     font-weight: 600;
     color: var(--ink);
     margin-bottom: 8px;
     padding: 0;
+    text-overflow: ellipsis;
   }
 
   .thumb-row {
@@ -866,9 +892,11 @@
     margin: 10px 0;
   }
 
+  .thumb-row { padding: 10px 10px 0 0; } /* room for the remove button hanging off each corner */
+
   .thumb-row .thumb {
     position: relative;
-    width: 64px; height: 64px;
+    width: 72px; height: 72px;
   }
 
   .thumb-row img {
@@ -884,26 +912,27 @@
     left: 3px; bottom: 3px;
     background: rgba(20,20,16,0.62);
     color: #fff;
-    font-size: 9px;
+    font-size: 0.6875rem;
     line-height: 1;
     font-weight: 600;
-    padding: 3px 4px;
+    padding: 3px 5px;
     border-radius: 5px;
     pointer-events: none;
   }
 
   .thumb-remove {
     position: absolute;
-    top: -6px; right: -6px;
-    width: 20px; height: 20px;
+    top: -10px; right: -10px;
+    width: 32px; height: 32px;
     background: var(--brick);
     color: white;
     border-radius: 50%;
-    font-size: 13px;
+    font-size: 1.125rem;
     line-height: 1;
     display: flex;
     align-items: center;
     justify-content: center;
+    border: 2px solid var(--card); /* separates it from the photo behind it */
   }
 
   /* ---------- Photo lightbox ---------- */
@@ -923,6 +952,7 @@
   .lightbox-img {
     max-width: 92vw;
     max-height: 78vh;
+    max-height: 78dvh;
     object-fit: contain;
     border-radius: 6px;
     user-select: none;
@@ -948,7 +978,7 @@
   .lightbox-close {
     top: max(14px, env(safe-area-inset-top));
     right: 14px;
-    width: 40px; height: 40px;
+    width: 44px; height: 44px;
   }
 
   .lightbox-nav {
@@ -959,6 +989,8 @@
 
   .lightbox-prev { left: 10px; }
   .lightbox-next { right: 10px; }
+  /* button:active sets its own transform, which wiped translateY(-50%) and made the arrows jump down while pressed. */
+  .lightbox-nav:active { transform: translateY(-50%) scale(0.94); }
 
   .lightbox-caption {
     position: absolute;
@@ -966,7 +998,7 @@
     bottom: max(18px, env(safe-area-inset-bottom));
     text-align: center;
     color: rgba(255,255,255,0.85);
-    font-size: 13px;
+    font-size: 0.8125rem;
   }
 
   .icon-btn:disabled { opacity: 0.4; cursor: default; }
@@ -979,9 +1011,10 @@
   }
 
   .btn {
+    min-height: 44px;
     padding: 10px 16px;
     border-radius: 10px;
-    font-size: 14px;
+    font-size: 0.875rem;
     font-weight: 600;
   }
 
@@ -998,7 +1031,7 @@
   .btn-danger:hover { background: #F5E7E7; }
   .btn-danger:active { background: #EBD5D5; transform: scale(0.97); }
 
-  .btn-text { color: var(--ink-soft); font-size: 13.5px; font-weight: 500; padding: 6px 4px; }
+  .btn-text { color: var(--ink-soft); font-size: 0.8438rem; font-weight: 500; min-height: 44px; padding: 6px 8px; }
   .btn-text:hover { color: var(--ink); }
   .btn-text:active { opacity: 0.65; }
 
@@ -1010,7 +1043,12 @@
 
   .lock-choice {
     flex: 1;
-    border: 1.5px solid var(--line);
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    justify-content: flex-start; /* a <button> centres its content vertically by default, which staggered the two titles */
+    border: 1.5px solid var(--line-strong);
     border-radius: 12px;
     padding: 14px;
     text-align: left;
@@ -1020,15 +1058,25 @@
   .lock-choice:hover { border-color: var(--pine-light); }
   .lock-choice:active { transform: scale(0.98); }
   .lock-choice.selected { border-color: var(--pine); background: var(--card-2); }
+  /* A check mark too, so "selected" is not carried by colour alone. */
+  .lock-choice.selected::after {
+    content: "\2713";
+    position: absolute;
+    top: 8px;
+    inset-inline-end: 12px;
+    color: var(--pine);
+    font-weight: 700;
+    font-size: 0.875rem;
+  }
 
   .lock-choice-title {
     font-weight: 600;
-    font-size: 14px;
+    font-size: 0.875rem;
     margin-bottom: 3px;
   }
 
   .lock-choice-desc {
-    font-size: 12.5px;
+    font-size: 0.7812rem;
     color: var(--ink-soft);
     line-height: 1.4;
   }
@@ -1038,31 +1086,33 @@
     color: var(--amber);
     border-radius: 12px;
     padding: 14px;
-    font-size: 14px;
+    font-size: 0.875rem;
     margin-bottom: 14px;
     line-height: 1.5;
   }
 
-  .countdown-box strong { display: block; font-size: 16px; margin-bottom: 2px; }
+  .countdown-box strong { display: block; font-size: 1rem; margin-bottom: 2px; }
 
   .divider-link {
-    font-size: 13px;
+    font-size: 0.8125rem;
     color: var(--pine);
     font-weight: 600;
     margin: 4px 0 14px;
-    display: inline-block;
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
   }
 
   .toast {
     position: fixed;
-    bottom: 22px;
+    bottom: max(22px, calc(env(safe-area-inset-bottom, 0px) + 12px));
     left: 50%;
     transform: translateX(-50%);
     background: var(--ink);
     color: var(--card);
     padding: 10px 18px;
     border-radius: 999px;
-    font-size: 13.5px;
+    font-size: 0.8438rem;
     box-shadow: var(--shadow);
     z-index: var(--z-toast);
     opacity: 0;
@@ -1076,8 +1126,180 @@
   }
 
   @media (max-width: 560px) {
-    .top-inner { flex-wrap: wrap; }
+    /* Two tidy rows: brand + settings on top, the tabs full-width below. (They used to wrap
+       with the settings gear stranded alone on its own line.) */
+    .top-inner { flex-wrap: wrap; row-gap: 8px; }
+    .brand { order: 1; flex: 1 1 0; min-width: 0; }
+    #btn-settings { order: 2; }
+    .tabbar { order: 3; flex: 1 0 100%; }
+    .tabbar button { flex: 1; }
     .grid { column-width: 100%; }
+  }
+
+  @media (forced-colors: active) {
+    .swatch::before { forced-color-adjust: none; } /* otherwise every ink colour collapses to one */
+    .lock-choice.selected, .tool-btn[aria-pressed="true"] { outline: 2px solid Highlight; }
+  }
+
+
+  /* =====================================================================
+     v1.5 — size meter, storage, audio clips
+     ===================================================================== */
+
+  [hidden] { display: none !important; } /* so a class's display: never wins over the hidden attribute */
+
+  /* Explanatory text anywhere in a dialog. (.field .hint, further up, is more specific and still wins inside form fields.) */
+  .hint { margin: 4px 0 0; font-size: 0.8125rem; line-height: 1.5; color: var(--ink-soft); }
+
+  :root {
+    --ok: #21423A;       --ok-bg: #E4EEE9;
+    --danger: #8F2D2D;   --danger-bg: #F7E3E3;
+  }
+
+  /* One set of level colours reused by the chip, badges, meters and notices.
+     Each level also has its own icon shape and a word — never colour alone. */
+  [data-zone] { --zone-fg: var(--ok);     --zone-bg: var(--ok-bg);     --zone-edge: #9FBBB0; --zone-bar: var(--ok); --zone-track: rgba(35,36,31,0.14); }
+  [data-zone="heavy"]  { --zone-fg: var(--amber);  --zone-bg: var(--amber-bg);  --zone-edge: #C9A66B; --zone-bar: var(--amber); }
+  [data-zone="danger"] { --zone-fg: var(--danger); --zone-bg: var(--danger-bg); --zone-edge: #D09A9A; --zone-bar: var(--danger); }
+  [data-zone="over"]   { --zone-fg: #fff;          --zone-bg: var(--danger);    --zone-edge: var(--danger); --zone-bar: var(--danger); --zone-track: rgba(255,255,255,0.35); }
+
+  .size-chip {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex: none;
+    min-height: 44px;
+    padding: 0 12px;
+    border: 1px solid var(--zone-edge);
+    border-radius: 999px;
+    background: var(--zone-bg);
+    color: var(--zone-fg);
+    font-size: 0.8125rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    overflow: hidden;
+  }
+  .size-icon, .storage-pill-icon, .size-advice-icon, .size-legend [data-zone-icon] { display: inline-flex; flex: none; width: 18px; height: 18px; }
+  .size-icon svg, .storage-pill-icon svg, .size-advice-icon svg, .size-legend [data-zone-icon] svg { width: 100%; height: 100%; }
+  .size-track { position: absolute; inset: auto 0 0 0; height: 3px; background: var(--zone-track); }
+  .size-fill { display: block; width: 100%; height: 100%; background: currentColor; transform-origin: left; transform: scaleX(0); transition: transform 0.25s ease; }
+
+  .storage-pill {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 10px;
+    border: 1px solid var(--zone-edge);
+    border-radius: 999px;
+    background: var(--zone-bg);
+    color: var(--zone-fg);
+    font-size: 0.75rem;
+    font-weight: 600;
+  }
+  .storage-pill::after { content: ""; position: absolute; inset: -11px -4px; } /* a 44px tap area around a small pill */
+  .storage-pill-icon { width: 14px; height: 14px; }
+
+  /* Progress bar with notches at the warning levels */
+  .meter { position: relative; height: 12px; margin: 12px 0; border-radius: 999px; background: var(--line); border: 1px solid var(--line-strong); overflow: hidden; }
+  .meter-fill { display: block; width: 100%; height: 100%; background: var(--zone-bar); transform-origin: left; transform: scaleX(0); transition: transform 0.3s ease; }
+  .meter-tick { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--card); }
+
+  .size-badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 10px;
+    border: 1px solid var(--zone-edge);
+    border-radius: 999px;
+    background: var(--zone-bg);
+    color: var(--zone-fg);
+    font-size: 0.8125rem; font-weight: 600;
+  }
+  .size-badge svg { width: 16px; height: 16px; flex: none; }
+  .size-status, .storage-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; }
+  .size-figure { font-variant-numeric: tabular-nums; font-weight: 600; font-size: 0.9375rem; }
+
+  .size-rows { list-style: none; margin: 0 0 14px; padding: 0; }
+  .size-rows li { display: grid; grid-template-columns: minmax(0, 1fr) 72px auto; align-items: center; gap: 10px; padding: 7px 0; font-size: 0.875rem; border-bottom: 1px solid var(--line); }
+  .size-row-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .size-row-bar { height: 6px; border-radius: 999px; background: var(--line); overflow: hidden; }
+  .size-row-bar span { display: block; height: 100%; background: var(--ink-soft); transform-origin: left; }
+  .size-row-value { font-variant-numeric: tabular-nums; color: var(--ink-soft); min-width: 3.5em; text-align: end; }
+
+  .size-advice { display: flex; gap: 10px; align-items: flex-start; padding: 12px; border: 1px solid var(--zone-edge); border-radius: var(--radius-sm); background: var(--zone-bg); color: var(--zone-fg); }
+  .size-advice p { margin: 0; font-size: 0.875rem; line-height: 1.5; }
+  .size-legend-title { margin: 18px 0 8px; font-family: var(--font-display); font-size: 0.9375rem; }
+  .size-legend { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+  .size-legend li { display: flex; gap: 10px; align-items: flex-start; font-size: 0.8125rem; line-height: 1.4; color: var(--ink-soft); }
+  .size-legend [data-zone-icon] { color: var(--zone-fg); background: none; }
+  .size-legend li[data-zone="over"] [data-zone-icon] { color: var(--danger); }
+
+  .settings-section { margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--line); }
+  .settings-section h3 { margin: 0 0 12px; font-family: var(--font-display); font-size: 1.0625rem; }
+  .storage-card { margin-bottom: 16px; }
+  .storage-card .hint { margin: 0 0 10px; }
+  .storage-top-label { margin: 6px 0 4px; font-size: 0.8125rem; color: var(--ink-soft); font-weight: 600; }
+  .storage-top { list-style: none; margin: 0; padding: 0; font-size: 0.875rem; }
+  .storage-top li { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+  .storage-top-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .field select { appearance: auto; }
+
+  /* ---------- Audio clips in the text ---------- */
+  ks-audio { display: inline-block; vertical-align: middle; margin: 2px; -webkit-user-select: none; user-select: none; }
+  .audio-chip {
+    --p: 0;
+    --i-play:  url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M8 5v14l11-7z'/%3E%3C/svg%3E");
+    --i-pause: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M7 5h4v14H7zM13 5h4v14h-4z'/%3E%3C/svg%3E");
+    --i-more:  url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='5' cy='12' r='2'/%3E%3Ccircle cx='12' cy='12' r='2'/%3E%3Ccircle cx='19' cy='12' r='2'/%3E%3C/svg%3E");
+    display: inline-flex;
+    align-items: center;
+    max-width: 100%;
+    min-height: 44px;
+    border: 1px solid var(--line-strong);
+    border-radius: 999px;
+    overflow: hidden;
+    background: linear-gradient(90deg, rgba(33,66,58,0.18) calc(var(--p) * 100%), var(--card-2) calc(var(--p) * 100%)); /* fills as it plays */
+    color: var(--pine);
+    font-family: var(--font-body);
+    font-size: 0.8125rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+  }
+  .audio-chip button { display: grid; place-items: center; flex: none; width: 44px; height: 44px; border-radius: 50%; color: var(--pine); }
+  .audio-chip button::before { content: ""; width: 22px; height: 22px; background: currentColor; -webkit-mask: var(--icon) center / contain no-repeat; mask: var(--icon) center / contain no-repeat; }
+  .audio-play { --icon: var(--i-play); }
+  .audio-chip.is-playing .audio-play { --icon: var(--i-pause); }
+  .audio-more { --icon: var(--i-more); }
+  .audio-time { padding: 0 2px; }
+  .audio-chip.is-missing { padding: 0 16px; color: var(--brick); }
+
+  /* ---------- Add-audio dialog ---------- */
+  .rec-panel { display: flex; flex-direction: column; gap: 12px; }
+  .rec-where { margin: 0 0 12px; }
+  .btn-block { display: flex; width: 100%; align-items: center; justify-content: center; gap: 8px; }
+  .btn-block svg { width: 20px; height: 20px; flex: none; }
+  .rec-error { margin: 0 0 12px; color: var(--brick); font-size: 0.875rem; font-weight: 500; line-height: 1.45; }
+  .rec-live { display: flex; align-items: center; gap: 10px; font-weight: 600; }
+  .rec-dot { width: 12px; height: 12px; border-radius: 50%; background: var(--brick); animation: rec-pulse 1.2s ease-in-out infinite; }
+  @keyframes rec-pulse { 50% { opacity: 0.3; } }
+  .rec-timer { margin-inline-start: auto; font-family: var(--font-display); font-size: 1.625rem; font-variant-numeric: tabular-nums; }
+  .rec-level { height: 8px; border-radius: 999px; background: var(--line); overflow: hidden; }
+  .rec-level span { display: block; height: 100%; background: var(--pine); transform-origin: left; transform: scaleX(var(--level, 0)); transition: transform 0.12s linear; }
+  .rec-projection { display: flex; gap: 8px; align-items: flex-start; margin: 0; padding: 10px 12px; border: 1px solid var(--zone-edge); border-radius: var(--radius-sm); background: var(--zone-bg); color: var(--zone-fg); font-size: 0.8125rem; line-height: 1.4; }
+  .rec-projection:empty { display: none; }
+  .rec-projection svg { width: 18px; height: 18px; flex: none; }
+  .rec-result { margin: 0; font-weight: 600; font-variant-numeric: tabular-nums; }
+  #record-preview, #clip-audio { width: 100%; min-height: 44px; }
+  #clip-audio { margin: 6px 0 16px; }
+  .clip-meta { margin: 0; }
+
+  @media (max-width: 340px) {
+    .editor-topbar-title { display: none; }
+    .size-chip { margin-inline-start: auto; }
+    .editor-toolbar { flex-wrap: wrap; }
   }
 
   @media (prefers-reduced-motion: reduce) {
@@ -1091,8 +1313,12 @@
   <div class="top-inner">
     <div class="brand">
       <span class="brand-mark">Keepsake</span>
-      <span class="version-badge" id="version-badge">v1.4.2</span>
+      <span class="version-badge" id="version-badge">v1.5.0</span>
       <span class="sync-status hidden" id="sync-status" role="status" aria-live="polite"></span>
+      <button class="storage-pill" id="storage-pill" type="button" data-zone="heavy" hidden>
+        <span class="storage-pill-icon" id="storage-pill-icon" aria-hidden="true"></span>
+        <span id="storage-pill-text"></span>
+      </button>
     </div>
     <div class="tabbar" role="tablist" aria-label="Note views">
       <button role="tab" id="tab-notes" aria-selected="true">Notes</button>
@@ -1134,12 +1360,17 @@
 </main>
 
 <!-- Editor: full-screen, not a cramped popup -->
-<div class="editor-screen hidden" id="overlay-editor">
+<div class="editor-screen hidden" id="overlay-editor" role="dialog" aria-modal="true" aria-label="Note editor">
   <header class="editor-topbar">
     <button class="icon-btn" id="btn-close-editor" aria-label="Close">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
     </button>
     <span class="editor-topbar-title" id="editor-heading">New note</span>
+    <button class="size-chip" id="btn-size" type="button" data-zone="ok" aria-haspopup="dialog" aria-label="Note size">
+      <span class="size-icon" id="size-icon" aria-hidden="true"></span>
+      <span class="size-text" id="size-text">0.0 / 25 MB</span>
+      <span class="size-track" aria-hidden="true"><span class="size-fill" id="size-fill"></span></span>
+    </button>
     <button class="btn btn-primary" id="btn-save-note">Save</button>
   </header>
 
@@ -1210,10 +1441,14 @@
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8.5" cy="10" r="1.5"/><path d="M21 15l-5-5-4 4-3-3-6 6"/></svg>
     </button>
     <input type="file" id="input-image" accept="image/*" multiple class="visually-hidden">
+    <button class="icon-btn" id="btn-add-audio" title="Add audio" aria-label="Add audio" aria-haspopup="dialog">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
+    </button>
+    <input type="file" id="input-audio" accept="audio/*,.m4a,.mp3,.wav,.ogg,.oga,.opus,.aac,.flac,.webm" multiple class="visually-hidden" tabindex="-1">
     <button class="icon-btn" id="btn-draw" title="Draw on this note" aria-label="Draw on this note" aria-pressed="false">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17c3-7 5-7 6-3s3 4 5-1 4-5 7-2"/></svg>
     </button>
-    <button class="icon-btn" id="btn-open-lock-chooser" title="Lock this note" aria-label="Lock this note">
+    <button class="icon-btn" id="btn-open-lock-chooser" title="Lock this note" aria-label="Lock this note" aria-pressed="false">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
     </button>
     <button class="icon-btn" id="btn-remove-lock" style="display:none;" title="Remove lock" aria-label="Remove lock">
@@ -1230,7 +1465,7 @@
 </div>
 
 <!-- Photo lightbox: opened by tapping a thumbnail in the editor -->
-<div class="lightbox hidden" id="overlay-lightbox">
+<div class="lightbox hidden" id="overlay-lightbox" role="dialog" aria-modal="true" aria-label="Photo viewer">
   <button class="lightbox-close" id="btn-lightbox-close" aria-label="Close">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6l12 12M18 6L6 18"/></svg>
   </button>
@@ -1246,20 +1481,20 @@
 
 <!-- Lock chooser modal -->
 <div class="overlay hidden" id="overlay-lock-chooser">
-  <div class="modal narrow">
+  <div class="modal narrow" role="dialog" aria-modal="true" aria-labelledby="lock-chooser-heading">
     <div class="modal-head">
-      <h2>Lock this note</h2>
+      <h2 id="lock-chooser-heading">Lock this note</h2>
       <button class="icon-btn" data-close="overlay-lock-chooser" aria-label="Close">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M18 6 6 18M6 6l12 12"/></svg>
       </button>
     </div>
     <div class="modal-body">
       <div class="lock-choice-row">
-        <button class="lock-choice" id="choice-quick">
+        <button class="lock-choice" id="choice-quick" aria-pressed="false">
           <div class="lock-choice-title">Quick lock</div>
           <div class="lock-choice-desc">One password. Opens any time you enter it.</div>
         </button>
-        <button class="lock-choice" id="choice-time">
+        <button class="lock-choice" id="choice-time" aria-pressed="false">
           <div class="lock-choice-title">Time lock</div>
           <div class="lock-choice-desc">Stays sealed until a date you set.</div>
         </button>
@@ -1292,6 +1527,7 @@
         <div class="field">
           <label for="time-unlock-at">Unlock at</label>
           <input type="datetime-local" id="time-unlock-at">
+          <p class="hint" id="time-lock-status" hidden></p>
           <p class="hint">A second, one-time password is also generated for this note and isn't shown to you. After the date above, this note opens with just your password.</p>
         </div>
         <p class="field error visually-hidden" id="time-lock-error"></p>
@@ -1303,7 +1539,7 @@
 
 <!-- Unlock modal -->
 <div class="overlay hidden" id="overlay-unlock">
-  <div class="modal narrow">
+  <div class="modal narrow" role="dialog" aria-modal="true" aria-labelledby="unlock-heading">
     <div class="modal-head">
       <h2 id="unlock-heading">Locked note</h2>
       <button class="icon-btn" data-close="overlay-unlock" aria-label="Close">
@@ -1316,9 +1552,102 @@
   </div>
 </div>
 
+<!-- Add audio: record or attach -->
+<div class="overlay hidden" id="overlay-record">
+  <div class="modal narrow" role="dialog" aria-modal="true" aria-labelledby="record-heading">
+    <div class="modal-head">
+      <h2 id="record-heading">Add audio</h2>
+      <button class="icon-btn" id="btn-record-close" type="button" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <p class="hint rec-where">The clip lands where your cursor was in the note — between two sentences, or two words.</p>
+      <p class="rec-error" id="record-error" role="alert" hidden></p>
+
+      <div class="rec-panel" data-panel="idle">
+        <button class="btn btn-primary btn-block" id="btn-record-start" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg><span>Start recording</span></button>
+        <button class="btn btn-ghost btn-block" id="btn-record-attach" type="button">Attach an audio file</button>
+        <p class="hint" id="record-quality"></p>
+      </div>
+
+      <div class="rec-panel" data-panel="recording" hidden>
+        <div class="rec-live">
+          <span class="rec-dot" aria-hidden="true"></span>
+          <span class="rec-live-label">Recording</span>
+          <span class="rec-timer" id="record-timer" role="timer" aria-live="off">0:00</span>
+        </div>
+        <div class="rec-level" id="record-level" aria-hidden="true"><span></span></div>
+        <p class="rec-projection" id="record-projection" data-zone="ok"></p>
+        <div class="btn-row">
+          <button class="btn btn-primary" id="btn-record-stop" type="button">Stop</button>
+          <button class="btn btn-ghost" id="btn-record-cancel" type="button">Cancel</button>
+        </div>
+      </div>
+
+      <div class="rec-panel" data-panel="review" hidden>
+        <p class="rec-result" id="record-result"></p>
+        <audio id="record-preview" controls preload="metadata"></audio>
+        <p class="rec-projection" id="record-review-note" data-zone="ok"></p>
+        <button class="btn btn-primary btn-block" id="btn-record-add" type="button">Add to note</button>
+        <div class="btn-row">
+          <button class="btn btn-ghost" id="btn-record-again" type="button">Record again</button>
+          <button class="btn btn-danger" id="btn-record-discard" type="button">Discard</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- One audio clip: play, download, delete -->
+<div class="overlay hidden" id="overlay-clip">
+  <div class="modal narrow" role="dialog" aria-modal="true" aria-labelledby="clip-heading">
+    <div class="modal-head">
+      <h2 id="clip-heading">Audio clip</h2>
+      <button class="icon-btn" data-close="overlay-clip" type="button" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <p class="hint clip-meta" id="clip-meta"></p>
+      <audio id="clip-audio" controls preload="metadata"></audio>
+      <div class="btn-row">
+        <button class="btn btn-primary" id="btn-clip-download" type="button">Download this clip</button>
+        <button class="btn btn-danger" id="btn-clip-delete" type="button">Delete clip</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- This note's size against the limits -->
+<div class="overlay hidden" id="overlay-size">
+  <div class="modal narrow" role="dialog" aria-modal="true" aria-labelledby="size-heading">
+    <div class="modal-head">
+      <h2 id="size-heading">Note size</h2>
+      <button class="icon-btn" data-close="overlay-size" type="button" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <div class="size-status" id="size-status"></div>
+      <div class="meter" id="size-dialog-meter" role="meter" aria-label="Note size in megabytes" aria-valuemin="0" aria-valuemax="25" aria-valuenow="0" data-zone="ok">
+        <span class="meter-fill" id="size-dialog-fill"></span>
+        <span class="meter-tick" style="left:48%"></span>
+        <span class="meter-tick" style="left:80%"></span>
+      </div>
+      <ul class="size-rows" id="size-rows"></ul>
+      <div class="size-advice" id="size-advice-box" data-zone="ok">
+        <span class="size-advice-icon" id="size-advice-icon" aria-hidden="true"></span>
+        <p id="size-advice"></p>
+      </div>
+      <h3 class="size-legend-title">What the levels mean</h3>
+      <ul class="size-legend">
+        <li data-zone="ok"><span data-zone-icon="ok" aria-hidden="true"></span><span><b>Up to 12 MB</b> — comfortable.</span></li>
+        <li data-zone="heavy"><span data-zone-icon="heavy" aria-hidden="true"></span><span><b>12–20 MB</b> — getting heavy: slower to open and sync.</span></li>
+        <li data-zone="danger"><span data-zone-icon="danger" aria-hidden="true"></span><span><b>20–25 MB</b> — close to the limit: saving may fail.</span></li>
+        <li data-zone="over"><span data-zone-icon="over" aria-hidden="true"></span><span><b>Over 25 MB</b> — can’t be saved. That’s Cloudflare’s limit for one note.</span></li>
+      </ul>
+    </div>
+  </div>
+</div>
+
 <!-- Confirm modal -->
 <div class="overlay hidden" id="overlay-confirm">
-  <div class="modal narrow">
+  <div class="modal narrow" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-message">
     <div class="modal-head"><h2 id="confirm-title">Are you sure?</h2></div>
     <div class="modal-body">
       <p id="confirm-message" style="color: var(--ink-soft); font-size: 14.5px; line-height: 1.5;"></p>
@@ -1332,9 +1661,9 @@
 
 <!-- Settings modal -->
 <div class="overlay hidden" id="overlay-settings">
-  <div class="modal narrow">
+  <div class="modal narrow" role="dialog" aria-modal="true" aria-labelledby="settings-heading">
     <div class="modal-head">
-      <h2>Settings</h2>
+      <h2 id="settings-heading">Settings</h2>
       <button class="icon-btn" data-close="overlay-settings" aria-label="Close">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M18 6 6 18M6 6l12 12"/></svg>
       </button>
@@ -1351,6 +1680,64 @@
       </div>
       <button class="btn btn-primary" id="btn-save-settings">Save</button>
 
+      <section class="settings-section" aria-labelledby="media-heading">
+        <h3 id="media-heading">Media quality</h3>
+        <div class="field">
+          <label for="settings-photo-quality">Photos</label>
+          <select id="settings-photo-quality">
+            <option value="standard">Standard</option>
+            <option value="high">High</option>
+            <option value="original">Original (no compression)</option>
+          </select>
+          <p class="hint" id="settings-photo-hint"></p>
+        </div>
+        <div class="field">
+          <label for="settings-audio-quality">Audio recordings</label>
+          <select id="settings-audio-quality">
+            <option value="standard">Standard</option>
+            <option value="high">High</option>
+            <option value="max">Maximum</option>
+          </select>
+          <p class="hint" id="settings-audio-hint"></p>
+        </div>
+        <p class="hint">Changes apply to photos and recordings you add from now on. Audio files you attach are always kept exactly as they are. Higher quality means bigger notes — the size indicator in the editor shows how close you are to the limit.</p>
+      </section>
+
+      <section class="settings-section" aria-labelledby="b2-heading">
+        <h3 id="b2-heading">Photos &amp; audio storage</h3>
+        <div class="field">
+          <label for="settings-media-on" style="display:flex; align-items:center; gap:10px;">
+            <input type="checkbox" id="settings-media-on" style="width:auto; margin:0;">
+            <span>Keep photos and audio in Backblaze B2</span>
+          </label>
+          <p class="hint" id="settings-media-status"></p>
+        </div>
+      </section>
+
+      <section class="settings-section" aria-labelledby="storage-heading">
+        <h3 id="storage-heading">Storage</h3>
+        <div class="storage-card" id="storage-card" data-zone="ok">
+          <div class="storage-head">
+            <span class="size-badge" id="storage-badge" data-zone="ok"></span>
+            <span class="size-figure" id="storage-figures"></span>
+          </div>
+          <div class="meter" id="storage-meter" role="meter" aria-label="Storage used, percent" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" data-zone="ok">
+            <span class="meter-fill" id="storage-fill"></span>
+            <span class="meter-tick" style="left:70%"></span>
+            <span class="meter-tick" style="left:90%"></span>
+          </div>
+          <p class="hint" id="storage-message"></p>
+          <p class="hint" id="storage-media" hidden></p>
+          <h4 class="storage-top-label" id="storage-top-label" hidden>Biggest notes</h4>
+          <ol class="storage-top" id="storage-top"></ol>
+        </div>
+        <div class="field">
+          <label for="settings-storage-limit">Account storage limit (MB)</label>
+          <input type="number" id="settings-storage-limit" min="50" step="50" inputmode="numeric">
+          <p class="hint">Cloudflare’s free plan gives Workers KV 1 GB (1,000 MB) in total, 25 MB per note and 1,000 writes a day — each save uses 2–3 of those writes. Raise this number if you’re on a paid plan.</p>
+        </div>
+      </section>
+
       <div class="field" style="margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--line);">
         <label>App shell</label>
         <div class="btn-row">
@@ -1366,13 +1753,14 @@
   </div>
 </div>
 
-<div class="toast" id="toast"></div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
 
 <script>
 // Bump this on EVERY change to the app, no matter how small — a typo fix,
 // a copy tweak, whatever. See CHANGELOG.md for the policy and history.
-window.KEEPSAKE_VERSION = "1.4.2";
+window.KEEPSAKE_VERSION = "1.6.0";
 </script>
+<script src="media.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

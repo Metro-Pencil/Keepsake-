@@ -14,3 +14,11 @@ kv_namespaces = [
 # No R2 bucket needed — note content, metadata, and the password-2 vault
 # all live in the one KV namespace above. This avoids the payment-method
 # requirement Cloudflare has for enabling R2 on an account.
+
+# Optional: keep photos and audio in a Backblaze B2 bucket instead of inside
+# the notes (see "Backblaze B2" in the README). Fill these two in, then add the
+# secrets with:   wrangler secret put B2_KEY_ID    and    wrangler secret put B2_APP_KEY
+# Leave both empty and the app works exactly as before.
+[vars]
+B2_ENDPOINT = ""   # e.g. "s3.us-west-004.backblazeb2.com" (shown on your bucket's page)
+B2_BUCKET = ""     # e.g. "ougi-media-2026"
