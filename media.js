@@ -1,26 +1,24 @@
 /* Keepsake — media.js
- * Photos and audio kept in Backblaze B2 instead of inside the note.
+ * Photos and audio kept as separate files in your Backblaze B2 bucket instead of inside the note.
  *
  * How it fits together
- *   - In the editor nothing changes: photos and clips are data: URLs, exactly as before.
- *   - When a note is SAVED (and Backblaze is set up on the Worker), every data: URL is
- *     swapped for a short reference ("ks-media:<name>") and the bytes are queued for upload.
- *     A manifest in the note says what each reference is. For a locked note the bytes are
- *     encrypted first, with a random key that lives inside the note's own encrypted content,
- *     so Backblaze only ever holds ciphertext for those.
- *   - When a note is OPENED, the references are swapped back for data: URLs (from this
- *     device's copy if it has one, otherwise downloaded through the Worker).
- *   - The browser only ever talks to your Worker, never to Backblaze.
+ *   - In the editor nothing changes: photos and clips are data: URLs.
+ *   - When a note is SAVED, every data: URL is swapped for a short reference ("ks-media:<name>")
+ *     and the bytes are queued for upload. A manifest in the note says what each reference is.
+ *     For a locked note the bytes are encrypted first, with a random key that lives inside the
+ *     note's own encrypted content, so the bucket only ever holds ciphertext for those.
+ *   - When a note is OPENED, the references are swapped back for data: URLs (from this device's
+ *     copy if it has one, otherwise downloaded from the bucket).
+ *   - Uploads and downloads go straight to the bucket through b2.js.
  *
  * Self-contained on purpose: its own small IndexedDB ("keepsake-media"), its own helpers.
- * It reads the Worker URL and token from the same localStorage keys Settings writes.
  */
 (function (root) {
   'use strict';
 
   const REF_PREFIX = 'ks-media:';
   const NAME_RE = /^[a-f0-9]{32}$/;
-  const MAX_ITEM_BYTES = 90 * 1024 * 1024; // the Worker's per-file limit
+  const MAX_ITEM_BYTES = 90 * 1024 * 1024; // per file: a photo or clip is held in memory while a note is open
   const CACHE_CAP_BYTES = 300 * 1024 * 1024; // synced copies kept on this device; oldest-used go first
   let cacheCap = CACHE_CAP_BYTES;
   const DB_NAME = 'keepsake-media';
@@ -28,24 +26,6 @@
   const BLOB = 'blob';   // heavy: { id, bytes }
 
   /* ------------------------------------------------------------------ helpers */
-
-  function ls(key) { try { return root.localStorage.getItem(key); } catch (e) { return null; } }
-  function lsSet(key, v) { try { root.localStorage.setItem(key, v); } catch (e) { /* private mode */ } }
-  function base() { return (ls('ks_apiBase') || '').replace(/\/+$/, ''); }
-  function token() { return ls('ks_token') || ''; }
-
-  function networkError() {
-    const err = new Error('Network error \u2014 check your connection');
-    err.isNetworkError = true;
-    return err;
-  }
-
-  function httpError(status, body, fallback) {
-    const err = new Error((body && body.error) || fallback || ('Request failed (' + status + ')'));
-    err.status = status;
-    err.body = body || {};
-    return err;
-  }
 
   function hex(buf) {
     return Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, '0')).join('');
@@ -240,77 +220,27 @@
     return all.reduce((n, i) => n + i.size, 0);
   }
 
-  /* ----------------------------------------------------------- talking to the Worker */
-
-  async function authedFetch(path, init) {
-    let res;
-    try {
-      res = await root.fetch(base() + path, {
-        ...init,
-        headers: { Authorization: 'Bearer ' + token(), ...((init && init.headers) || {}) },
-      });
-    } catch (e) { throw networkError(); }
-    return res;
-  }
-
-  async function jsonRequest(path) {
-    const res = await authedFetch(path);
-    if (!res.ok) {
-      let body = {};
-      try { body = await res.json(); } catch (e) { /* not JSON */ }
-      throw httpError(res.status, body);
-    }
-    return res.json();
-  }
+  /* ------------------------------------------------------------ talking to the bucket */
 
   async function downloadBytes(noteId, name) {
-    const res = await authedFetch('/api/media/' + noteId + '/' + name);
-    if (!res.ok) {
-      let body = {};
-      try { body = await res.json(); } catch (e) { /* not JSON */ }
-      throw httpError(res.status, body, res.status === 404 ? 'A photo or audio clip is missing from Backblaze' : undefined);
+    const bytes = await root.KSB2.getBytesOrNull(root.KSB2.mediaKey(noteId, name));
+    if (!bytes) {
+      const err = new Error('A photo or audio clip is missing from your bucket');
+      err.status = 404;
+      throw err;
     }
-    try { return new Uint8Array(await res.arrayBuffer()); } catch (e) { throw networkError(); }
+    return bytes;
   }
 
-  // XHR rather than fetch so a big upload can report progress.
   function uploadBytes(noteId, name, bytes, sha, onProgress) {
-    return new Promise((resolve, reject) => {
-      const xhr = new root.XMLHttpRequest();
-      xhr.open('PUT', base() + '/api/media/' + noteId + '/' + name);
-      xhr.setRequestHeader('Authorization', 'Bearer ' + token());
-      xhr.setRequestHeader('X-Content-SHA256', sha);
-      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-      if (onProgress) xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(e.loaded); };
-      xhr.onload = () => {
-        let body = {};
-        try { body = JSON.parse(xhr.responseText); } catch (e) { /* not JSON */ }
-        if (xhr.status >= 200 && xhr.status < 300) resolve(body);
-        else reject(httpError(xhr.status, body));
-      };
-      xhr.onerror = () => reject(networkError());
-      xhr.ontimeout = () => reject(networkError());
-      xhr.onabort = () => reject(networkError());
-      xhr.send(bytes);
-    });
+    return root.KSB2.putBytes(root.KSB2.mediaKey(noteId, name), bytes, sha, onProgress ? (loaded) => onProgress(loaded) : null);
   }
 
   /* ------------------------------------------------------------------- settings */
 
-  // "available": the Worker says Backblaze is configured (remembered, so it holds offline).
-  // "enabled":   available AND you haven't switched it off in Settings.
-  function available() { return ls('ks_mediaAvailable') === '1'; }
-  function enabled() { return available() && ls('ks_mediaOff') !== '1'; }
-  function setUserEnabled(on) { lsSet('ks_mediaOff', on ? '0' : '1'); }
-
-  async function refreshConfig() {
-    if (!base() || !token()) return available();
-    try {
-      const cfg = await jsonRequest('/api/media-config');
-      lsSet('ks_mediaAvailable', cfg && cfg.enabled ? '1' : '0');
-    } catch (e) { /* offline or an older Worker: keep what we last knew */ if (e.status === 404) lsSet('ks_mediaAvailable', '0'); }
-    return available();
-  }
+  // Photos and audio always live in the bucket once it is set up.
+  function available() { return !!(root.KSB2 && root.KSB2.config.configured()); }
+  function enabled() { return available(); }
 
   /* ----------------------------------------------- references <-> data URLs */
 
@@ -506,7 +436,7 @@
   /* ----------------------------------------------------- offline + download helpers */
 
   async function list(noteId) {
-    return (await jsonRequest('/api/media/' + noteId)).items || [];
+    return root.KSB2.listMedia(noteId);
   }
 
   // Quietly fetches a note's media so the note opens offline, while there is room.
@@ -555,7 +485,7 @@
 
   root.KSMedia = {
     REF_PREFIX, NAME_RE, MAX_ITEM_BYTES, CACHE_CAP_BYTES,
-    available, enabled, setUserEnabled, refreshConfig,
+    available, enabled,
     externalize, inflate, uploadPending, reconcile, dropNote,
     prefetchNote, attachToBundle, cacheBytesUsed,
     _test: { setCap(n) { cacheCap = n; }, resetMemory() { indexes.clear(); noteKeys.clear(); }, parseDataURL, bytesToDataUrl, cachePut, cacheGet, infoGet, infoForNote, evict, indexes, noteKeys },

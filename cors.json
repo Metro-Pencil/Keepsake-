@@ -1,0 +1,11 @@
+{
+  "CORSRules": [
+    {
+      "AllowedOrigins": ["https://YOUR-NAME.github.io"],
+      "AllowedMethods": ["GET", "PUT", "DELETE"],
+      "AllowedHeaders": ["*"],
+      "ExposeHeaders": ["ETag", "Date"],
+      "MaxAgeSeconds": 3600
+    }
+  ]
+}

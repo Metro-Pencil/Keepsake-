@@ -1235,6 +1235,24 @@
   .size-legend [data-zone-icon] { color: var(--zone-fg); background: none; }
   .size-legend li[data-zone="over"] [data-zone-icon] { color: var(--danger); }
 
+  .quality-options { display: flex; flex-direction: column; gap: 10px; }
+  .quality-opt { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; text-align: left; height: auto; padding: 12px 16px; }
+  .quality-opt .q-title { font-weight: 600; }
+  .quality-opt .q-hint { font-size: 0.8125rem; line-height: 1.45; font-weight: 400; opacity: 0.9; }
+  .quality-files { list-style: none; margin: 0 0 14px; padding: 8px 10px; max-height: 150px; overflow-y: auto; background: var(--paper); border-radius: 10px; font-size: 0.8125rem; }
+  .quality-files li { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; }
+  .quality-files .qf-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .quality-files .qf-size { flex: none; color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+  .quality-files .qf-more { color: var(--ink-soft); justify-content: center; }
+  .lightbox-compress {
+    position: absolute; left: 50%; transform: translateX(-50%);
+    bottom: calc(max(18px, env(safe-area-inset-bottom)) + 30px);
+    min-height: 40px; padding: 8px 16px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.45);
+    background: rgba(0,0,0,0.45); color: #fff; font: inherit; font-size: 0.875rem; cursor: pointer;
+  }
+  .b2-status { margin: 0 0 12px; padding: 10px 12px; border-radius: 10px; }
+  .b2-status[data-kind="bad"] { background: var(--danger-bg); color: var(--danger); }
+  .b2-status[data-kind="ok"] { background: var(--ok-bg); color: var(--ok); }
   .settings-section { margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--line); }
   .settings-section h3 { margin: 0 0 12px; font-family: var(--font-display); font-size: 1.0625rem; }
   .storage-card { margin-bottom: 16px; }
@@ -1476,6 +1494,7 @@
   <button class="lightbox-nav lightbox-next" id="btn-lightbox-next" aria-label="Next photo">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 6l6 6-6 6"/></svg>
   </button>
+  <button class="lightbox-compress" id="btn-lightbox-compress" type="button">Compress this photo</button>
   <div class="lightbox-caption" id="lightbox-caption"></div>
 </div>
 
@@ -1609,6 +1628,7 @@
       <audio id="clip-audio" controls preload="metadata"></audio>
       <div class="btn-row">
         <button class="btn btn-primary" id="btn-clip-download" type="button">Download this clip</button>
+        <button class="btn btn-ghost" id="btn-clip-compress" type="button">Compress</button>
         <button class="btn btn-danger" id="btn-clip-delete" type="button">Delete clip</button>
       </div>
     </div>
@@ -1639,7 +1659,7 @@
         <li data-zone="ok"><span data-zone-icon="ok" aria-hidden="true"></span><span><b>Up to 12 MB</b> — comfortable.</span></li>
         <li data-zone="heavy"><span data-zone-icon="heavy" aria-hidden="true"></span><span><b>12–20 MB</b> — getting heavy: slower to open and sync.</span></li>
         <li data-zone="danger"><span data-zone-icon="danger" aria-hidden="true"></span><span><b>20–25 MB</b> — close to the limit: saving may fail.</span></li>
-        <li data-zone="over"><span data-zone-icon="over" aria-hidden="true"></span><span><b>Over 25 MB</b> — can’t be saved. That’s Cloudflare’s limit for one note.</span></li>
+        <li data-zone="over"><span data-zone-icon="over" aria-hidden="true"></span><span><b>Over 25 MB</b> — can’t be saved.</span></li>
       </ul>
     </div>
   </div>
@@ -1670,48 +1690,49 @@
     </div>
     <div class="modal-body">
       <div class="field">
-        <label for="settings-api-base">Worker URL</label>
-        <input type="url" id="settings-api-base" placeholder="https://your-worker.workers.dev">
+        <label for="settings-b2-endpoint">Endpoint</label>
+        <input type="text" id="settings-b2-endpoint" placeholder="s3.us-west-004.backblazeb2.com" autocomplete="off" autocapitalize="off" spellcheck="false">
+        <p class="hint">Shown on your bucket’s page in Backblaze.</p>
       </div>
       <div class="field">
-        <label for="settings-token">Access token</label>
-        <input type="password" id="settings-token" autocomplete="off">
-        <p class="hint">Matches the API_TOKEN secret set on your Worker. Stored only in this browser.</p>
+        <label for="settings-b2-bucket">Bucket name</label>
+        <input type="text" id="settings-b2-bucket" autocomplete="off" autocapitalize="off" spellcheck="false">
       </div>
-      <button class="btn btn-primary" id="btn-save-settings">Save</button>
+      <div class="field">
+        <label for="settings-b2-keyid">Key ID</label>
+        <input type="text" id="settings-b2-keyid" autocomplete="off" autocapitalize="off" spellcheck="false">
+      </div>
+      <div class="field">
+        <label for="settings-b2-appkey">Application key</label>
+        <input type="password" id="settings-b2-appkey" autocomplete="off">
+        <p class="hint">Stored only in this browser. Anyone who has this key can read and delete everything in the bucket.</p>
+      </div>
+      <p class="hint" id="settings-clock"></p>
+      <p class="hint">In Backblaze, set the bucket’s <b>Lifecycle</b> to “Keep only the last version of the file”. Otherwise every save keeps the old copy too, and deleted notes and photos stay in your storage.</p>
+      <p class="hint b2-status" id="settings-b2-status" role="alert" hidden></p>
+      <button class="btn btn-primary" id="btn-save-settings">Save and test</button>
+
+      <div id="migrate-slot"></div>
 
       <section class="settings-section" aria-labelledby="media-heading">
-        <h3 id="media-heading">Media quality</h3>
+        <h3 id="media-heading">Compressed quality</h3>
         <div class="field">
           <label for="settings-photo-quality">Photos</label>
           <select id="settings-photo-quality">
             <option value="standard">Standard</option>
             <option value="high">High</option>
-            <option value="original">Original (no compression)</option>
           </select>
           <p class="hint" id="settings-photo-hint"></p>
         </div>
         <div class="field">
-          <label for="settings-audio-quality">Audio recordings</label>
+          <label for="settings-audio-quality">Audio</label>
           <select id="settings-audio-quality">
             <option value="standard">Standard</option>
             <option value="high">High</option>
-            <option value="max">Maximum</option>
           </select>
           <p class="hint" id="settings-audio-hint"></p>
         </div>
-        <p class="hint">Changes apply to photos and recordings you add from now on. Audio files you attach are always kept exactly as they are. Higher quality means bigger notes — the size indicator in the editor shows how close you are to the limit.</p>
-      </section>
-
-      <section class="settings-section" aria-labelledby="b2-heading">
-        <h3 id="b2-heading">Photos &amp; audio storage</h3>
-        <div class="field">
-          <label for="settings-media-on" style="display:flex; align-items:center; gap:10px;">
-            <input type="checkbox" id="settings-media-on" style="width:auto; margin:0;">
-            <span>Keep photos and audio in Backblaze B2</span>
-          </label>
-          <p class="hint" id="settings-media-status"></p>
-        </div>
+        <p class="hint">Every time you add photos or audio, Keepsake asks whether to keep the Original or make a Compressed copy. These settings only decide how strong Compressed is.</p>
       </section>
 
       <section class="settings-section" aria-labelledby="storage-heading">
@@ -1734,7 +1755,7 @@
         <div class="field">
           <label for="settings-storage-limit">Account storage limit (MB)</label>
           <input type="number" id="settings-storage-limit" min="50" step="50" inputmode="numeric">
-          <p class="hint">Cloudflare’s free plan gives Workers KV 1 GB (1,000 MB) in total, 25 MB per note and 1,000 writes a day — each save uses 2–3 of those writes. Raise this number if you’re on a paid plan.</p>
+          <p class="hint">Backblaze B2’s free plan includes 10 GB (10,000 MB) of storage. Change this number if your plan is different — it only drives the meter above.</p>
         </div>
       </section>
 
@@ -1753,14 +1774,32 @@
   </div>
 </div>
 
+<!-- Original or Compressed: asked before every photo / audio is added -->
+<div class="overlay hidden" id="overlay-quality">
+  <div class="modal narrow" role="dialog" aria-modal="true" aria-labelledby="quality-title">
+    <div class="modal-head"><h2 id="quality-title">Add media</h2></div>
+    <div class="modal-body">
+      <p class="hint" id="quality-summary" style="margin-bottom: 8px;"></p>
+      <ul class="quality-files" id="quality-files" hidden></ul>
+      <div class="quality-options">
+        <button class="btn btn-primary quality-opt" id="btn-quality-original" type="button"><span class="q-title"></span><span class="q-hint"></span></button>
+        <button class="btn btn-ghost quality-opt" id="btn-quality-compressed" type="button"><span class="q-title"></span><span class="q-hint"></span></button>
+        <button class="btn btn-ghost" id="btn-quality-cancel" type="button">Cancel</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
 <script>
 // Bump this on EVERY change to the app, no matter how small — a typo fix,
 // a copy tweak, whatever. See CHANGELOG.md for the policy and history.
-window.KEEPSAKE_VERSION = "1.6.0";
+window.KEEPSAKE_VERSION = "1.8.0";
 </script>
+<script src="b2.js"></script>
 <script src="media.js"></script>
+<script src="migrate.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

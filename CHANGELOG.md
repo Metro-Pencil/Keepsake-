@@ -6,6 +6,56 @@ All notable changes to this project are recorded here, following
 small — gets a version bump. If the version number hasn't moved,
 nothing changed; that's the whole point of keeping one.
 
+## v1.8.0 — 2026-10-09
+
+- **Time-locked notes use Backblaze's clock.** Opening one asks Backblaze for the time right then,
+  so changing the phone's clock can't release it early. Time-locked notes are also stamped with
+  server time; ordinary notes keep using the phone's clock. Settings shows the difference.
+- **Every file's size in the Original / Compressed prompt**, and the progress bar along the top
+  now names each file, its size and a percentage for every compression, then shows the result
+  ("5.4 MB → 1.2 MB").
+- **Compress saved media any time:** "Compress this photo" in the photo viewer and "Compress" in
+  a clip's dialog, with the new size shown and a confirmation before the original is replaced.
+- **Bucket lifecycle:** the README and Settings now say to set the bucket's Lifecycle to "Keep
+  only the last version of the file", otherwise overwritten and deleted files stay in storage.
+- `cors.json` now also exposes the `Date` header.
+
+## v1.7.0 — 2026-10-09
+
+**Backblaze B2 only: Cloudflare is gone**
+
+- **No server any more.** The app talks straight to your private Backblaze B2 bucket (its
+  S3-compatible API), signing each request in the browser. Notes, locks, second passwords,
+  photos and audio all live in the bucket (`meta/`, `content/`, `vault/`, `media/`). The
+  Worker, the KV namespace and `wrangler.toml` are not needed and have been removed.
+- **Settings now takes four values** (endpoint, bucket, key ID, application key) instead of a
+  Worker address and token, with a **Save and test** that tells apart a wrong key, a wrong
+  bucket, a missing CORS rule, a skewed clock and no connection. The bucket needs a CORS rule
+  for your site (see the README and `cors.json`).
+- **Photos and audio always go to the bucket** as separate files, so the old on/off switch is
+  gone. Notes saved before keep their media inside until you next save them.
+- **Original or Compressed, every time.** Adding photos, attaching an audio file or starting a
+  recording now asks first. Photos: Original is byte for byte, Compressed resizes. Audio files:
+  Original is kept as is, Compressed re-encodes in real time (the original is kept if that
+  wouldn't make it smaller). Recording: Original turns the microphone's noise suppression,
+  echo cancellation and auto-gain off and records at the highest quality; Compressed uses the
+  usual processing at the chosen bitrate. Settings → Media quality became Compressed quality
+  and only sets how strong Compressed is.
+- **Storage meter** counts photos and audio with the notes and defaults to 10 GB (Backblaze's
+  free plan). Change it in Settings if your plan differs.
+- **One-time move from Cloudflare** (this version only): Settings → Move notes from Cloudflare
+  copies every note, its second password and any photos or audio from the old Worker into the
+  bucket, reading each note back to check it. It only reads from the old side, never deletes,
+  and is safe to run again. It lives entirely in `migrate.js`; delete that file when you're done.
+- **Time lock note:** with no server, the unlock date is enforced by the app on the device (it
+  uses the device's clock) rather than by a server. See the README.
+
+**Under the hood**
+
+- New `b2.js` (SigV4 signing checked against Amazon's published test vectors, listing with
+  pagination, a metadata cache so the list only re-reads changed notes, upload progress).
+  `media.js` now uses it instead of a Worker. Service worker cache bumped to v14.
+
 ## v1.6.0 — 2026-10-09
 
 **Photos and audio in Backblaze B2 (optional)**

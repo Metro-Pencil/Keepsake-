@@ -81,122 +81,51 @@ async function decryptNote(passphrase, record) {
  * Config + API client
  * ------------------------------------------------------------------- */
 
-// Photo / audio quality presets (Settings → Media quality). The size hints are
-// rough: they depend on the picture or the voice, and a locked note stores
-// everything about a third larger again (encryption is kept as text).
+// Every photo and audio you add is first offered as Original or Compressed (see askMediaQuality).
+// These presets only decide how strong "Compressed" is (Settings -> Compressed quality). A locked
+// note stores everything about a third larger again (encryption is kept as text).
 const PHOTO_QUALITY = {
   standard: { label: 'Standard', maxDim: 1600, quality: 0.82, hint: 'Resized to 1600px. Roughly 0.3\u20130.7 MB per photo.' },
   high:     { label: 'High',     maxDim: 2560, quality: 0.92, hint: 'Resized to 2560px, light compression. Roughly 1\u20132.5 MB per photo.' },
-  original: { label: 'Original', maxDim: 0,    quality: 1,    hint: 'Kept exactly as taken \u2014 no resizing or re-compression. Often 3\u20138 MB per photo, and it keeps the photo\u2019s location data.' },
 };
 const AUDIO_QUALITY = {
-  standard: { label: 'Standard', bps: 64000,  hint: 'Clear for voice. About 0.6 MB per minute.' },
-  high:     { label: 'High',     bps: 128000, hint: 'Good for voice and music. About 1.3 MB per minute.' },
-  max:      { label: 'Maximum',  bps: 256000, hint: 'Best the browser offers. About 2.6 MB per minute.' },
+  standard: { label: 'Standard', bps: 64000,  hint: 'Clear for voice. About 0.5 MB per minute.' },
+  high:     { label: 'High',     bps: 128000, hint: 'Good for voice and music. About 1 MB per minute.' },
+  max:      { label: 'Original', bps: 256000, hint: 'Recorded with no mic processing at the highest quality the browser offers. About 2 MB per minute.' },
 };
 
 const Config = {
-  base() { return localStorage.getItem('ks_apiBase') || ''; },
-  token() { return localStorage.getItem('ks_token') || ''; },
-  setBase(v) { localStorage.setItem('ks_apiBase', v.trim().replace(/\/+$/, '')); },
-  setToken(v) { localStorage.setItem('ks_token', v.trim()); },
-  configured() { return !!(this.base() && this.token()); },
-  photoQuality() { const v = localStorage.getItem('ks_photoQuality'); return PHOTO_QUALITY[v] ? v : 'high'; },
+  configured() { return !!(window.KSB2 && KSB2.config.configured()); },
+  photoQuality() { const v = localStorage.getItem('ks_photoQuality'); return v === 'standard' || v === 'high' ? v : 'high'; },
   setPhotoQuality(v) { localStorage.setItem('ks_photoQuality', v); },
-  audioQuality() { const v = localStorage.getItem('ks_audioQuality'); return AUDIO_QUALITY[v] ? v : 'high'; },
+  audioQuality() { const v = localStorage.getItem('ks_audioQuality'); return v === 'standard' || v === 'high' ? v : 'high'; },
   setAudioQuality(v) { localStorage.setItem('ks_audioQuality', v); },
-  // Free plan: 1 GB for the whole account. People on a paid Workers plan can raise it.
-  storageLimitMB() { const n = Number(localStorage.getItem('ks_storageLimitMB')); return n >= 50 ? n : 1000; },
+  // Backblaze B2's free plan includes 10 GB. Change it in Settings if your plan is different.
+  storageLimitMB() { const n = Number(localStorage.getItem('ks_storageLimitMB')); return n >= 50 ? n : 10000; },
   setStorageLimitMB(n) { localStorage.setItem('ks_storageLimitMB', String(Math.round(n))); },
 };
 
+// The app's whole view of storage. Everything lives in your Backblaze B2 bucket (see b2.js);
+// photos and audio are separate files there (see media.js).
 const API = {
-  async request(path, opts = {}) {
-    let res;
-    try {
-      res = await fetch(Config.base() + path, {
-        ...opts,
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer ' + Config.token(),
-          ...(opts.headers || {}),
-        },
-      });
-    } catch (e) {
-      // fetch() only rejects when the request never got an HTTP response at
-      // all (offline, DNS, dropped connection). Flagged so callers can treat
-      // that as "queue it locally", unlike a 401/500 which is a real error.
-      const err = new Error('Network error — check your connection');
-      err.isNetworkError = true;
-      throw err;
-    }
-    if (!res.ok) {
-      let body = {};
-      try { body = await res.json(); } catch (e) { /* non-JSON error body */ }
-      const err = new Error(body.error || ('Request failed (' + res.status + ')'));
-      err.status = res.status;
-      err.body = body;
-      throw err;
-    }
-    return res.json();
-  },
-  // Same contract as request() (resolves with parsed JSON, rejects with an
-  // Error carrying .status/.body, or .isNetworkError for a connection-level
-  // failure) but over XHR instead of fetch, so we can report real upload
-  // progress for payloads that carry photos.
-  requestWithProgress(path, method, payload, onProgress) {
-    return new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      xhr.open(method, Config.base() + path);
-      xhr.setRequestHeader('Content-Type', 'application/json');
-      xhr.setRequestHeader('Authorization', 'Bearer ' + Config.token());
-      if (onProgress) {
-        xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(e.loaded / e.total); };
-      }
-      xhr.onload = () => {
-        let body = {};
-        try { body = JSON.parse(xhr.responseText); } catch (e) { /* non-JSON error body */ }
-        if (xhr.status >= 200 && xhr.status < 300) {
-          resolve(body);
-        } else {
-          const err = new Error(body.error || ('Request failed (' + xhr.status + ')'));
-          err.status = xhr.status;
-          err.body = body;
-          reject(err);
-        }
-      };
-      const networkFail = () => {
-        const err = new Error('Network error — check your connection');
-        err.isNetworkError = true;
-        reject(err);
-      };
-      xhr.onerror = networkFail;
-      xhr.ontimeout = networkFail;
-      xhr.onabort = networkFail;
-      xhr.send(JSON.stringify(payload));
-    });
-  },
-
-  listNotes() { return this.request('/api/notes'); },
-  getNote(id) { return this.request('/api/notes/' + id); },
-  // Always a PUT to a client-generated id — see worker.js's upsertNote.
-  // There's no separate "create" call anymore: a note's first save and
-  // every save after it go through the exact same idempotent path, so
-  // retrying a save that looked like it failed can never create a
-  // duplicate note — it just overwrites the same one.
-  // Photos and audio that were moved out to Backblaze (see media.js) go up first, through the
-  // Worker; the note itself \u2014 by then just text and references \u2014 follows. Both the editor's
-  // saves and the offline queue come through here, so a queued note uploads its media too.
+  listNotes() { return KSB2.listNotes(); },
+  getNote(id) { return KSB2.getNote(id); },
+  // Always a save to a client-generated id. There's no separate "create" call: a note's first
+  // save and every save after it go through the same idempotent path, so retrying a save that
+  // looked like it failed can never create a duplicate note \u2014 it just overwrites the same one.
+  // Photos and audio go up first; the note itself \u2014 by then just text and references \u2014 follows.
+  // Both the editor's saves and the offline queue come through here, so a queued note uploads
+  // its media too.
   async saveNote(id, payload, onProgress) {
     let uploaded = 0;
     if (payload && payload.mediaKeep && payload.mediaKeep.length && window.KSMedia) {
       uploaded = await KSMedia.uploadPending(id, payload.mediaKeep, onProgress);
     }
-    return this.requestWithProgress('/api/notes/' + id, 'PUT', payload, uploaded ? null : onProgress);
+    return KSB2.saveNote(id, payload, uploaded ? null : onProgress);
   },
-  deleteNote(id) { return this.request('/api/notes/' + id, { method: 'DELETE' }); },
-  getVault(id) { return this.request('/api/notes/' + id + '/vault'); },
-  exportNote(id) { return this.request('/api/notes/' + id + '/export'); },
+  deleteNote(id) { return KSB2.deleteNote(id); },
+  getVault(id) { return KSB2.getVault(id); },
+  exportNote(id) { return KSB2.exportNote(id); },
 };
 
 /* ---------------------------------------------------------------------
@@ -242,34 +171,31 @@ function readFileAsDataURL(file) {
   });
 }
 
-// Stores a photo at the quality chosen in Settings. "Original" keeps the
-// file's own bytes (after checking this browser can actually display it).
-async function fileToStoredDataURL(file) {
-  const q = PHOTO_QUALITY[Config.photoQuality()];
-  if (!q.maxDim) {
+// Stores a photo the way the person chose in the Original / Compressed prompt. "Original" keeps
+// the file's own bytes (after checking this browser can actually display it); "compressed"
+// uses the strength set in Settings.
+async function fileToStoredDataURL(file, mode) {
+  if (mode === 'original') {
     await loadImageFromFile(file);
     return readFileAsDataURL(file);
   }
+  const q = PHOTO_QUALITY[Config.photoQuality()];
   return fileToCompressedDataURL(file, q.maxDim, q.quality);
 }
 
 /* ---------------------------------------------------------------------
  * Size limits.
- *   25 MB   Workers KV's hard cap on one value — content:{id} holds a note's
- *           text, photos, audio and drawing together, so this is the ceiling
- *           for all of it combined.
+ *   25 MB   the most one note's own content (text, formatting, drawing) may take. Photos and
+ *           audio are separate files in the bucket and don't count toward it.
  *   12 MB   from here a note is slow to open and sync, especially on mobile data.
- *   20 MB   the Worker holds a note in memory several times over while it
- *           handles it (128 MB per request), and the Free plan allows only
- *           10 ms of CPU per request — so risk of a failed save rises here.
- *           (12 and 20 are this app's own cautious lines, not Cloudflare's.)
+ *   20 MB   from here saving is more likely to fail on a weak connection.
  * ------------------------------------------------------------------- */
 const NOTE_SIZE_LIMIT = 25 * 1024 * 1024;
 const NOTE_HEAVY_BYTES = 12 * 1024 * 1024;
 const NOTE_DANGER_BYTES = 20 * 1024 * 1024;
-// With Backblaze set up (media.js), photos and audio no longer count toward the 25 MB above —
-// the note only keeps small references. They are still held in memory while a note is open,
-// so there is a ceiling on how much one note carries. (Sizes here are base64 text lengths.)
+// Photos and audio (media.js) don't count toward the 25 MB above \u2014 the note only keeps small
+// references. They are still held in memory while a note is open, so there is a ceiling on how
+// much one note carries. (Sizes here are base64 text lengths.)
 const MEDIA_ITEM_MAX_CHARS = 120 * 1024 * 1024;  // one file, about 90 MB of real data
 const MEDIA_NOTE_MAX_CHARS = 200 * 1024 * 1024;  // all of a note's photos + audio, about 150 MB
 function limitWord() { return mediaOffloadOn() ? 'its 150 MB of photos and audio' : '25 MB'; }
@@ -376,7 +302,7 @@ function formatBytes(bytes) {
 }
 
 /* ---------------------------------------------------------------------
- * Size accounting — how many bytes a note takes up in Workers KV. Measured
+ * Size accounting — how many bytes a note takes up in the bucket. Measured
  * from string lengths (photos and audio are base64 text), not by
  * serialising, so it is cheap enough to run while you type.
  * ------------------------------------------------------------------- */
@@ -394,7 +320,7 @@ function utf8Len(s) {
   return n;
 }
 
-// The size of a content object as the server stores it.
+// The size of a content object as it is stored.
 function contentStoredBytes(c) {
   if (!c) return 0;
   if (typeof c.ciphertext === 'string') {
@@ -632,9 +558,9 @@ async function setLockedTitle(id, title) {
   } catch (e) { /* best-effort */ }
 }
 
-// Older Workers return title:null for locked notes. Once any response shows
-// a string there, we know the Worker has been redeployed and it's worth
-// re-saving old locked notes (when they're next opened) to give them a title.
+// Notes locked long ago were stored with title:null. Once any listed note shows a
+// string there, it's worth re-saving old locked notes (when they're next opened)
+// to give them a title.
 function learnServerTitleSupport(metas) {
   if (metas.some((m) => m && m.lockType !== 'none' && typeof m.title === 'string')) {
     try { localStorage.setItem('ks_titlesOnServer', '1'); } catch (e) { /* private mode — harmless */ }
@@ -789,8 +715,12 @@ function fmtDateTime(ts) {
   });
 }
 
+// Time-locked notes are judged by Backblaze's clock (kept in step by b2.js); everything else
+// in the app uses the phone's clock. Falls back to the phone's if the server was never reached.
+function lockNow() { return window.KSB2 ? KSB2.clock.now() : Date.now(); }
+
 function fmtCountdown(unlockAt) {
-  let diff = unlockAt - Date.now();
+  let diff = unlockAt - lockNow();
   if (diff <= 0) return null;
   const days = Math.floor(diff / 86400000); diff -= days * 86400000;
   const hours = Math.floor(diff / 3600000); diff -= hours * 3600000;
@@ -1273,7 +1203,7 @@ async function applySavedNote(noteId, note, payload, title) {
 }
 
 // The offline counterpart: no server response exists, so the metadata is
-// built here exactly the way worker.js's metaFromBody would build it, the
+// built here exactly the way b2.js's metaFromBody would build it, the
 // note is cached + queued for the next flush, and the grid shows it as a
 // normal card marked "Not synced". Queueing is a plain put keyed by note
 // id, so a later edit while still offline simply replaces this entry.
@@ -1335,7 +1265,8 @@ async function syncFromServer() {
   lastServerSyncAt = Date.now();
   setOnline(true);
   learnServerTitleSupport(notes);
-  if (window.KSMedia) KSMedia.refreshConfig(); // learns whether the Worker has Backblaze set up (not awaited)
+  // A time-locked note exists: make sure the server clock is current (a no-op while Date headers keep it fresh).
+  if (window.KSB2 && notes.some((n) => n && n.lockType === 'time')) KSB2.clock.ensureFresh(30 * 60 * 1000).catch(() => {});
 
   const outboxIds = new Set(await getOutboxIds());
   const serverIds = new Set(notes.map((n) => n.id));
@@ -1373,7 +1304,7 @@ async function prefetchOfflineData(metas) {
         const { content } = await API.getNote(meta.id);
         await cacheNote(meta, content);
       }
-      const unlocked = meta.lockType === 'time' && meta.unlockAt && Date.now() >= meta.unlockAt;
+      const unlocked = meta.lockType === 'time' && meta.unlockAt && lockNow() >= meta.unlockAt;
       const vaultFresh = !!(cached && cached.vault && cached.vaultUpdatedAt === meta.updatedAt);
       if (unlocked && !vaultFresh) {
         try {
@@ -1545,6 +1476,7 @@ function renderLightbox() {
 
 function setupLightbox() {
   document.getElementById('btn-lightbox-close').addEventListener('click', closeLightbox);
+  document.getElementById('btn-lightbox-compress').addEventListener('click', compressSavedPhoto);
   document.getElementById('btn-lightbox-prev').addEventListener('click', () => lightboxStep(-1));
   document.getElementById('btn-lightbox-next').addEventListener('click', () => lightboxStep(1));
 
@@ -1598,7 +1530,7 @@ function renderLockSummary() {
     text = 'Quick lock on \u2014 tap the padlock to change it.';
   } else if (!pendingLock.unlockAt) {
     text = 'Time lock on \u2014 tap the padlock to change it.';
-  } else if (pendingLock.unlockAt > Date.now()) {
+  } else if (pendingLock.unlockAt > lockNow()) {
     text = `Time-locked until ${fmtDateTime(pendingLock.unlockAt)}. Tap the padlock to change it.`;
   } else {
     text = `Time lock ended ${fmtDateTime(pendingLock.unlockAt)} \u2014 this note opens with your password.`;
@@ -1662,9 +1594,8 @@ function openEditorWithContent(meta, content) {
   // look "changed" and get re-encrypted and re-uploaded just for being opened.
   const openedSnapshot = captureSnapshot();
   lastAutosavedJSON = snapshotKey(openedSnapshot);
-  // A note locked before titles were stored on the server has none there.
-  // Once the Worker supports it, make closing this note re-save it once so
-  // every device gets the title — no edit needed.
+  // A note locked before titles were stored has none. Make closing this note re-save it
+  // once so every device gets the title — no edit needed.
   if (isExisting && meta.lockType !== 'none' && meta.title == null
       && localStorage.getItem('ks_titlesOnServer') === '1') {
     lastAutosavedJSON = null;
@@ -1817,7 +1748,7 @@ async function buildSavePayload(snapshot, noteId) {
 
 /* ---------------------------------------------------------------------
  * Background save — used by both the Save button and autosave. Always a
- * PUT to a note id generated client-side (see worker.js's upsertNote), so
+ * save to a note id generated client-side (see b2.js's saveNote), so
  * it's idempotent: saving the same content twice — a double-tap, a
  * retried request after a flaky connection, autosave racing the Save
  * button — just overwrites the same note instead of ever creating a
@@ -1866,12 +1797,11 @@ async function syncRunOne(noteId, snapshot, state) {
 
   const { payload, hasImages, mediaWhat } = built;
 
-  // The note's photos are stored together with its text in one blob (see
-  // worker.js), so every save necessarily re-sends all of it — but that's
-  // only worth calling out as "saving photos" when photos are actually
-  // part of what changed. Otherwise a plain text edit on a photo-heavy
-  // note would misleadingly claim to be re-saving pictures on every
-  // autosave tick.
+  // Photos and audio only go up when they actually changed (the note itself
+  // is just text and references), so "saving photos" is only worth calling
+  // out when media is part of what changed. Otherwise a plain text edit on a
+  // photo-heavy note would misleadingly claim to be re-saving pictures on
+  // every autosave tick.
   const imagesJSON = mediaKey(snapshot);
   const imagesChanged = hasImages && imagesJSON !== state.lastSyncedImagesJSON;
 
@@ -1940,7 +1870,7 @@ function maybeContinueQueued(noteId, state) {
 /* ---------------------------------------------------------------------
  * Autosave scheduling — local cache is aggressive (~1s) since it's free
  * and instant; the server sync is debounced so ordinary typing doesn't
- * hit the Worker on every keystroke, with a periodic safety net so a long
+ * hit the bucket on every keystroke, with a periodic safety net so a long
  * unbroken typing session still gets flushed to the server periodically
  * rather than waiting indefinitely for a pause.
  * ------------------------------------------------------------------- */
@@ -1959,8 +1889,7 @@ function onEditorContentChanged() {
   }
 
   // Every save re-sends the whole note, so a heavy note waits a little
-  // longer between autosaves (it also saves Workers KV's 1,000-writes-a-day
-  // allowance on the Free plan).
+  // longer between autosaves.
   const delay = Math.min(10000, 2000 + Math.floor(lastNoteBytes / 1048576) * 1000);
   clearTimeout(serverSyncDebounce);
   serverSyncDebounce = setTimeout(triggerAutosave, delay);
@@ -2018,7 +1947,7 @@ function closeEditorAndSync(isExplicitSave) {
   if (overLimit) {
     // Closing (not explicitly saving) with an oversized note: the local
     // draft cache already has it, so nothing is lost — just skip sending a
-    // request to the server that KV would reject anyway.
+    // request that could never succeed.
     // Nothing else holds this version (it can't be sent), so keep a local
     // draft now \u2014 even for a locked note, since the alternative is losing it.
     saveDraftNow(noteId);
@@ -2135,7 +2064,7 @@ function prefillLockChooser() {
     // it used to come up blank, and "Update" then demanded a new date).
     document.getElementById('time-unlock-at').value = toLocalDatetimeInput(lock.unlockAt);
     const status = document.getElementById('time-lock-status');
-    status.textContent = lock.unlockAt > Date.now()
+    status.textContent = lock.unlockAt > lockNow()
       ? `Currently set to unlock ${fmtDateTime(lock.unlockAt)}.`
       : `This lock\u2019s date (${fmtDateTime(lock.unlockAt)}) has passed, so the note opens with just your password. Pick a new future date to seal it again, or keep it as it is.`;
     status.hidden = false;
@@ -2287,8 +2216,8 @@ function openUnlockFlow(meta) {
 // token, clock skew) used to be reported as \"Wrong password.\" too.
 function unlockErrorText(e, wrongPasswordText) {
   if (e && e.notCached) return e.message;
-  if (e && e.status === 403) return 'The server says this note is still sealed \u2014 check this device\u2019s date and time.';
-  if (e && e.status === 401) return 'The server rejected your access token \u2014 check Settings.';
+  if (e && e.status === 403) return 'This note is still sealed \u2014 check this device\u2019s date and time.';
+  if (e && e.status === 401) return e.message || 'Backblaze rejected your key \u2014 check Settings.';
   if (e && (e.status || e.isNetworkError)) return e.message;
   return wrongPasswordText;
 }
@@ -2369,7 +2298,7 @@ async function fetchVaultPassword2(meta) {
     }
   }
   if (!light || !light.vault) {
-    const err = new Error('Needs a connection — the second password is released by the server.');
+    const err = new Error('Needs a connection — the second password is fetched once the unlock date has passed.');
     err.notCached = true;
     throw err;
   }
@@ -2467,36 +2396,46 @@ function openConfirm(title, message, onYes, yesLabel = 'Delete') {
 const FORCE_REFRESH_SHELL_FILES = [
   './index.html',
   './app.js',
+  './b2.js',
   './media.js',
+  './migrate.js',
   './manifest.json',
   './icon-192.png',
   './icon-512.png',
 ];
 
 function openSettings() {
-  document.getElementById('settings-api-base').value = Config.base();
-  document.getElementById('settings-token').value = Config.token();
-  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.6.0';
+  const c = KSB2.config;
+  document.getElementById('settings-b2-endpoint').value = c.endpoint();
+  document.getElementById('settings-b2-bucket').value = c.bucket();
+  document.getElementById('settings-b2-keyid').value = c.keyId();
+  document.getElementById('settings-b2-appkey').value = c.appKey();
+  setB2Status('', '');
+  fillClockLine();
+  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.8.0';
   fillQualitySettings();
-  fillMediaSettings();
   show('overlay-settings');
   renderStorageSection();
-  if (window.KSMedia && Config.configured()) KSMedia.refreshConfig().then(() => { fillMediaSettings(); renderStorageSection(); });
 }
 
-// The Backblaze row in Settings: whether the Worker has it set up, and a switch.
-function fillMediaSettings() {
-  const box = document.getElementById('settings-media-on');
-  const status = document.getElementById('settings-media-status');
-  if (!box || !status) return;
-  const avail = !!(window.KSMedia && KSMedia.available());
-  box.disabled = !avail;
-  box.checked = avail && KSMedia.enabled();
-  status.textContent = avail
-    ? (box.checked
-        ? 'On. New and edited notes keep their photos and audio in your Backblaze bucket (up to about 90 MB a file), so they no longer count toward the 25 MB note limit. Locked notes\u2019 media is encrypted first. Notes saved before this keep theirs inside until you next save them.'
-        : 'Off. Photos and audio stay inside each note (25 MB limit per note).')
-    : 'Not set up on your Worker, so photos and audio stay inside each note (25 MB limit per note). See the README to connect a Backblaze bucket.';
+// How far this phone's clock is from Backblaze's (used for time-locked notes).
+function fillClockLine() {
+  const el = document.getElementById('settings-clock');
+  if (!el) return;
+  if (!KSB2.clock.known()) { el.textContent = 'Time-locked notes use Backblaze\u2019s clock, once it has been reached.'; return; }
+  const off = Math.round(KSB2.clock.offset() / 1000);
+  el.textContent = Math.abs(off) <= 2
+    ? 'This phone\u2019s clock matches Backblaze\u2019s. Time-locked notes use Backblaze\u2019s clock either way.'
+    : `This phone\u2019s clock is ${Math.abs(off)} s ${off > 0 ? 'behind' : 'ahead of'} Backblaze\u2019s. Time-locked notes use Backblaze\u2019s clock.`;
+}
+
+// The line under the Backblaze fields: what the last "Save and test" found.
+function setB2Status(text, kind) {
+  const el = document.getElementById('settings-b2-status');
+  if (!el) return;
+  el.textContent = text;
+  el.dataset.kind = kind || '';
+  el.hidden = !text;
 }
 
 // Clears the installed service worker + its cached app shell, then reloads.
@@ -2538,13 +2477,29 @@ async function forceRefresh() {
   location.replace(url.toString());
 }
 
-function saveSettings() {
-  const base = document.getElementById('settings-api-base').value.trim();
-  const token = document.getElementById('settings-token').value.trim();
-  if (!base || !token) { toast('Both fields are needed'); return; }
-  if (!/^https?:\/\//i.test(base)) { toast('Worker URL should start with https://'); return; }
-  Config.setBase(base);
-  Config.setToken(token);
+async function saveSettings() {
+  const vals = {
+    endpoint: document.getElementById('settings-b2-endpoint').value,
+    bucket: document.getElementById('settings-b2-bucket').value,
+    keyId: document.getElementById('settings-b2-keyid').value,
+    appKey: document.getElementById('settings-b2-appkey').value,
+  };
+  if (!vals.endpoint.trim() || !vals.bucket.trim() || !vals.keyId.trim() || !vals.appKey.trim()) {
+    setB2Status('All four fields are needed.', 'bad');
+    return;
+  }
+  KSB2.config.set(vals);
+  const btn = document.getElementById('btn-save-settings');
+  setBusy(btn, true, 'Testing\u2026');
+  setB2Status('', '');
+  let result;
+  try { result = await KSB2.testConnection(); } finally { setBusy(btn, false); }
+  if (!result.ok) {
+    // Saved, but not closed: the message below says what to fix.
+    setB2Status(result.message, 'bad');
+    return;
+  }
+  setB2Status('Connected to your bucket.', 'ok');
   hide('overlay-settings');
   refreshNotes();
 }
@@ -2649,6 +2604,9 @@ function wireStaticEvents() {
     const files = Array.from(e.target.files || []);
     if (!files.length) return;
 
+    const mode = await askMediaQuality('photo', files);
+    if (!mode) { e.target.value = ''; return; }
+
     const attachBtn = document.getElementById('btn-attach-image');
     attachBtn.disabled = true;
     let failed = 0;
@@ -2656,10 +2614,14 @@ function wireStaticEvents() {
     let refused = 0;
     const targetNoteId = editingNoteId; // photos belong to the note they were picked for
 
+    const results = [];
     for (let i = 0; i < files.length; i++) {
-      syncBarSet(`Adding photo ${i + 1} of ${files.length}…`, i / files.length);
+      const verb = mode === 'original' ? 'Adding' : 'Compressing';
+      const what = `${verb} photo ${i + 1} of ${files.length} \u00b7 ${files[i].name} (${formatBytes(files[i].size)})`;
+      syncBarSet(`${what} \u00b7 ${Math.round(i / files.length * 100)}%`, i / files.length);
       try {
-        const dataUrl = await fileToStoredDataURL(files[i]);
+        const dataUrl = await fileToStoredDataURL(files[i], mode);
+        results.push(`${formatBytes(files[i].size)} \u2192 ${formatBytes(estimateImageBytes(dataUrl))}`);
         // Compression is slow; if you've since opened a different note, these
         // must not be attached to it.
         if (editingNoteId !== targetNoteId) { dropped++; continue; }
@@ -2671,10 +2633,11 @@ function wireStaticEvents() {
       } catch (err) {
         failed++;
       }
-      syncBarSet(`Adding photo ${i + 1} of ${files.length}…`, (i + 1) / files.length);
+      syncBarSet(`${what} \u00b7 ${Math.round((i + 1) / files.length * 100)}%`, (i + 1) / files.length);
     }
 
-    syncBarHideSoon(700);
+    if (mode === 'compressed' && results.length) syncBarSuccess(results.length === 1 ? `Compressed: ${results[0]}` : `Compressed ${results.length} photos`);
+    else syncBarHideSoon(700);
     attachBtn.disabled = false;
     e.target.value = '';
 
@@ -2735,7 +2698,7 @@ function wireStaticEvents() {
     // (the note just stays \"ready to open\"); any *changed* date must be in the future.
     const keepsDate = !!(pendingLock && pendingLock.type === 'time' && pendingLock.unlockAt
       && Math.floor(pendingLock.unlockAt / 60000) === Math.floor(unlockAt / 60000));
-    if (unlockAt <= Date.now() && !keepsDate) { err.textContent = 'Pick a time in the future.'; err.classList.remove('visually-hidden'); return; }
+    if (unlockAt <= lockNow() && !keepsDate) { err.textContent = 'Pick a time in the future.'; err.classList.remove('visually-hidden'); return; }
     pendingLock = { type: 'time', password: pw, unlockAt: keepsDate ? pendingLock.unlockAt : unlockAt, existing: false };
     hide('overlay-lock-chooser');
     renderLockSummary();
@@ -2992,7 +2955,7 @@ function renderSizeDialog(b) {
   const advice = {
     ok: 'Plenty of room.',
     heavy: 'This note is getting heavy. It will be slower to open and to sync, especially on mobile data. Moving some photos or recordings into another note keeps each one quick.',
-    danger: 'This note is close to the limit. Above about 20 MB the Worker is more likely to run out of memory or time while saving it, and the free plan is the first to struggle. Remove or split some media before adding more.',
+    danger: 'This note is close to the limit. Above about 20 MB, saving is more likely to fail, especially on a weak connection. Remove or split some content before adding more.',
     over: 'This note is over the 25 MB limit and can\u2019t be saved. Remove a photo or audio clip \u2014 or lower the quality in Settings and add them again.',
   };
   let text = advice[zone];
@@ -3021,6 +2984,7 @@ function storageUsage() {
     } else unknown++;
   }
   sized.sort((x, y) => y.bytes - x.bytes);
+  used += media; // photos and audio live in the same bucket
   const ratio = limit ? used / limit : 0;
   const zone = ratio > 1 ? 'over' : ratio >= STORAGE_DANGER_RATIO ? 'danger' : ratio >= STORAGE_WARN_RATIO ? 'heavy' : 'ok';
   return { used, limit, ratio, zone, unknown, media, count: notesCache.length, top: sized.slice(0, 3) };
@@ -3056,7 +3020,7 @@ function renderStorageSection() {
   const mediaLine = document.getElementById('storage-media');
   if (mediaLine) {
     mediaLine.hidden = !(u.media > 0 || (window.KSMedia && KSMedia.available()));
-    mediaLine.textContent = `Photos and audio in Backblaze: ${formatBytes(u.media)} of the 10 GB its free plan includes.`;
+    mediaLine.textContent = `Of that, photos and audio take ${formatBytes(u.media)}.`;
   }
 }
 
@@ -3338,6 +3302,176 @@ function deleteClip(id) {
   onEditorContentChanged();
 }
 
+
+/* ---------------------------------------------------------------------
+ * Compress saved media \u2014 any time after a photo or clip went into a note, open the note and
+ * compress it from the photo viewer or the clip's own dialog. The compressed copy replaces the
+ * original once the note saves (the original file is then removed from the bucket), so it asks
+ * first and says how much smaller it will be. Strength comes from Settings -> Compressed quality.
+ * ------------------------------------------------------------------- */
+
+let compressingSaved = false;
+
+async function compressSavedPhoto() {
+  if (compressingSaved) { toast('Another compression is still running'); return; }
+  const idx = lightboxIndex;
+  const src = editorImages[idx];
+  if (!src) return;
+  const targetNoteId = editingNoteId;
+  const before = estimateImageBytes(src);
+  const q = PHOTO_QUALITY[Config.photoQuality()];
+  const label = `Compressing photo ${idx + 1} \u00b7 ${formatBytes(before)}`;
+  compressingSaved = true;
+  closeLightbox();
+  syncBarSet(`${label} \u00b7 0%`, null);
+  try {
+    const blob = await (await fetch(src)).blob();
+    const out = await fileToCompressedDataURL(blob, q.maxDim, q.quality);
+    const after = estimateImageBytes(out);
+    syncBarSet(`${label} \u00b7 100%`, 1);
+    if (editingNoteId !== targetNoteId) { syncBarHideSoon(300); return; }
+    if (after >= before * 0.95) {
+      syncBarHideSoon(300);
+      toast('Compressing wouldn\u2019t make this photo meaningfully smaller \u2014 left as it is');
+      return;
+    }
+    syncBarHideSoon(300);
+    openConfirm('Replace with the compressed copy?',
+      `${formatBytes(before)} \u2192 ${formatBytes(after)} (${q.label}: ${q.hint}) The original is removed from this note, and the app can\u2019t get it back afterwards. Its file is cleared out of your bucket the next time this note is saved after an hour.`,
+      () => {
+        if (editingNoteId !== targetNoteId || editorImages[idx] !== src) return;
+        editorImages[idx] = out;
+        renderEditorThumbs();
+        updateSizeMeter();
+        onEditorContentChanged();
+        syncBarSuccess(`Compressed: ${formatBytes(before)} \u2192 ${formatBytes(after)}`);
+      }, 'Replace');
+  } catch (e) {
+    syncBarHideSoon(300);
+    toast('Couldn\u2019t compress that photo');
+  } finally {
+    compressingSaved = false;
+  }
+}
+
+async function compressSavedClip(id) {
+  if (compressingSaved) { toast('Another compression is still running'); return; }
+  const clip = editorAudio[id];
+  if (!clip) return;
+  const targetNoteId = editingNoteId;
+  const before = estimateImageBytes(clip.data);
+  const bps = AUDIO_QUALITY[Config.audioQuality()].bps;
+  const q = AUDIO_QUALITY[Config.audioQuality()];
+  const label = `Compressing audio clip ${clipIndex(id)} \u00b7 ${formatBytes(before)}`;
+  compressingSaved = true;
+  hide('overlay-clip');
+  syncBarSet(`${label} \u00b7 0%`, 0);
+  try {
+    const blob = await (await fetch(clip.data)).blob();
+    const out = await compressAudioFile(blob, bps,
+      (f) => syncBarSet(`${label} \u00b7 ${Math.round(f * 100)}%`, f),
+      () => editingNoteId !== targetNoteId || !editorAudio[id]);
+    if (!out || editingNoteId !== targetNoteId) { syncBarHideSoon(300); return; }
+    if (out.size >= before * 0.95) {
+      syncBarHideSoon(300);
+      toast('Compressing wouldn\u2019t make this clip meaningfully smaller \u2014 left as it is');
+      return;
+    }
+    syncBarHideSoon(300);
+    const data = await readFileAsDataURL(out);
+    const after = estimateImageBytes(data);
+    openConfirm('Replace with the compressed copy?',
+      `${formatBytes(before)} \u2192 ${formatBytes(after)} (${q.label}, ${q.bps / 1000} kbps). The original is removed from this note, and the app can\u2019t get it back afterwards. Its file is cleared out of your bucket the next time this note is saved after an hour.`,
+      () => {
+        const cur = editorAudio[id];
+        if (editingNoteId !== targetNoteId || !cur || cur.data !== clip.data) return;
+        cur.data = data;
+        if (cur.name) cur.name = cur.name.replace(/\.[^.]+$/, '') + (/mp4|aac/.test(out.type) ? '.m4a' : '.webm');
+        const old = audioUrls.get(id);
+        if (old) { URL.revokeObjectURL(old); audioUrls.delete(id); }
+        updateSizeMeter();
+        onEditorContentChanged();
+        syncBarSuccess(`Compressed: ${formatBytes(before)} \u2192 ${formatBytes(after)}`);
+      }, 'Replace');
+  } catch (e) {
+    syncBarHideSoon(300);
+    toast('Couldn\u2019t compress that clip');
+  } finally {
+    compressingSaved = false;
+  }
+}
+
+/* ---------------------------------------------------------------------
+ * Original or Compressed \u2014 asked every time photos or audio are about to be added, so nothing
+ * is ever shrunk without the person choosing it. Resolves 'original', 'compressed', or null
+ * if they cancel.
+ * ------------------------------------------------------------------- */
+
+function askMediaQuality(kind, files) {
+  return new Promise((resolve) => {
+    const list = files || [];
+    const count = list.length;
+    const total = list.reduce((n, f) => n + (f.size || 0), 0);
+    const compAudio = AUDIO_QUALITY[Config.audioQuality()];
+    let title; let summary; let origHint; let compHint;
+    if (kind === 'photo') {
+      title = count === 1 ? 'Add this photo' : `Add ${count} photos`;
+      summary = `${formatBytes(total)} as taken.`;
+      origHint = 'Exactly as taken \u2014 no resizing, no re-compression. Keeps location data.';
+      compHint = PHOTO_QUALITY[Config.photoQuality()].hint + ' Set the strength in Settings.';
+    } else if (kind === 'audio') {
+      title = count === 1 ? 'Add this audio file' : `Add ${count} audio files`;
+      summary = `${formatBytes(total)} as it is.`;
+      origHint = 'Kept byte for byte, exactly as the file is.';
+      compHint = `Re-encoded at ${compAudio.label.toLowerCase()} quality (${compAudio.bps / 1000} kbps). It runs in real time \u2014 as long as the audio plays \u2014 and needs this screen open. Kept as it is if that wouldn\u2019t make it smaller.`;
+    } else {
+      title = 'Record audio';
+      summary = 'Choose before you start \u2014 a recording can\u2019t be changed afterwards.';
+      origHint = `Highest quality the browser offers, with noise suppression, echo cancellation and auto-gain turned off. ${AUDIO_QUALITY.max.hint}`;
+      compHint = `${compAudio.label} quality with the usual noise suppression on. ${compAudio.hint}`;
+    }
+    document.getElementById('quality-title').textContent = title;
+    document.getElementById('quality-summary').textContent = summary;
+    // Every file with its own size, so the choice is an informed one.
+    const filesEl = document.getElementById('quality-files');
+    filesEl.textContent = '';
+    list.slice(0, 8).forEach((f) => {
+      const li = document.createElement('li');
+      const nm = document.createElement('span');
+      nm.className = 'qf-name';
+      nm.textContent = f.name || 'file';
+      const sz = document.createElement('span');
+      sz.className = 'qf-size';
+      sz.textContent = formatBytes(f.size || 0);
+      li.append(nm, sz);
+      filesEl.appendChild(li);
+    });
+    if (list.length > 8) {
+      const li = document.createElement('li');
+      li.className = 'qf-more';
+      li.textContent = `+ ${list.length - 8} more`;
+      filesEl.appendChild(li);
+    }
+    filesEl.hidden = !list.length;
+
+    // Fresh buttons each time, so an old choice's listener can't fire again.
+    const wire = (id, label, hint, value) => {
+      const old = document.getElementById(id);
+      const btn = old.cloneNode(true);
+      old.parentNode.replaceChild(btn, old);
+      if (label !== null) {
+        btn.querySelector('.q-title').textContent = label;
+        btn.querySelector('.q-hint').textContent = hint;
+      }
+      btn.addEventListener('click', () => { hide('overlay-quality'); resolve(value); });
+    };
+    wire('btn-quality-original', 'Original', origHint, 'original');
+    wire('btn-quality-compressed', 'Compressed', compHint, 'compressed');
+    wire('btn-quality-cancel', null, null, null);
+    show('overlay-quality');
+  });
+}
+
 // ---- attaching audio files ----
 
 function probeAudioDuration(url) {
@@ -3357,17 +3491,91 @@ function probeAudioDuration(url) {
   });
 }
 
+// Re-encodes an audio file at a lower bitrate. A browser has no way to do that faster than the
+// audio plays, so this plays the file silently into a recorder: it takes as long as the audio lasts.
+// Resolves with a Blob, or null if `shouldStop()` turned true part-way.
+async function compressAudioFile(file, bps, onProgress, shouldStop) {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC || !window.MediaRecorder) throw new Error('This browser can\u2019t compress audio.');
+  const mime = pickRecorderMime();
+  const url = URL.createObjectURL(file);
+  const audio = new Audio();
+  audio.preload = 'auto';
+  audio.src = url;
+  const ctx = new AC();
+  const chunks = [];
+  let rec = null;
+  let timer = 0;
+  let stopped = false;
+  try {
+    await ctx.resume();
+    const source = ctx.createMediaElementSource(audio);
+    const dest = ctx.createMediaStreamDestination();
+    source.connect(dest); // deliberately not connected to the speakers
+    rec = new MediaRecorder(dest.stream, { ...(mime ? { mimeType: mime } : {}), audioBitsPerSecond: bps });
+    rec.ondataavailable = (ev) => { if (ev.data && ev.data.size) chunks.push(ev.data); };
+    const finished = new Promise((resolve, reject) => {
+      rec.onstop = resolve;
+      rec.onerror = () => reject(new Error('Compression failed'));
+      audio.onended = () => { if (rec.state !== 'inactive') rec.stop(); };
+      audio.onerror = () => reject(new Error('Couldn\u2019t play that file to compress it'));
+    });
+    timer = setInterval(() => {
+      if (shouldStop && shouldStop()) {
+        stopped = true;
+        audio.pause();
+        if (rec.state !== 'inactive') rec.stop();
+        return;
+      }
+      if (onProgress && isFinite(audio.duration) && audio.duration > 0) onProgress(Math.min(1, audio.currentTime / audio.duration));
+    }, 400);
+    rec.start(1000);
+    await audio.play();
+    await finished;
+    if (stopped || !chunks.length) return null;
+    return new Blob(chunks, { type: rec.mimeType || mime || 'audio/webm' });
+  } finally {
+    clearInterval(timer);
+    if (rec && rec.state !== 'inactive') { try { rec.stop(); } catch (e) { /* already stopped */ } }
+    try { audio.pause(); } catch (e) { /* nothing playing */ }
+    audio.removeAttribute('src');
+    try { ctx.close(); } catch (e) { /* already closed */ }
+    URL.revokeObjectURL(url);
+  }
+}
+
 async function attachAudioFiles(files) {
+  const mode = await askMediaQuality('audio', files);
+  if (!mode) return 0;
   const targetNoteId = editingNoteId;
   let added = 0;
   let refused = 0;
   let unreadable = 0;
-  for (const file of files) {
+  let keptOriginal = 0;
+  const audioResults = [];
+  for (let n = 0; n < files.length; n++) {
+    const file = files[n];
     const ext = ((/\.([a-z0-9]+)$/i.exec(file.name) || [])[1] || '').toLowerCase();
     if (!/^audio\//.test(file.type) && !EXT_MIME[ext]) { unreadable++; continue; }
     if (!canFitMedia(Math.ceil(file.size * 4 / 3) + 40).ok) { refused++; continue; }
     try {
-      let data = await readFileAsDataURL(file);
+      let blob = file;
+      let name = file.name;
+      if (mode === 'compressed') {
+        const base = `Compressing audio ${n + 1} of ${files.length} \u00b7 ${file.name} (${formatBytes(file.size)})`;
+        syncBarSet(`${base} \u00b7 0%`, 0);
+        try {
+          const out = await compressAudioFile(file, AUDIO_QUALITY[Config.audioQuality()].bps,
+            (f) => syncBarSet(`${base} \u00b7 ${Math.round(f * 100)}%`, f), () => editingNoteId !== targetNoteId);
+          if (editingNoteId !== targetNoteId) break;
+          if (out && out.size < file.size) {
+            blob = out;
+            name = file.name.replace(/\.[^.]+$/, '') + (/mp4|aac/.test(out.type) ? '.m4a' : '.webm');
+            audioResults.push(`${formatBytes(file.size)} \u2192 ${formatBytes(out.size)}`);
+          } else keptOriginal++;
+        } catch (e) { keptOriginal++; }
+      }
+      let data = await readFileAsDataURL(blob);
       if (!/^data:audio\//.test(data)) data = data.replace(/^data:[^;,]*/, 'data:' + (EXT_MIME[ext] || 'audio/mpeg'));
       if (editingNoteId !== targetNoteId) break;
       const url = URL.createObjectURL(file);
@@ -3375,12 +3583,17 @@ async function attachAudioFiles(files) {
       URL.revokeObjectURL(url);
       if (editingNoteId !== targetNoteId) break;
       if (!canFitMedia(data.length + 4).ok) { refused++; continue; }
-      addAudioClip({ data, dur, name: file.name });
+      addAudioClip({ data, dur, name });
       added++;
     } catch (e) { unreadable++; }
   }
+  if (mode === 'compressed') {
+    if (audioResults.length) syncBarSuccess(audioResults.length === 1 ? `Compressed: ${audioResults[0]}` : `Compressed ${audioResults.length} audio files`);
+    else syncBarHideSoon(300);
+  }
   if (refused) toast(refused === 1 ? `A file wasn\u2019t added \u2014 it would push this note over ${limitWord()}` : `${refused} files weren\u2019t added \u2014 they would push this note over ${limitWord()}`);
   else if (unreadable) toast(unreadable === 1 ? 'Couldn\u2019t read that file as audio' : `Couldn\u2019t read ${unreadable} of those files as audio`);
+  else if (keptOriginal) toast(keptOriginal === 1 ? 'Kept the original \u2014 compressing wouldn\u2019t have made it smaller' : `Kept ${keptOriginal} originals \u2014 compressing wouldn\u2019t have made them smaller`);
   return added;
 }
 
@@ -3389,7 +3602,7 @@ async function attachAudioFiles(files) {
 const Rec = {
   state: 'idle', stream: null, recorder: null, chunks: [], bytes: 0, t0: 0, stopAt: 0, tick: 0,
   ctx: null, analyser: null, buf: null, blob: null, dur: 0, previewUrl: null, discard: false,
-  baseBytes: 0, autoStopped: false,
+  baseBytes: 0, autoStopped: false, bps: 0, mode: '',
 };
 
 function recorderSupported() {
@@ -3411,13 +3624,12 @@ function micErrorText(e) {
   return 'Couldn\u2019t start the microphone.';
 }
 
-function overlayIsProtected(id) { return id === 'overlay-record' && Rec.state !== 'idle'; }
+function overlayIsProtected(id) { return (id === 'overlay-record' && Rec.state !== 'idle') || id === 'overlay-quality'; }
 
 function openRecorder() {
   recorderTeardown();
   setRecState('idle');
-  const q = AUDIO_QUALITY[Config.audioQuality()];
-  document.getElementById('record-quality').textContent = `Quality: ${q.label}. ${q.hint} Change it in Settings.`;
+  document.getElementById('record-quality').textContent = 'You\u2019ll choose Original or Compressed when you start recording or attach a file.';
   showRecError('');
   const ok = recorderSupported();
   document.getElementById('btn-record-start').disabled = !ok;
@@ -3481,7 +3693,7 @@ function projectedStored(bytesSoFar) { // what a clip of this many raw bytes add
 
 function updateRecUI() {
   if (Rec.state !== 'recording') return;
-  const q = AUDIO_QUALITY[Config.audioQuality()];
+  const q = { bps: Rec.bps || AUDIO_QUALITY[Config.audioQuality()].bps };
   const elapsed = (performance.now() - Rec.t0) / 1000;
   document.getElementById('record-timer').textContent = mmss(elapsed);
   document.getElementById('record-level').style.setProperty('--level', readLevel().toFixed(2));
@@ -3506,12 +3718,21 @@ function guardRecordingSize() {
 async function startRecording() {
   showRecError('');
   if (!recorderSupported()) { showRecError('Recording isn\u2019t available here. You can still attach an audio file.'); return; }
+  const mode = await askMediaQuality('record');
+  if (!mode) return;
+  // Original: the browser's own noise suppression, echo cancellation and auto-gain are switched off
+  // (they muddy music and quiet sounds), and the recorder runs at its highest quality.
+  const constraints = mode === 'original'
+    ? { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+    : true;
   let stream;
-  try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+  try { stream = await navigator.mediaDevices.getUserMedia({ audio: constraints }); }
   catch (e) { showRecError(micErrorText(e)); return; }
   if (document.getElementById('overlay-record').classList.contains('hidden')) { stream.getTracks().forEach((t) => t.stop()); return; }
   const mime = pickRecorderMime();
-  const q = AUDIO_QUALITY[Config.audioQuality()];
+  const q = mode === 'original' ? AUDIO_QUALITY.max : AUDIO_QUALITY[Config.audioQuality()];
+  Rec.bps = q.bps;
+  Rec.mode = mode;
   let recorder;
   try { recorder = new MediaRecorder(stream, { ...(mime ? { mimeType: mime } : {}), audioBitsPerSecond: q.bps }); }
   catch (e) { try { recorder = new MediaRecorder(stream); } catch (e2) { stream.getTracks().forEach((t) => t.stop()); showRecError('Couldn\u2019t start recording in this browser.'); return; } }
@@ -3631,6 +3852,7 @@ function setupMedia() {
   });
 
   document.getElementById('btn-clip-download').addEventListener('click', () => { if (clipDialogId) downloadClip(clipDialogId); });
+  document.getElementById('btn-clip-compress').addEventListener('click', () => { if (clipDialogId) compressSavedClip(clipDialogId); });
   document.getElementById('btn-clip-delete').addEventListener('click', () => {
     const id = clipDialogId;
     if (!id) return;
@@ -3642,11 +3864,6 @@ function setupMedia() {
   const audioSel = document.getElementById('settings-audio-quality');
   photoSel.addEventListener('change', () => { Config.setPhotoQuality(photoSel.value); document.getElementById('settings-photo-hint').textContent = PHOTO_QUALITY[photoSel.value].hint; });
   audioSel.addEventListener('change', () => { Config.setAudioQuality(audioSel.value); document.getElementById('settings-audio-hint').textContent = AUDIO_QUALITY[audioSel.value].hint; });
-  document.getElementById('settings-media-on').addEventListener('change', (e) => {
-    if (window.KSMedia) KSMedia.setUserEnabled(e.target.checked);
-    fillMediaSettings();
-    if (!document.getElementById('overlay-editor').classList.contains('hidden')) updateSizeMeter();
-  });
   document.getElementById('settings-storage-limit').addEventListener('change', (e) => {
     const n = Number(e.target.value);
     if (n >= 50) Config.setStorageLimitMB(n);
@@ -4111,11 +4328,11 @@ function init() {
   setupRichText();
   setupMedia();
   setupInk();
-  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.6.0');
+  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.8.0');
 
   // Connectivity: react the moment the browser notices, and keep retrying
   // on a timer since navigator.onLine can't see a connection that's up but
-  // not actually reaching the Worker.
+  // not actually reaching Backblaze.
   window.addEventListener('online', () => { setOnline(true); flushOutbox(); });
   window.addEventListener('offline', () => setOnline(false));
   setInterval(() => { if (navigator.onLine && outboxCount > 0) flushOutbox(); }, 30000);
@@ -4123,7 +4340,7 @@ function init() {
 
   if (!Config.configured()) {
     openSettings();
-    toast('Add your Worker URL and access token to get started');
+    toast('Add your Backblaze bucket details to get started');
   } else {
     refreshNotes().then(checkForRecoverableDrafts);
   }
