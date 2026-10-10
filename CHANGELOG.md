@@ -6,6 +6,31 @@ All notable changes to this project are recorded here, following
 small — gets a version bump. If the version number hasn't moved,
 nothing changed; that's the whole point of keeping one.
 
+## v1.8.1 — 2026-10-10
+
+- **The size at the top of a note is the whole note now.** It used to read "x / 25 MB" and ignore
+  photos and audio, so a note with a 4 MB photo showed 0.0. It now adds up text, drawing, photos and
+  audio against the real limit, 150 MB per note (50 MB "getting heavy", 100 MB "close to the limit").
+  The details dialog, the recorder's size line and every "over the limit" message use the same figures.
+  One photo or clip may be up to 90 MB; the written part alone up to 25 MB.
+- **Original / Compressed now has an OK button.** Tapping an option only selects it (Original is
+  pre-selected); nothing happens until OK. Cancel and Escape add nothing.
+- **Recorded audio playback:** the clip's player no longer waits on an asynchronous step before
+  starting, which browsers such as Safari treat as "not started by a tap" and refuse. When a browser
+  does refuse, or can't play the format, it now says so instead of staying silent. The progress fill
+  works for recordings, which report no length. A recording that is silent or almost silent is flagged
+  on the review screen before it is added.
+- **Cards:** the lock pill and the "Not synced" pill touched each other and sat at different heights.
+  They now share one shape in a wrapping row with a gap, on every kind of card; the date row wraps
+  instead of squashing, and the buttons on locked cards line up with the card's edge.
+- **Error messages** (wrong password, passwords don't match, ...) were plain black because the
+  style only matched an error inside a form field; they are red, with an icon, now.
+- Smaller: the progress bar's label wraps so the percentage is never cut off; the lightbox's
+  "Compress this photo" button is 44px and its focus ring shows on the dark backdrop; "Restore"
+  (draft) is no longer a red delete-style button; a photo with no file type keeps image/* so it
+  reopens; autosave timing is based on the written part only; the header badge no longer starts as
+  "v1.5.0"; duplicate CSS rules merged. Service worker cache bumped to v16.
+
 ## v1.8.0 — 2026-10-09
 
 - **Time-locked notes use Backblaze's clock.** Opening one asks Backblaze for the time right then,

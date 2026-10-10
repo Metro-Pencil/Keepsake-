@@ -177,40 +177,46 @@ function readFileAsDataURL(file) {
 async function fileToStoredDataURL(file, mode) {
   if (mode === 'original') {
     await loadImageFromFile(file);
-    return readFileAsDataURL(file);
+    let url = await readFileAsDataURL(file);
+    // Some files arrive with no type at all; a note only reopens photos whose data: URL says image/...
+    if (!/^data:image\//.test(url)) {
+      const ext = ((/\.([a-z0-9]+)$/i.exec(file.name) || [])[1] || '').toLowerCase();
+      const guess = { png: 'image/png', gif: 'image/gif', webp: 'image/webp', avif: 'image/avif', heic: 'image/heic', heif: 'image/heif', bmp: 'image/bmp' }[ext] || 'image/jpeg';
+      url = url.replace(/^data:[^;,]*/, 'data:' + guess);
+    }
+    return url;
   }
   const q = PHOTO_QUALITY[Config.photoQuality()];
   return fileToCompressedDataURL(file, q.maxDim, q.quality);
 }
 
 /* ---------------------------------------------------------------------
- * Size limits.
- *   25 MB   the most one note's own content (text, formatting, drawing) may take. Photos and
- *           audio are separate files in the bucket and don't count toward it.
- *   12 MB   from here a note is slow to open and sync, especially on mobile data.
- *   20 MB   from here saving is more likely to fail on a weak connection.
+ * Size limits. A note is its written part (text, formatting, drawing) plus its photos and audio,
+ * which are separate files in the bucket (media.js). The figure shown at the top of the editor is
+ * the WHOLE note \u2014 all of that added up \u2014 against the one limit that really applies to it.
+ *   150 MB  the most one note may carry in total (photos and audio are held in memory while a
+ *           note is open, so there has to be a ceiling).
+ *    90 MB  the most one photo or clip may be.
+ *    25 MB  the most the written part alone may take (it is saved as one file and re-sent whole).
+ *    50 MB  from here a note is slower to open for the first time on a new device or on mobile data.
+ *   100 MB  from here you are close to the limit.
  * ------------------------------------------------------------------- */
-const NOTE_SIZE_LIMIT = 25 * 1024 * 1024;
-const NOTE_HEAVY_BYTES = 12 * 1024 * 1024;
-const NOTE_DANGER_BYTES = 20 * 1024 * 1024;
-// Photos and audio (media.js) don't count toward the 25 MB above \u2014 the note only keeps small
-// references. They are still held in memory while a note is open, so there is a ceiling on how
-// much one note carries. (Sizes here are base64 text lengths.)
-const MEDIA_ITEM_MAX_CHARS = 120 * 1024 * 1024;  // one file, about 90 MB of real data
-const MEDIA_NOTE_MAX_CHARS = 200 * 1024 * 1024;  // all of a note's photos + audio, about 150 MB
-function limitWord() { return mediaOffloadOn() ? 'its 150 MB of photos and audio' : '25 MB'; }
-function mediaOffloadOn() { return !!(window.KSMedia && KSMedia.enabled()); }
-function mediaZone(chars) {
-  const r = chars / MEDIA_NOTE_MAX_CHARS;
-  return r > 1 ? 'over' : r >= 0.85 ? 'danger' : r >= 0.6 ? 'heavy' : 'ok';
-}
+const MB = 1024 * 1024;
+const NOTE_TOTAL_LIMIT = 150 * MB;
+const NOTE_HEAVY_BYTES = 50 * MB;
+const NOTE_DANGER_BYTES = 100 * MB;
+const NOTE_TEXT_LIMIT = 25 * MB;
+const MEDIA_ITEM_MAX_BYTES = 90 * MB;
+const NOTE_LIMIT_LABEL = '150 MB';
+function limitWord() { return 'the ' + NOTE_LIMIT_LABEL + ' limit'; }
 const STORAGE_WARN_RATIO = 0.7;
 const STORAGE_DANGER_RATIO = 0.9;
 
-function noteSizeZone(bytes) {
-  if (bytes > NOTE_SIZE_LIMIT) return 'over';
-  if (bytes >= NOTE_DANGER_BYTES) return 'danger';
-  if (bytes >= NOTE_HEAVY_BYTES) return 'heavy';
+// `total` is everything in the note; `content` is just its written part as it will be stored.
+function noteSizeZone(total, content) {
+  if (total > NOTE_TOTAL_LIMIT || (content || 0) > NOTE_TEXT_LIMIT) return 'over';
+  if (total >= NOTE_DANGER_BYTES) return 'danger';
+  if (total >= NOTE_HEAVY_BYTES) return 'heavy';
   return 'ok';
 }
 
@@ -220,8 +226,9 @@ function noteSizeZone(bytes) {
 function noteSizeBreakdown() {
   const body = document.getElementById('editor-body');
   const text = utf8Len(document.getElementById('editor-title').value) + utf8Len(body.innerHTML) * 2; // html + its plain-text copy
+  // Photos and audio: their real size (what the bucket stores). Only a short reference to each stays in the note itself.
   let photos = 0;
-  for (const src of editorImages) photos += src.length + 4;
+  for (const src of editorImages) photos += estimateImageBytes(src);
   let audio = 0;
   let clips = 0;
   const seen = new Set();
@@ -229,31 +236,22 @@ function noteSizeBreakdown() {
     const id = el.getAttribute('data-id');
     if (seen.has(id) || !editorAudio[id]) return;
     seen.add(id);
-    audio += editorAudio[id].data.length + 120;
+    audio += estimateImageBytes(editorAudio[id].data);
     clips++;
   });
   const drawing = inkEstimateBytes();
-  // Offloaded media: only a reference + manifest entry stays in the note.
-  const mediaChars = photos + audio;
-  const offload = mediaOffloadOn();
-  let offloaded = 0;
-  if (offload) {
-    offloaded = Math.round(mediaChars * 3 / 4);
-    photos = editorImages.length * 160;
-    audio = clips * 260;
-  }
-  let total = 160 + text + photos + audio + drawing;
+  const refs = editorImages.length * 160 + clips * 260;
+  let content = 160 + text + refs + drawing; // the written part, as the note file will hold it
   const locked = lockIsActive();
   let lockExtra = 0;
   if (locked) {
-    const encrypted = Math.ceil((total + 16) * 4 / 3) + 80;
-    lockExtra = encrypted - total;
-    total = encrypted;
+    const encrypted = Math.ceil((content + 16) * 4 / 3) + 80; // encrypted data is stored as text, about a third bigger
+    lockExtra = encrypted - content;
+    content = encrypted;
   }
-  return { text, photos, photoCount: editorImages.length, audio, clips, drawing, lockExtra, locked, total, offload, offloaded, mediaChars };
+  const media = photos + audio;
+  return { text, photos, photoCount: editorImages.length, audio, clips, drawing, lockExtra, locked, content, media, total: content + media };
 }
-
-function estimateContentBytes() { return noteSizeBreakdown().total; }
 
 // Cheap fingerprint of a big base64 string (length + 48 sampled characters),
 // so "did the photos/audio change?" doesn't mean comparing megabytes of text.
@@ -287,11 +285,10 @@ function snapshotKey(snapshot) {
 // Precise-enough byte size of one compressed photo, straight from its
 // base64 data URL — used both for the per-photo size shown under each
 // thumbnail/in the lightbox, and (summed) for the 25MB ceiling check above.
-function estimateImageBytes(dataUrl) {
-  const comma = dataUrl.indexOf(',');
-  const base64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
-  const len = base64.length;
-  const padding = base64.endsWith('==') ? 2 : base64.endsWith('=') ? 1 : 0;
+function estimateImageBytes(dataUrl) { // works for any base64 data: URL, audio included
+  dataUrl = String(dataUrl || '');
+  const len = dataUrl.length - (dataUrl.indexOf(',') + 1);
+  const padding = dataUrl.endsWith('==') ? 2 : dataUrl.endsWith('=') ? 1 : 0;
   return Math.max(0, Math.round((len * 3) / 4) - padding);
 }
 
@@ -1153,7 +1150,7 @@ function cardHTML(meta) {
   return `
     <article class="card ${typeClass}${revealedClass}">
       <div class="card-open" data-action="open" data-id="${escapeHTML(meta.id)}" role="button" tabindex="0">
-        ${pill}${pendingBadge}
+        <div class="card-badges">${pill}${pendingBadge}</div>
         <div class="${titleClass}">${escapeHTML(titleText)}</div>
         <div class="card-snippet">${escapeHTML(snippet)}</div>
       </div>
@@ -1637,7 +1634,8 @@ async function maybeOfferDraftRestore(noteId, serverContent) {
       onEditorContentChanged();
       toast('Draft restored');
     },
-    'Restore'
+    'Restore',
+    true
   );
 }
 
@@ -1890,7 +1888,7 @@ function onEditorContentChanged() {
 
   // Every save re-sends the whole note, so a heavy note waits a little
   // longer between autosaves.
-  const delay = Math.min(10000, 2000 + Math.floor(lastNoteBytes / 1048576) * 1000);
+  const delay = Math.min(10000, 2000 + Math.floor(lastNoteBytes / MB) * 1000);
   clearTimeout(serverSyncDebounce);
   serverSyncDebounce = setTimeout(triggerAutosave, delay);
 
@@ -1924,10 +1922,11 @@ function stopAutosaveTimers() {
 
 function closeEditorAndSync(isExplicitSave) {
   const noteId = editingNoteId;
-  const overLimit = noteSizeBreakdown().total > NOTE_SIZE_LIMIT;
+  const problem = sizeProblem(noteSizeBreakdown());
+  const overLimit = !!problem;
 
   if (overLimit && isExplicitSave) {
-    toast('This note is over the 25 MB limit — remove a photo or an audio clip before saving.');
+    toast(problem + ' Fix that, then save.');
     return;
   }
 
@@ -1953,7 +1952,7 @@ function closeEditorAndSync(isExplicitSave) {
     saveDraftNow(noteId);
     hide('overlay-editor');
     currentUnlockCreds = null;
-    toast('Kept on this device only — this note is over the 25 MB limit. Remove a photo or clip to sync it.');
+    toast('Kept on this device only \u2014 ' + problem.charAt(0).toLowerCase() + problem.slice(1) + ' Fix that to sync it.');
     return;
   }
 
@@ -2372,12 +2371,14 @@ async function downloadNote(id) {
  * Confirm modal
  * ------------------------------------------------------------------- */
 
-function openConfirm(title, message, onYes, yesLabel = 'Delete') {
+function openConfirm(title, message, onYes, yesLabel = 'Delete', calm = false) {
   document.getElementById('confirm-title').textContent = title;
   document.getElementById('confirm-message').textContent = message;
   const yesBtn = document.getElementById('btn-confirm-yes');
   const freshYes = yesBtn.cloneNode(true);
   freshYes.textContent = yesLabel;
+  // Only things that throw something away get the red button; "Restore" is not one of them.
+  freshYes.className = 'btn ' + (calm ? 'btn-primary' : 'btn-danger');
   yesBtn.parentNode.replaceChild(freshYes, yesBtn);
   freshYes.addEventListener('click', async () => {
     hide('overlay-confirm');
@@ -2412,7 +2413,7 @@ function openSettings() {
   document.getElementById('settings-b2-appkey').value = c.appKey();
   setB2Status('', '');
   fillClockLine();
-  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.8.0';
+  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.8.1';
   fillQualitySettings();
   show('overlay-settings');
   renderStorageSection();
@@ -2893,7 +2894,14 @@ let lastNoteBytes = 0;
 let sizeMeterTimer = null;
 let lastWarnedZone = 'ok';
 
-function mb1(bytes) { return (bytes / 1048576).toFixed(1); }
+function mb1(bytes) { return (bytes / MB).toFixed(1); }
+
+// Why a note can't be saved right now, or '' if it can.
+function sizeProblem(b) {
+  if (b.content > NOTE_TEXT_LIMIT) return 'The written part of this note (text and drawing) is over 25 MB.';
+  if (b.total > NOTE_TOTAL_LIMIT) return 'This note is over the ' + NOTE_LIMIT_LABEL + ' limit \u2014 remove a photo or an audio clip.';
+  return '';
+}
 
 function scheduleSizeMeter() {
   clearTimeout(sizeMeterTimer);
@@ -2905,61 +2913,58 @@ function updateSizeMeter() {
   const btn = document.getElementById('btn-size');
   if (!btn) return;
   const b = noteSizeBreakdown();
-  lastNoteBytes = b.total;
-  const zone = noteSizeZone(b.total);
+  lastNoteBytes = b.content;
+  const zone = noteSizeZone(b.total, b.content);
   btn.dataset.zone = zone;
   document.getElementById('size-icon').innerHTML = ZONE_ICON[zone];
-  document.getElementById('size-text').textContent = `${mb1(b.total)} / 25 MB`;
-  document.getElementById('size-fill').style.transform = `scaleX(${Math.min(1, b.total / NOTE_SIZE_LIMIT).toFixed(4)})`;
-  btn.setAttribute('aria-label', `Note size: ${mb1(b.total)} of 25 megabytes. ${ZONE_WORD[zone]}. Open details.`);
+  document.getElementById('size-text').textContent = `${formatBytes(b.total)} / ${NOTE_LIMIT_LABEL}`;
+  document.getElementById('size-fill').style.transform = `scaleX(${Math.min(1, b.total / NOTE_TOTAL_LIMIT).toFixed(4)})`;
+  btn.setAttribute('aria-label', `Note size: ${formatBytes(b.total)} of 150 megabytes. ${ZONE_WORD[zone]}. Open details.`);
   if (!document.getElementById('overlay-size').classList.contains('hidden')) renderSizeDialog(b);
 }
 
 // A toast only when a note first crosses into a worse level — not on every keystroke.
 function warnIfHeavy() {
-  const zone = noteSizeZone(noteSizeBreakdown().total);
+  const b = noteSizeBreakdown();
+  const zone = noteSizeZone(b.total, b.content);
   const order = ['ok', 'heavy', 'danger', 'over'];
   if (order.indexOf(zone) > order.indexOf(lastWarnedZone)) {
     if (zone === 'heavy') toast('This note is getting heavy \u2014 see the size indicator at the top.');
-    if (zone === 'danger') toast('This note is close to the size limit. Saving may fail \u2014 consider moving some media elsewhere.');
-    if (zone === 'over') toast('This note is over the 25 MB limit and can\u2019t be saved until you remove something.');
+    if (zone === 'danger') toast('This note is close to the ' + NOTE_LIMIT_LABEL + ' limit \u2014 consider moving some photos or audio to another note.');
+    if (zone === 'over') toast(sizeProblem(b) + ' It can\u2019t be saved until you fix that.');
   }
   lastWarnedZone = zone;
 }
 
 function renderSizeDialog(b) {
   b = b || noteSizeBreakdown();
-  const zone = noteSizeZone(b.total);
+  const zone = noteSizeZone(b.total, b.content);
   document.getElementById('size-status').innerHTML =
     `<span class="size-badge" data-zone="${zone}">${ZONE_ICON[zone]}<span>${ZONE_WORD[zone]}</span></span>` +
-    `<span class="size-figure">${mb1(b.total)} MB of 25 MB</span>`;
+    `<span class="size-figure">${formatBytes(b.total)} of ${NOTE_LIMIT_LABEL}</span>`;
   const meter = document.getElementById('size-dialog-meter');
   meter.dataset.zone = zone;
-  meter.setAttribute('aria-valuenow', String(Math.round(b.total / 1048576 * 10) / 10));
-  document.getElementById('size-dialog-fill').style.transform = `scaleX(${Math.min(1, b.total / NOTE_SIZE_LIMIT).toFixed(4)})`;
+  meter.setAttribute('aria-valuenow', String(Math.round(b.total / MB * 10) / 10));
+  document.getElementById('size-dialog-fill').style.transform = `scaleX(${Math.min(1, b.total / NOTE_TOTAL_LIMIT).toFixed(4)})`;
 
   const rows = [['Text', b.text]];
-  if (b.offload) {
-    if (b.photoCount || b.clips) rows.push([`Photos & audio (${b.photoCount + b.clips}) \u2014 in Backblaze`, b.offloaded, true]);
-  } else {
-    if (b.photoCount) rows.push([`Photos (${b.photoCount})`, b.photos]);
-    if (b.clips) rows.push([`Audio (${b.clips} clip${b.clips === 1 ? '' : 's'})`, b.audio]);
-  }
+  if (b.photoCount) rows.push([`Photos (${b.photoCount})`, b.photos]);
+  if (b.clips) rows.push([`Audio (${b.clips} clip${b.clips === 1 ? '' : 's'})`, b.audio]);
   if (b.drawing) rows.push(['Drawing', b.drawing]);
   if (b.locked) rows.push(['Lock encryption', b.lockExtra]);
-  document.getElementById('size-rows').innerHTML = rows.map(([label, bytes, noBar]) =>
+  document.getElementById('size-rows').innerHTML = rows.map(([label, bytes]) =>
     `<li><span class="size-row-label">${escapeHTML(label)}</span>` +
-    `<span class="size-row-bar" aria-hidden="true"><span style="transform:scaleX(${noBar ? '0' : Math.min(1, bytes / Math.max(1, b.total)).toFixed(3)})"></span></span>` +
+    `<span class="size-row-bar" aria-hidden="true"><span style="transform:scaleX(${Math.min(1, bytes / Math.max(1, b.total)).toFixed(3)})"></span></span>` +
     `<span class="size-row-value">${formatBytes(bytes)}</span></li>`).join('');
 
   const advice = {
     ok: 'Plenty of room.',
-    heavy: 'This note is getting heavy. It will be slower to open and to sync, especially on mobile data. Moving some photos or recordings into another note keeps each one quick.',
-    danger: 'This note is close to the limit. Above about 20 MB, saving is more likely to fail, especially on a weak connection. Remove or split some content before adding more.',
-    over: 'This note is over the 25 MB limit and can\u2019t be saved. Remove a photo or audio clip \u2014 or lower the quality in Settings and add them again.',
+    heavy: 'This note is getting heavy. Opening it for the first time on another device, or on mobile data, will take a while. Moving some photos or recordings into another note keeps each one quick.',
+    danger: 'This note is close to the ' + NOTE_LIMIT_LABEL + ' limit. Remove or split some photos or audio before adding more.',
+    over: (sizeProblem(b) || 'This note is over its size limit.') + ' It can\u2019t be saved until you fix that \u2014 or add photos and audio again as Compressed.',
   };
   let text = advice[zone];
-  if (b.offload && b.offloaded) text += ` ${mb1(b.offloaded)} MB of photos and audio is stored in Backblaze and doesn\u2019t count toward this limit.`;
+  text += ' Photos and audio are kept as separate files in your bucket, but they count toward the note\u2019s size here.';
   if (b.locked) text += ' Locked notes are about a third bigger than their contents, because encrypted data is stored as text.';
   document.getElementById('size-advice').textContent = text;
   document.getElementById('size-advice-icon').innerHTML = ZONE_ICON[zone];
@@ -3169,21 +3174,16 @@ function addAudioClip(clip) {
 }
 
 // Would this much more stored data still fit in the note?
+// `storedLen` is the length of the base64 data: URL.
 function canFitMedia(storedLen) {
   const b = noteSizeBreakdown();
-  if (b.offload) {
-    const itemOk = storedLen <= MEDIA_ITEM_MAX_CHARS;
-    return {
-      ok: itemOk && b.mediaChars + storedLen <= MEDIA_NOTE_MAX_CHARS,
-      projected: b.total + 300,
-      message: itemOk ? 'That would make this note\u2019s photos and audio more than 150 MB.' : 'That file is over the 90 MB limit.',
-    };
-  }
-  const projected = b.total + Math.ceil(storedLen * (b.locked ? 4 / 3 : 1));
+  const add = Math.ceil(storedLen * 3 / 4);
+  const itemOk = add <= MEDIA_ITEM_MAX_BYTES;
+  const projected = b.total + add + 300;
   return {
-    ok: projected <= NOTE_SIZE_LIMIT,
+    ok: itemOk && projected <= NOTE_TOTAL_LIMIT,
     projected,
-    message: `That would make this note ${mb1(projected)} MB \u2014 over the 25 MB limit.`,
+    message: itemOk ? `That would make this note ${formatBytes(projected)} \u2014 over the ${NOTE_LIMIT_LABEL} limit.` : 'That file is over the 90 MB limit.',
   };
 }
 
@@ -3192,21 +3192,41 @@ function canFitMedia(storedLen) {
 const Player = { el: null, id: null };
 const audioUrls = new Map(); // clip id -> blob: URL
 
+// Why a clip didn't play, in words. (Safari in particular refuses to start sound that isn't begun
+// directly by a tap, and some browsers can't play WebM at all.)
+function playbackProblem(err) {
+  const n = err && err.name;
+  if (n === 'AbortError') return ''; // another clip was started over this one \u2014 not a problem
+  if (n === 'NotAllowedError') return 'Your browser blocked the sound \u2014 tap play again.';
+  if (n === 'NotSupportedError') return 'This browser can\u2019t play this kind of audio. Open \u22ef and use Download to listen elsewhere.';
+  return 'Couldn\u2019t play this clip.';
+}
+
 function ensurePlayer() {
   if (Player.el) return Player.el;
   const el = new Audio();
   el.preload = 'auto';
   ['play', 'pause', 'ended', 'timeupdate'].forEach((ev) => el.addEventListener(ev, syncChipStates));
+  el.addEventListener('error', () => {
+    if (!Player.id || !el.getAttribute('src')) return;
+    toast(el.error && el.error.code === 4 ? playbackProblem({ name: 'NotSupportedError' }) : 'Couldn\u2019t play this clip.');
+    syncChipStates();
+  });
   Player.el = el;
   return el;
 }
 
-async function audioUrl(id) {
+// Turns a clip's data: URL into a playable blob: URL right away (no network or promise in
+// between). Starting playback has to happen inside the tap itself or Safari refuses it, and the old
+// version waited on an asynchronous fetch() first \u2014 which is why a recording could sit there silent.
+function audioUrlSync(id) {
   if (audioUrls.has(id)) return audioUrls.get(id);
   const clip = editorAudio[id];
   if (!clip) return null;
-  const blob = await (await fetch(clip.data)).blob();
-  const url = URL.createObjectURL(blob);
+  const comma = clip.data.indexOf(',');
+  let type = clip.data.slice(5, comma).replace(/;base64$/i, '');
+  if (!/^audio\//i.test(type)) type = 'audio/mpeg';
+  const url = URL.createObjectURL(new Blob([b64ToBytes(clip.data.slice(comma + 1))], { type }));
   audioUrls.set(id, url);
   return url;
 }
@@ -3228,30 +3248,32 @@ function syncChipStates() {
     chip.classList.toggle('is-playing', playing);
     const btn = chip.querySelector('.audio-play');
     if (btn) btn.setAttribute('aria-pressed', String(playing));
-    const d = el && el.duration;
-    chip.style.setProperty('--p', mine && d && isFinite(d) ? Math.min(1, el.currentTime / d).toFixed(3) : '0');
+    // A recording straight from the browser reports no length (Infinity), so fall back to the one we measured.
+    const known = mine && editorAudio[Player.id] ? editorAudio[Player.id].dur : 0;
+    const d = el && isFinite(el.duration) && el.duration > 0 ? el.duration : known;
+    chip.style.setProperty('--p', mine && d ? Math.min(1, el.currentTime / d).toFixed(3) : '0');
   });
 }
 
-async function toggleClipPlayback(id) {
+function toggleClipPlayback(id) {
   const el = ensurePlayer();
   if (Player.id === id && !el.paused) { el.pause(); return; }
-  try {
-    const url = await audioUrl(id);
-    if (!url) return;
-    if (Player.id !== id || !el.src) { el.src = url; Player.id = id; }
-    else if (el.ended) el.currentTime = 0;
-    await el.play();
-  } catch (e) {
-    toast('Couldn\u2019t play this clip');
-  }
+  let url;
+  try { url = audioUrlSync(id); } catch (e) { toast('Couldn\u2019t read this clip.'); return; }
+  if (!url) return;
+  if (Player.id !== id || !el.getAttribute('src')) { el.src = url; Player.id = id; el.load(); }
+  else if (el.ended) el.currentTime = 0;
+  el.muted = false;
+  el.volume = 1;
+  const started = el.play(); // nothing awaited above: this still counts as started by the tap
+  if (started && started.catch) started.catch((e) => { const msg = playbackProblem(e); if (msg) toast(msg); syncChipStates(); });
 }
 
 // ---- clip options dialog ----
 
 let clipDialogId = null;
 
-async function openClipDialog(id) {
+function openClipDialog(id) {
   const clip = editorAudio[id];
   if (!clip) return;
   if (Player.el) Player.el.pause();
@@ -3260,8 +3282,10 @@ async function openClipDialog(id) {
   document.getElementById('clip-meta').textContent = [
     fmtDur(clip.dur), formatBytes(estimateImageBytes(clip.data)), audioExtFor(clip).toUpperCase(), clip.name,
   ].filter(Boolean).join(' \u00b7 ');
-  const url = await audioUrl(id);
-  document.getElementById('clip-audio').src = url || '';
+  const player = document.getElementById('clip-audio');
+  const problem = document.getElementById('clip-error');
+  problem.hidden = true;
+  try { player.src = audioUrlSync(id) || ''; } catch (e) { player.removeAttribute('src'); problem.hidden = false; }
   show('overlay-clip');
 }
 
@@ -3280,7 +3304,7 @@ function clipFileName(id) {
 
 async function downloadClip(id) {
   try {
-    const url = await audioUrl(id);
+    const url = audioUrlSync(id);
     if (!url) throw new Error('missing');
     const a = document.createElement('a');
     a.href = url;
@@ -3455,20 +3479,48 @@ function askMediaQuality(kind, files) {
     filesEl.hidden = !list.length;
 
     // Fresh buttons each time, so an old choice's listener can't fire again.
-    const wire = (id, label, hint, value) => {
-      const old = document.getElementById(id);
-      const btn = old.cloneNode(true);
-      old.parentNode.replaceChild(btn, old);
-      if (label !== null) {
-        btn.querySelector('.q-title').textContent = label;
-        btn.querySelector('.q-hint').textContent = hint;
+    const fresh = (id) => { const old = document.getElementById(id); const btn = old.cloneNode(true); old.parentNode.replaceChild(btn, old); return btn; };
+    const optOriginal = fresh('btn-quality-original');
+    const optCompressed = fresh('btn-quality-compressed');
+    const okBtn = fresh('btn-quality-ok');
+    const cancelBtn = fresh('btn-quality-cancel');
+    optOriginal.querySelector('.q-title').textContent = 'Original';
+    optOriginal.querySelector('.q-hint').textContent = origHint;
+    optCompressed.querySelector('.q-title').textContent = 'Compressed';
+    optCompressed.querySelector('.q-hint').textContent = compHint;
+
+    // Tapping an option only selects it; nothing happens until OK. Original is pre-selected because
+    // it never changes your file.
+    let choice = 'original';
+    const options = [[optOriginal, 'original'], [optCompressed, 'compressed']];
+    const select = (value, moveFocus) => {
+      choice = value;
+      for (const [btn, v] of options) {
+        btn.setAttribute('aria-checked', String(v === value));
+        btn.tabIndex = v === value ? 0 : -1;
+        if (v === value && moveFocus) btn.focus();
       }
-      btn.addEventListener('click', () => { hide('overlay-quality'); resolve(value); });
     };
-    wire('btn-quality-original', 'Original', origHint, 'original');
-    wire('btn-quality-compressed', 'Compressed', compHint, 'compressed');
-    wire('btn-quality-cancel', null, null, null);
+    const finish = (value) => {
+      document.removeEventListener('keydown', onKey, true);
+      hide('overlay-quality');
+      resolve(value);
+    };
+    const onKey = (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); finish(null); return; }
+      // Radio-group keys: arrows move the selection between the two options.
+      if (['ArrowDown', 'ArrowUp', 'ArrowLeft', 'ArrowRight'].includes(e.key) && options.some(([btn]) => btn === document.activeElement)) {
+        e.preventDefault();
+        select(choice === 'original' ? 'compressed' : 'original', true);
+      }
+    };
+    for (const [btn, v] of options) btn.addEventListener('click', () => select(v, false));
+    okBtn.addEventListener('click', () => finish(choice));
+    cancelBtn.addEventListener('click', () => finish(null));
+    document.addEventListener('keydown', onKey, true);
+    select('original', false);
     show('overlay-quality');
+    optOriginal.focus();
   });
 }
 
@@ -3675,6 +3727,7 @@ function startMeter(stream) {
     Rec.analyser.fftSize = 512;
     src.connect(Rec.analyser);
     Rec.buf = new Uint8Array(Rec.analyser.fftSize);
+    if (Rec.ctx.state === 'suspended') Rec.ctx.resume().catch(() => {}); // Safari starts it suspended
   } catch (e) { Rec.analyser = null; }
 }
 
@@ -3686,30 +3739,22 @@ function readLevel() {
   return Math.min(1, Math.sqrt(sum / Rec.buf.length) * 3);
 }
 
-function projectedStored(bytesSoFar) { // what a clip of this many raw bytes adds to the note
-  if (mediaOffloadOn()) return Math.ceil(bytesSoFar * 4 / 3); // stored in Backblaze: just its base64 length, locked or not
-  return Math.ceil(bytesSoFar * 4 / 3 * (lockIsActive() ? 4 / 3 : 1));
-}
-
 function updateRecUI() {
   if (Rec.state !== 'recording') return;
   const q = { bps: Rec.bps || AUDIO_QUALITY[Config.audioQuality()].bps };
   const elapsed = (performance.now() - Rec.t0) / 1000;
   document.getElementById('record-timer').textContent = mmss(elapsed);
   document.getElementById('record-level').style.setProperty('--level', readLevel().toFixed(2));
-  const clipBytes = projectedStored(Math.max(Rec.bytes, q.bps / 8 * elapsed));
+  const clipBytes = Math.round(Math.max(Rec.bytes, q.bps / 8 * elapsed));
   const projected = Rec.baseBytes + clipBytes;
-  const off = mediaOffloadOn();
-  const zone = off ? mediaZone(projected) : noteSizeZone(projected);
+  const zone = noteSizeZone(projected, 0);
   const box = document.getElementById('record-projection');
   box.dataset.zone = zone;
-  box.innerHTML = off
-    ? `${ZONE_ICON[zone]}<span>This clip \u2248 ${formatBytes(Math.round(clipBytes * 3 / 4))} \u00b7 photos and audio would be ${mb1(projected * 3 / 4)} / 150 MB</span>`
-    : `${ZONE_ICON[zone]}<span>This clip \u2248 ${formatBytes(clipBytes)} \u00b7 note would be ${mb1(projected)} / 25 MB</span>`;
+  box.innerHTML = `${ZONE_ICON[zone]}<span>This clip \u2248 ${formatBytes(clipBytes)} \u00b7 note would be ${formatBytes(projected)} / ${NOTE_LIMIT_LABEL}</span>`;
 }
 
 function guardRecordingSize() {
-  if (Rec.baseBytes + projectedStored(Rec.bytes) > (mediaOffloadOn() ? MEDIA_NOTE_MAX_CHARS : NOTE_SIZE_LIMIT) - 256 * 1024) {
+  if (Rec.baseBytes + Rec.bytes > NOTE_TOTAL_LIMIT - 256 * 1024 || Rec.bytes > MEDIA_ITEM_MAX_BYTES - 256 * 1024) {
     Rec.autoStopped = true;
     stopRecording();
   }
@@ -3742,7 +3787,7 @@ async function startRecording() {
   Rec.bytes = 0;
   Rec.discard = false;
   Rec.autoStopped = false;
-  { const b0 = noteSizeBreakdown(); Rec.baseBytes = b0.offload ? b0.mediaChars : b0.total; }
+  Rec.baseBytes = noteSizeBreakdown().total;
   recorder.ondataavailable = (ev) => {
     if (!ev.data || !ev.data.size) return;
     Rec.chunks.push(ev.data);
@@ -3783,14 +3828,37 @@ function finishRecording() {
   document.getElementById('record-result').textContent =
     `${mmss(Rec.dur)} \u00b7 ${formatBytes(blob.size)}${Rec.autoStopped ? ' \u00b7 stopped at the size limit' : ''}`;
   const fit = canFitMedia(Math.ceil(blob.size * 4 / 3) + 40);
-  const off = mediaOffloadOn();
-  const zone = off ? (fit.ok ? 'ok' : 'over') : noteSizeZone(fit.projected);
+  const zone = fit.ok ? noteSizeZone(fit.projected, 0) : 'over';
+  const msg = fit.ok ? `Adding this makes the note ${formatBytes(fit.projected)} / ${NOTE_LIMIT_LABEL}.` : fit.message + ' Discard it, or record something shorter.';
   const box = document.getElementById('record-review-note');
   box.dataset.zone = zone;
-  box.innerHTML = `${ZONE_ICON[zone]}<span>${fit.ok ? (off ? `This clip will be stored in Backblaze, so it doesn\u2019t count toward the note\u2019s 25 MB.` : `Adding this makes the note ${mb1(fit.projected)} / 25 MB.`) : fit.message + ' Discard it, or record something shorter.'}</span>`;
+  box.innerHTML = `${ZONE_ICON[zone]}<span>${escapeHTML(msg)}</span>`;
+  if (fit.ok) warnIfSilent(blob);
   document.getElementById('btn-record-add').disabled = !fit.ok;
   showRecError('');
   setRecState('review');
+}
+
+// Looks at the finished recording itself: if it holds (almost) no sound, say so now rather than
+// when it plays back silent. Skipped quietly where the browser can't decode it.
+async function warnIfSilent(blob) {
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    const ctx = new AC();
+    let peak = 0;
+    try {
+      const buf = await ctx.decodeAudioData(await blob.arrayBuffer());
+      for (let c = 0; c < buf.numberOfChannels; c++) {
+        const ch = buf.getChannelData(c);
+        for (let i = 0; i < ch.length; i += 4) { const v = Math.abs(ch[i]); if (v > peak) peak = v; }
+      }
+    } finally { try { ctx.close(); } catch (e) { /* already closed */ } }
+    if (Rec.blob !== blob || peak >= 0.01) return; // moved on, or there is sound
+    const box = document.getElementById('record-review-note');
+    box.dataset.zone = 'heavy';
+    box.innerHTML = `${ZONE_ICON.heavy}<span>This recording is silent or almost silent \u2014 the microphone may be muted or blocked. Press play on the preview; if you hear nothing, record again (Compressed keeps auto-gain on).</span>`;
+  } catch (e) { /* can't decode here \u2014 no warning */ }
 }
 
 async function addRecordingToNote() {
@@ -3851,6 +3919,9 @@ function setupMedia() {
     if (added && !document.getElementById('overlay-record').classList.contains('hidden')) hide('overlay-record');
   });
 
+  document.getElementById('clip-audio').addEventListener('error', () => {
+    if (document.getElementById('clip-audio').getAttribute('src')) document.getElementById('clip-error').hidden = false;
+  });
   document.getElementById('btn-clip-download').addEventListener('click', () => { if (clipDialogId) downloadClip(clipDialogId); });
   document.getElementById('btn-clip-compress').addEventListener('click', () => { if (clipDialogId) compressSavedClip(clipDialogId); });
   document.getElementById('btn-clip-delete').addEventListener('click', () => {
@@ -4328,7 +4399,7 @@ function init() {
   setupRichText();
   setupMedia();
   setupInk();
-  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.8.0');
+  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.8.1');
 
   // Connectivity: react the moment the browser notices, and keep retrying
   // on a timer since navigator.onLine can't see a connection that's up but

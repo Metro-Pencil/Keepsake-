@@ -76,8 +76,8 @@ media/{id}/{file}  that note's photos and audio (encrypted first if the note is 
 ```
 
 - Don't put other files under those four prefixes.
-- Photos and audio are separate files (up to about 90 MB each, about 150 MB per note) and
-  don't count toward a note's own size.
+- Photos and audio are separate files (up to about 90 MB each, about 150 MB per note including
+  the written part).
 - Deleting a note deletes all of its files. A photo removed from a note is deleted from the
   bucket after an hour (so a save still in flight never loses a file).
 - Notes stay readable offline: everything you open is kept on the device, and photos and
@@ -89,7 +89,8 @@ media/{id}/{file}  that note's photos and audio (encrypted first if the note is 
 
 ## Original or Compressed
 
-Every time you add photos or audio, Keepsake asks first:
+Every time you add photos or audio, Keepsake asks first. Tap **Original** or **Compressed** to
+choose (Original is pre-selected), then **OK**; Cancel or Escape adds nothing.
 
 - **Photos:** *Original* keeps the file byte for byte (including location data);
   *Compressed* resizes and re-encodes at the strength set in Settings.
@@ -191,13 +192,14 @@ offline, whichever syncs last overwrites the other.
 
 ## Limits worth knowing
 
-- A note's own content (text, formatting, drawing) is capped at 25 MB. The editor shows the
-  note's size next to the Save button: comfortable up to 12 MB, "getting heavy" from 12,
-  "close to the limit" from 20, and a note over 25 MB can't be saved. Photos and audio are
-  separate files and don't count toward it; a locked note is about a third bigger than its
+- The editor shows the **whole note's** size next to the Save button: its text and drawing plus
+  its photos and audio, against a limit of 150 MB per note. Comfortable up to 50 MB, "getting
+  heavy" from 50, "close to the limit" from 100, and a note over 150 MB can't be saved. (Photos
+  and audio are separate files in the bucket, but they are held in memory while the note is open,
+  which is why there is a ceiling.) A locked note's written part is about a third bigger than its
   contents, because encrypted data is stored as text, and the meter accounts for that.
-- Each photo or clip is limited to about 90 MB and a note can carry about 150 MB of them,
-  because they are held in memory while the note is open.
+- Each photo or clip is limited to about 90 MB, and the written part of a note (text, formatting,
+  drawing) to 25 MB.
 - Storage: **Settings → Storage** shows how much of your bucket's allowance your notes use
   (10 GB by default, matching Backblaze's free plan; change the number if yours differs),
   warns from 70% and again from 90%, and lists your biggest notes.

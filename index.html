@@ -154,11 +154,11 @@
 
   @keyframes sync-spin { to { transform: rotate(360deg); } }
 
-  .sync-bar-label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sync-bar-label { flex: 1 1 10rem; min-width: 0; line-height: 1.3; overflow-wrap: anywhere; }
 
   .sync-bar-track {
-    flex: 1;
-    max-width: 180px;
+    flex: 0 1 140px;
+    min-width: 72px;
     height: 4px;
     background: var(--line);
     border-radius: 999px;
@@ -238,7 +238,7 @@
 
   .brand {
     display: flex;
-    align-items: baseline;
+    align-items: center;
     flex-wrap: wrap;
     gap: 2px 8px;
     margin-right: auto;
@@ -398,9 +398,6 @@
     font-weight: 600;
     margin: 0 0 6px;
     color: var(--ink);
-  }
-
-  .card-title {
     overflow-wrap: anywhere;
   }
 
@@ -432,15 +429,30 @@
     border: 1px solid var(--line);
   }
 
-  .lock-pill {
+  /* Lock + "Not synced" pills share one shape and sit in one wrapping row, so they never touch,
+     never differ in height, and line up the same on every kind of card. */
+  .card-badges {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-1) var(--space-2);
+    margin-bottom: 10px;
+  }
+
+  .card-badges:empty { display: none; }
+
+  .lock-pill,
+  .pending-pill {
     display: inline-flex;
     align-items: center;
     gap: 5px;
+    min-height: 24px;
+    padding: 2px 10px;
+    border-radius: 999px;
     font-size: 0.75rem;
     font-weight: 600;
-    padding: 3px 9px;
-    border-radius: 999px;
-    margin-bottom: 10px;
+    line-height: 1.2;
+    margin: 0;
   }
 
   .lock-pill.quick { background: var(--violet-bg); color: var(--violet); }
@@ -458,16 +470,26 @@
      rather than tacked on underneath it. */
   .card-footer {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
-    gap: 8px;
+    justify-content: space-between;
+    gap: var(--space-1) var(--space-2);
     margin-top: 8px;
   }
 
-  .card-footer .card-meta { flex: 1; }
+  .card-footer .card-meta { flex: 1 1 8rem; min-width: 0; }
+
+  /* Locked cards hold a 44px row for the buttons even while they are tucked away, so the card
+     doesn't jump when they appear; the date sits in the middle of that row. */
+  .card.type-quick .card-footer,
+  .card.type-time .card-footer { min-height: 44px; }
+  .card.type-quick,
+  .card.type-time { padding-bottom: 2px; }
 
   .card-actions {
     display: flex;
     align-items: center;
+    margin-inline-end: calc(var(--space-2) * -1); /* the 44px buttons' icons line up with the card's text edge */
     gap: 8px; /* keeps the two touch targets comfortably apart */
     opacity: 1;
     transition: opacity 0.15s ease;
@@ -499,16 +521,8 @@
 
   /* A note saved on this device but not yet pushed to the server. */
   .pending-pill {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    font-size: 0.6875rem;
-    font-weight: 600;
     color: var(--amber);
     background: var(--amber-bg);
-    padding: 3px 8px;
-    border-radius: 999px;
-    margin: 0 0 10px;
   }
 
   .pending-pill::before {
@@ -652,11 +666,16 @@
     line-height: 1.5;
   }
 
+  .error,
   .field .error {
-    font-size: 0.7812rem;
-    color: var(--brick);
+    font-size: 0.8125rem;
+    line-height: 1.4;
+    font-weight: 500;
+    color: var(--danger);
     margin-top: 5px;
   }
+
+  .error:not(.visually-hidden)::before { content: "\26A0\FE0E\00a0"; } /* an icon too, so it isn't colour alone */
 
   /* ---------- Full-screen note editor ---------- */
 
@@ -1229,6 +1248,7 @@
 
   .size-advice { display: flex; gap: 10px; align-items: flex-start; padding: 12px; border: 1px solid var(--zone-edge); border-radius: var(--radius-sm); background: var(--zone-bg); color: var(--zone-fg); }
   .size-advice p { margin: 0; font-size: 0.875rem; line-height: 1.5; }
+  .size-legend + .hint { margin-top: 12px; }
   .size-legend-title { margin: 18px 0 8px; font-family: var(--font-display); font-size: 0.9375rem; }
   .size-legend { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
   .size-legend li { display: flex; gap: 10px; align-items: flex-start; font-size: 0.8125rem; line-height: 1.4; color: var(--ink-soft); }
@@ -1236,9 +1256,29 @@
   .size-legend li[data-zone="over"] [data-zone-icon] { color: var(--danger); }
 
   .quality-options { display: flex; flex-direction: column; gap: 10px; }
-  .quality-opt { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; text-align: left; height: auto; padding: 12px 16px; }
-  .quality-opt .q-title { font-weight: 600; }
-  .quality-opt .q-hint { font-size: 0.8125rem; line-height: 1.45; font-weight: 400; opacity: 0.9; }
+  .quality-opt {
+    position: relative;
+    display: flex; flex-direction: column; align-items: flex-start; gap: 4px;
+    width: 100%; min-height: 44px; text-align: left;
+    padding: 12px 52px 12px 16px;
+    border: 1.5px solid var(--line-strong); border-radius: 12px;
+    background: var(--card); color: var(--ink);
+  }
+  .quality-opt .q-title { font-weight: 600; font-size: 0.9375rem; }
+  .quality-opt .q-hint { font-size: 0.8125rem; line-height: 1.45; font-weight: 400; color: var(--ink-soft); }
+  .quality-opt:hover { border-color: var(--pine-light); }
+  .quality-opt[aria-checked="true"] { border-color: var(--pine); background: var(--card-2); box-shadow: 0 0 0 1px var(--pine) inset; }
+  /* A round radio mark that fills when chosen: a shape change, not just colour. */
+  .quality-opt::after {
+    content: ""; position: absolute; inset-block-start: 14px; inset-inline-end: 16px;
+    width: 22px; height: 22px; border-radius: 50%;
+    border: 2px solid var(--line-strong); background: var(--card);
+  }
+  .quality-opt[aria-checked="true"]::after { border-color: var(--pine); background: radial-gradient(circle, var(--pine) 0 5px, var(--card) 6px); }
+  .quality-actions { display: flex; gap: 10px; margin-top: 16px; }
+  .quality-actions .btn { flex: 1; }
+  .confirm-message { margin: 0; color: var(--ink-soft); font-size: 0.9063rem; line-height: 1.5; }
+  .confirm-actions { margin-top: 16px; }
   .quality-files { list-style: none; margin: 0 0 14px; padding: 8px 10px; max-height: 150px; overflow-y: auto; background: var(--paper); border-radius: 10px; font-size: 0.8125rem; }
   .quality-files li { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; }
   .quality-files .qf-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
@@ -1247,9 +1287,10 @@
   .lightbox-compress {
     position: absolute; left: 50%; transform: translateX(-50%);
     bottom: calc(max(18px, env(safe-area-inset-bottom)) + 30px);
-    min-height: 40px; padding: 8px 16px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.45);
+    min-height: 44px; padding: 8px 18px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.45);
     background: rgba(0,0,0,0.45); color: #fff; font: inherit; font-size: 0.875rem; cursor: pointer;
   }
+  .lightbox :focus-visible { outline-color: #fff; }
   .b2-status { margin: 0 0 12px; padding: 10px 12px; border-radius: 10px; }
   .b2-status[data-kind="bad"] { background: var(--danger-bg); color: var(--danger); }
   .b2-status[data-kind="ok"] { background: var(--ok-bg); color: var(--ok); }
@@ -1331,7 +1372,7 @@
   <div class="top-inner">
     <div class="brand">
       <span class="brand-mark">Keepsake</span>
-      <span class="version-badge" id="version-badge">v1.5.0</span>
+      <span class="version-badge" id="version-badge">v1.8.1</span>
       <span class="sync-status hidden" id="sync-status" role="status" aria-live="polite"></span>
       <button class="storage-pill" id="storage-pill" type="button" data-zone="heavy" hidden>
         <span class="storage-pill-icon" id="storage-pill-icon" aria-hidden="true"></span>
@@ -1386,7 +1427,7 @@
     <span class="editor-topbar-title" id="editor-heading">New note</span>
     <button class="size-chip" id="btn-size" type="button" data-zone="ok" aria-haspopup="dialog" aria-label="Note size">
       <span class="size-icon" id="size-icon" aria-hidden="true"></span>
-      <span class="size-text" id="size-text">0.0 / 25 MB</span>
+      <span class="size-text" id="size-text">0 B / 150 MB</span>
       <span class="size-track" aria-hidden="true"><span class="size-fill" id="size-fill"></span></span>
     </button>
     <button class="btn btn-primary" id="btn-save-note">Save</button>
@@ -1626,6 +1667,7 @@
     <div class="modal-body">
       <p class="hint clip-meta" id="clip-meta"></p>
       <audio id="clip-audio" controls preload="metadata"></audio>
+      <p class="rec-error" id="clip-error" role="alert" hidden>This browser can’t play this clip. Use “Download this clip” to listen to it elsewhere.</p>
       <div class="btn-row">
         <button class="btn btn-primary" id="btn-clip-download" type="button">Download this clip</button>
         <button class="btn btn-ghost" id="btn-clip-compress" type="button">Compress</button>
@@ -1644,10 +1686,10 @@
     </div>
     <div class="modal-body">
       <div class="size-status" id="size-status"></div>
-      <div class="meter" id="size-dialog-meter" role="meter" aria-label="Note size in megabytes" aria-valuemin="0" aria-valuemax="25" aria-valuenow="0" data-zone="ok">
+      <div class="meter" id="size-dialog-meter" role="meter" aria-label="Note size in megabytes" aria-valuemin="0" aria-valuemax="150" aria-valuenow="0" data-zone="ok">
         <span class="meter-fill" id="size-dialog-fill"></span>
-        <span class="meter-tick" style="left:48%"></span>
-        <span class="meter-tick" style="left:80%"></span>
+        <span class="meter-tick" style="left:33.3%"></span>
+        <span class="meter-tick" style="left:66.7%"></span>
       </div>
       <ul class="size-rows" id="size-rows"></ul>
       <div class="size-advice" id="size-advice-box" data-zone="ok">
@@ -1656,11 +1698,12 @@
       </div>
       <h3 class="size-legend-title">What the levels mean</h3>
       <ul class="size-legend">
-        <li data-zone="ok"><span data-zone-icon="ok" aria-hidden="true"></span><span><b>Up to 12 MB</b> — comfortable.</span></li>
-        <li data-zone="heavy"><span data-zone-icon="heavy" aria-hidden="true"></span><span><b>12–20 MB</b> — getting heavy: slower to open and sync.</span></li>
-        <li data-zone="danger"><span data-zone-icon="danger" aria-hidden="true"></span><span><b>20–25 MB</b> — close to the limit: saving may fail.</span></li>
-        <li data-zone="over"><span data-zone-icon="over" aria-hidden="true"></span><span><b>Over 25 MB</b> — can’t be saved.</span></li>
+        <li data-zone="ok"><span data-zone-icon="ok" aria-hidden="true"></span><span><b>Up to 50 MB</b> — comfortable.</span></li>
+        <li data-zone="heavy"><span data-zone-icon="heavy" aria-hidden="true"></span><span><b>50–100 MB</b> — getting heavy: slow to open the first time on a new device or on mobile data.</span></li>
+        <li data-zone="danger"><span data-zone-icon="danger" aria-hidden="true"></span><span><b>100–150 MB</b> — close to the limit.</span></li>
+        <li data-zone="over"><span data-zone-icon="over" aria-hidden="true"></span><span><b>Over 150 MB</b> — can’t be saved.</span></li>
       </ul>
+      <p class="hint">The size is the whole note: its text and drawing plus its photos and audio. One photo or clip can be up to 90 MB, and the written part alone up to 25 MB.</p>
     </div>
   </div>
 </div>
@@ -1670,8 +1713,8 @@
   <div class="modal narrow" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-message">
     <div class="modal-head"><h2 id="confirm-title">Are you sure?</h2></div>
     <div class="modal-body">
-      <p id="confirm-message" style="color: var(--ink-soft); font-size: 14.5px; line-height: 1.5;"></p>
-      <div class="btn-row" style="margin-top: 16px;">
+      <p id="confirm-message" class="confirm-message"></p>
+      <div class="btn-row confirm-actions">
         <button class="btn btn-danger" id="btn-confirm-yes">Delete</button>
         <button class="btn btn-ghost" data-close="overlay-confirm">Cancel</button>
       </div>
@@ -1781,10 +1824,13 @@
     <div class="modal-body">
       <p class="hint" id="quality-summary" style="margin-bottom: 8px;"></p>
       <ul class="quality-files" id="quality-files" hidden></ul>
-      <div class="quality-options">
-        <button class="btn btn-primary quality-opt" id="btn-quality-original" type="button"><span class="q-title"></span><span class="q-hint"></span></button>
-        <button class="btn btn-ghost quality-opt" id="btn-quality-compressed" type="button"><span class="q-title"></span><span class="q-hint"></span></button>
+      <div class="quality-options" role="radiogroup" aria-labelledby="quality-title">
+        <button class="quality-opt" id="btn-quality-original" type="button" role="radio" aria-checked="true"><span class="q-title"></span><span class="q-hint"></span></button>
+        <button class="quality-opt" id="btn-quality-compressed" type="button" role="radio" aria-checked="false" tabindex="-1"><span class="q-title"></span><span class="q-hint"></span></button>
+      </div>
+      <div class="quality-actions">
         <button class="btn btn-ghost" id="btn-quality-cancel" type="button">Cancel</button>
+        <button class="btn btn-primary" id="btn-quality-ok" type="button">OK</button>
       </div>
     </div>
   </div>
@@ -1795,7 +1841,7 @@
 <script>
 // Bump this on EVERY change to the app, no matter how small — a typo fix,
 // a copy tweak, whatever. See CHANGELOG.md for the policy and history.
-window.KEEPSAKE_VERSION = "1.8.0";
+window.KEEPSAKE_VERSION = "1.8.1";
 </script>
 <script src="b2.js"></script>
 <script src="media.js"></script>
