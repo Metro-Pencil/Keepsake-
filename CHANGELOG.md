@@ -6,6 +6,17 @@ All notable changes to this project are recorded here, following
 small — gets a version bump. If the version number hasn't moved,
 nothing changed; that's the whole point of keeping one.
 
+## v1.9.1 — 2026-10-11
+
+- **Text now flows around photos, like a newspaper.** A photo grid used to be a solid block, so the
+  empty cells at the end of its last row (say, 2 photos in a row of 3) stayed blank and your text always
+  started underneath. Photos now float, so whatever you type after a grid fills those empty cells beside
+  the last row and then runs full width below it. A blank line (where the cursor sits before you type)
+  goes to the same spot, so the cursor no longer jumps when you type the first letter. A grid whose last
+  row is full leaves nothing to fill, so the text starts underneath as before. A second batch of photos
+  always starts its own grid below the first. Nothing about saved notes changes, so old notes open the
+  same way. Service worker cache bumped to v18.
+
 ## v1.9.0 — 2026-10-11
 
 - **Photos live in the text, in a bigger grid, and can't be deleted by accident.** The little × on every

@@ -2955,7 +2955,7 @@ function openSettings() {
   keyField.placeholder = c.appKey() ? 'Saved on this device \u2014 type a new key to replace it' : '';
   setB2Status('', '');
   fillClockLine();
-  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.9.0';
+  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.9.1';
   fillQualitySettings();
   show('overlay-settings');
   renderStorageSection();
@@ -5242,7 +5242,7 @@ function init() {
   setupRichText();
   setupMedia();
   setupInk();
-  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.9.0');
+  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.9.1');
 
   // Connectivity: react the moment the browser notices, and keep retrying
   // on a timer since navigator.onLine can't see a connection that's up but

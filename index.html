@@ -962,13 +962,23 @@
   @media (min-width: 720px) { .rich-body { --photo-cols: 4; } }
 
   ks-photo {
-    display: inline-block;
-    vertical-align: top;
+    /* Floated, like a picture in a newspaper: the text that comes after a grid flows into any empty
+       cells at the end of its last row and then spreads out underneath. (A float is the one case where
+       float beats grid - grid cannot let text run around it.) */
+    display: block;
+    float: left;
     /* n tiles and n gaps per row; the 1px keeps rounding from ever pushing the last tile onto a new row */
     width: calc((100% - var(--photo-cols) * var(--photo-gap) - 1px) / var(--photo-cols));
     margin: 0 var(--photo-gap) var(--photo-gap) 0;
     -webkit-user-select: none; user-select: none;
   }
+  /* Each batch of photos starts a fresh grid below the one before it, never in its gap. */
+  ks-photo:first-child { clear: both; }
+  /* A blank line has no text to make it wait for room, so beside a grid it would squeeze into the 1px
+     sliver at the right of the first row and the cursor would sit there. Giving it a minimum width
+     (which a plain block must have beside a float) puts it where the text will go: in the empty cells
+     of the last row, or under a full grid. It stops matching the moment a letter is typed. */
+  .rich-body > :is(div, p):has(> br:only-child) { display: flow-root; min-width: 5rem; }
 
   .photo-tile {
     position: relative;
@@ -1452,7 +1462,7 @@
   <div class="top-inner">
     <div class="brand">
       <span class="brand-mark">Keepsake</span>
-      <span class="version-badge" id="version-badge">v1.9.0</span>
+      <span class="version-badge" id="version-badge">v1.9.1</span>
       <span class="sync-status hidden" id="sync-status" role="status" aria-live="polite"></span>
       <button class="storage-pill" id="storage-pill" type="button" data-zone="heavy" hidden>
         <span class="storage-pill-icon" id="storage-pill-icon" aria-hidden="true"></span>
@@ -1936,7 +1946,7 @@
 <script>
 // Bump this on EVERY change to the app, no matter how small — a typo fix,
 // a copy tweak, whatever. See CHANGELOG.md for the policy and history.
-window.KEEPSAKE_VERSION = "1.9.0";
+window.KEEPSAKE_VERSION = "1.9.1";
 </script>
 <script src="b2.js"></script>
 <script src="media.js"></script>
