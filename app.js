@@ -116,12 +116,21 @@ const API = {
   // Photos and audio go up first; the note itself \u2014 by then just text and references \u2014 follows.
   // Both the editor's saves and the offline queue come through here, so a queued note uploads
   // its media too.
-  async saveNote(id, payload, onProgress) {
-    let uploaded = 0;
+  // Photos and audio are sent one file at a time, each checked against the bucket before the next
+  // starts. `report` (optional) hears about every step: onPlan, onFileStart, onFileProgress,
+  // onFileDone, onText.
+  async saveNote(id, payload, report) {
+    const r = report || {};
     if (payload && payload.mediaKeep && payload.mediaKeep.length && window.KSMedia) {
-      uploaded = await KSMedia.uploadPending(id, payload.mediaKeep, onProgress);
+      await KSMedia.uploadPending(id, payload.mediaKeep, {
+        sizes: payload.mediaSizes,
+        onPlan: r.onPlan, onFileStart: r.onFileStart, onFileProgress: r.onFileProgress, onFileDone: r.onFileDone,
+      });
     }
-    return KSB2.saveNote(id, payload, uploaded ? null : onProgress);
+    if (r.onText) r.onText('active', 0);
+    const out = await KSB2.saveNote(id, payload, r.onText ? (f) => r.onText('active', f) : null);
+    if (r.onText) r.onText('done', 1);
+    return out;
   },
   deleteNote(id) { return KSB2.deleteNote(id); },
   getVault(id) { return KSB2.getVault(id); },
@@ -228,7 +237,8 @@ function noteSizeBreakdown() {
   const text = utf8Len(document.getElementById('editor-title').value) + utf8Len(body.innerHTML) * 2; // html + its plain-text copy
   // Photos and audio: their real size (what the bucket stores). Only a short reference to each stays in the note itself.
   let photos = 0;
-  for (const src of editorImages) photos += estimateImageBytes(src);
+  const photoIds = photoIdsInBody();
+  for (const id of photoIds) photos += estimateImageBytes(editorPhotos[id]);
   let audio = 0;
   let clips = 0;
   const seen = new Set();
@@ -240,7 +250,7 @@ function noteSizeBreakdown() {
     clips++;
   });
   const drawing = inkEstimateBytes();
-  const refs = editorImages.length * 160 + clips * 260;
+  const refs = photoIds.length * 200 + clips * 260;
   let content = 160 + text + refs + drawing; // the written part, as the note file will hold it
   const locked = lockIsActive();
   let lockExtra = 0;
@@ -250,7 +260,7 @@ function noteSizeBreakdown() {
     content = encrypted;
   }
   const media = photos + audio;
-  return { text, photos, photoCount: editorImages.length, audio, clips, drawing, lockExtra, locked, content, media, total: content + media };
+  return { text, photos, photoCount: photoIds.length, audio, clips, drawing, lockExtra, locked, content, media, total: content + media };
 }
 
 // Cheap fingerprint of a big base64 string (length + 48 sampled characters),
@@ -458,11 +468,22 @@ async function idbGet(db, store, key) { return (await idbRequest(db, store, 'get
 async function idbGetAll(db, store) { return (await idbRequest(db, store, 'getAll')) || []; }
 async function idbGetAllKeys(db, store) { return (await idbRequest(db, store, 'getAllKeys')) || []; }
 
-async function saveLocalDraft(id, title, body, images, html, drawing, audio) {
+// A draft is written about once a second while you type. Photos and audio can add up to 150 MB, and
+// IndexedDB can only replace a record whole - so they live in a second record of their own
+// ("<id>#media") that is rewritten only when the photos/audio themselves change. Typing then rewrites
+// a few kilobytes, not the whole note's media.
+const DRAFT_MEDIA_SUFFIX = '#media';
+const draftMediaSigs = new Map(); // note id -> signature of the media last written
+
+async function saveLocalDraft(id, title, body, images, imageIds, html, drawing, audio) {
   if (!id) return;
   try {
     const db = await openKeepsakeDB();
-    await idbPut(db, DRAFT_STORE, { id, title, body, images, html, drawing, audio, savedAt: Date.now() });
+    const sig = mediaKey({ images, audio });
+    const entries = [[DRAFT_STORE, { id, title, body, html, drawing, imageIds, mediaSig: sig, savedAt: Date.now() }]];
+    if (draftMediaSigs.get(id) !== sig) entries.push([DRAFT_STORE, { id: id + DRAFT_MEDIA_SUFFIX, images, audio }]);
+    await idbPutMany(db, entries); // one transaction: the two records never disagree
+    draftMediaSigs.set(id, sig);
   } catch (e) {
     // Best-effort only — local caching should never interrupt the editor.
   }
@@ -471,15 +492,22 @@ async function saveLocalDraft(id, title, body, images, html, drawing, audio) {
 async function loadLocalDraft(id) {
   try {
     const db = await openKeepsakeDB();
-    return await idbGet(db, DRAFT_STORE, id);
+    const rec = await idbGet(db, DRAFT_STORE, id);
+    if (!rec) return null;
+    if (rec.mediaSig !== undefined) { // newer layout: photos and audio are in the companion record
+      const media = await idbGet(db, DRAFT_STORE, id + DRAFT_MEDIA_SUFFIX);
+      return { ...rec, images: media ? media.images || [] : [], audio: media ? media.audio : undefined };
+    }
+    return rec; // older drafts kept everything in one record
   } catch (e) { return null; }
 }
 
 async function clearLocalDraft(id) {
   if (!id) return;
+  draftMediaSigs.delete(id);
   try {
     const db = await openKeepsakeDB();
-    await idbDelete(db, DRAFT_STORE, id);
+    await idbDeleteMany(db, [[DRAFT_STORE, id], [DRAFT_STORE, id + DRAFT_MEDIA_SUFFIX]]);
   } catch (e) {
     // Worst case an orphaned draft lingers and gets offered for recovery
     // again later, which is harmless.
@@ -489,7 +517,7 @@ async function clearLocalDraft(id) {
 async function listLocalDraftIds() {
   try {
     const db = await openKeepsakeDB();
-    return await idbGetAllKeys(db, DRAFT_STORE);
+    return (await idbGetAllKeys(db, DRAFT_STORE)).filter((k) => !String(k).endsWith(DRAFT_MEDIA_SUFFIX));
   } catch (e) { return []; }
 }
 
@@ -641,16 +669,31 @@ async function buildNotesCacheFromLocal() {
  * Outbox — notes with a save or delete the server hasn't seen yet.
  * ------------------------------------------------------------------- */
 
-async function queueOutbox(id, op, payload) {
+// `info` (saves only) = { title, batch } where batch is { fileName: 'photo' | 'audio' } for the
+// photos/audio that were still waiting to upload. It is carried over from an earlier queued save of
+// the same note, so "43 of 100 photos" stays true across edits and across closing the app.
+// Resolves with the queuedAt stamp of the entry it wrote (0 if it could not be written).
+async function queueOutbox(id, op, payload, info) {
+  const queuedAt = Date.now();
   try {
     const db = await openKeepsakeDB();
+    let batch = {};
+    if (op === 'save' && info && info.batch) {
+      const prev = await idbGet(db, OUTBOX_STORE, id);
+      const keep = new Set((payload && payload.mediaKeep) || []);
+      if (prev && prev.batch) for (const name of Object.keys(prev.batch)) if (keep.has(name)) batch[name] = prev.batch[name];
+      Object.assign(batch, info.batch);
+    }
     await idbRun(db, [OUTBOX_STORE, OUTBOX_PAYLOAD_STORE], 'readwrite', (tx) => {
-      tx.objectStore(OUTBOX_STORE).put({ id, op, queuedAt: Date.now() });
+      const rec = { id, op, queuedAt };
+      if (op === 'save' && info) { rec.title = String(info.title || '').slice(0, 120); rec.batch = batch; }
+      tx.objectStore(OUTBOX_STORE).put(rec);
       const payloads = tx.objectStore(OUTBOX_PAYLOAD_STORE);
       if (op === 'save' && payload) payloads.put({ id, payload }); else payloads.delete(id);
     });
-  } catch (e) { /* best-effort */ }
+  } catch (e) { await refreshOutboxCount(); return 0; }
   await refreshOutboxCount();
+  return queuedAt;
 }
 
 async function clearOutbox(id) {
@@ -659,6 +702,15 @@ async function clearOutbox(id) {
     await idbDeleteMany(db, [[OUTBOX_STORE, id], [OUTBOX_PAYLOAD_STORE, id]]);
   } catch (e) { /* best-effort */ }
   await refreshOutboxCount();
+}
+
+// Clears the entry only if it is still the one this save wrote. A newer edit that replaced it
+// in the meantime stays queued.
+async function clearOutboxIfCurrent(id, queuedAt) {
+  const cur = await getOutboxItem(id);
+  if (cur && queuedAt && cur.queuedAt !== queuedAt) return false;
+  await clearOutbox(id);
+  return true;
 }
 
 async function getOutbox() { // light entries only: { id, op, queuedAt }
@@ -782,7 +834,7 @@ function setPasswordVisible(input, btn, visible) {
 }
 
 function enhancePasswordInputs(root) {
-  root.querySelectorAll('input[type="password"]:not([data-pw-enhanced])').forEach((input) => {
+  root.querySelectorAll('input[type="password"]:not([data-pw-enhanced]):not([data-secret])').forEach((input) => {
     input.dataset.pwEnhanced = '1';
     // A revealed password shouldn't be autocorrected, capitalised or spell-checked.
     input.setAttribute('autocapitalize', 'off');
@@ -838,6 +890,24 @@ function applyViewportFix() {
   });
 }
 
+// Fields marked data-secret (the application key, the old access token) are for typing a secret in,
+// never for getting it back out: no copy, no cut, no drag, no context menu. (They are also never filled
+// with the saved value - see openSettings.)
+function setupSecretFields() {
+  const isSecret = (t) => !!(t && t.closest && t.closest('[data-secret]'));
+  const block = (e) => {
+    if (!isSecret(e.target) && !isSecret(document.activeElement)) return;
+    e.preventDefault();
+    if (e.clipboardData) e.clipboardData.setData('text/plain', '');
+  };
+  ['copy', 'cut', 'dragstart', 'contextmenu'].forEach((ev) => document.addEventListener(ev, block, true));
+  document.addEventListener('keydown', (e) => { // Ctrl/Cmd+C, Ctrl/Cmd+X, Ctrl+Insert on a secret field
+    if (!isSecret(e.target)) return;
+    const k = e.key.toLowerCase();
+    if (((e.ctrlKey || e.metaKey) && (k === 'c' || k === 'x')) || (e.ctrlKey && k === 'insert')) e.preventDefault();
+  }, true);
+}
+
 function setupKeyboardViewportFix() {
   if (window.visualViewport) {
     window.visualViewport.addEventListener('resize', applyViewportFix);
@@ -864,11 +934,14 @@ function setupKeyboardViewportFix() {
 
 let syncBarHideTimer = null;
 
-function syncBarSet(label, fraction /* number 0..1, or null for indeterminate */) {
+// `steps` (optional) = one row per kind of thing being sent - photos, audio, note text - each with
+// its own bar; see renderSyncSteps. Left out, the rows are hidden.
+function syncBarSet(label, fraction /* number 0..1, or null for indeterminate */, steps) {
   clearTimeout(syncBarHideTimer);
   const bar = document.getElementById('sync-bar');
   bar.classList.remove('error', 'done');
   bar.classList.add('show');
+  renderSyncSteps(steps);
   document.getElementById('sync-bar-label').textContent = label;
   document.getElementById('sync-bar-retry').classList.add('hidden');
   const track = document.getElementById('sync-bar-track');
@@ -888,10 +961,10 @@ function syncBarHideSoon(delay = 1100) {
   }, delay);
 }
 
-function syncBarSuccess(label = 'Saved') {
-  syncBarSet(label, 1);
-  document.getElementById('sync-bar').classList.add('done'); // finished — stop the spinner
-  syncBarHideSoon();
+function syncBarSuccess(label = 'Saved', steps) {
+  syncBarSet(label, 1, steps);
+  document.getElementById('sync-bar').classList.add('done'); // finished: stop the spinner
+  syncBarHideSoon(steps ? 2200 : 1100);
 }
 
 function syncBarError(label, onRetry) {
@@ -907,6 +980,248 @@ function syncBarError(label, onRetry) {
   freshRetry.classList.remove('hidden');
   retryBtn.parentNode.replaceChild(freshRetry, retryBtn);
   freshRetry.addEventListener('click', () => { bar.classList.remove('error'); onRetry(); });
+}
+
+// One row per kind of thing being sent, each with its own bar and count:
+//   Photos     [=====>    ]  3 / 60
+//   Audio      [          ]  pending
+//   Note text  [          ]  pending
+function renderSyncSteps(steps) {
+  const wrap = document.getElementById('sync-steps');
+  if (!wrap) return;
+  const bar = document.getElementById('sync-bar');
+  if (bar) bar.classList.toggle('has-steps', !!(steps && steps.length)); // the rows carry the bars then
+  if (!steps || !steps.length) { wrap.hidden = true; return; }
+  wrap.hidden = false;
+  const keep = new Set();
+  steps.forEach((st, i) => {
+    keep.add(st.key);
+    let row = wrap.querySelector(`.sync-step[data-key="${st.key}"]`);
+    if (!row) {
+      row = document.createElement('div');
+      row.className = 'sync-step';
+      row.dataset.key = st.key;
+      row.innerHTML = '<span class="sync-step-name"></span>'
+        + '<span class="sync-step-track" role="progressbar" aria-valuemin="0" aria-valuemax="100"><span class="sync-step-fill"></span></span>'
+        + '<span class="sync-step-count"></span>';
+      wrap.appendChild(row);
+    }
+    if (wrap.children[i] !== row) wrap.insertBefore(row, wrap.children[i] || null);
+    const f = Math.max(0, Math.min(1, st.frac || 0));
+    row.dataset.state = st.state;
+    row.style.setProperty('--f', f.toFixed(3));
+    row.querySelector('.sync-step-name').textContent = st.label;
+    row.querySelector('.sync-step-count').textContent = st.count;
+    const track = row.querySelector('.sync-step-track');
+    track.setAttribute('aria-valuenow', String(Math.round(f * 100)));
+    track.setAttribute('aria-label', `${st.label}: ${st.aria || st.count}`);
+  });
+  wrap.querySelectorAll('.sync-step').forEach((r) => { if (!keep.has(r.dataset.key)) r.remove(); });
+}
+
+/* ---------------------------------------------------------------------
+ * Upload progress model. Every note being sent is a "job": which photos and clips it still has to
+ * send (each tagged photo / audio), which are done, the file in flight right now, and the state of
+ * the note's text. The bar adds the jobs up, so a queue of several notes reads as one piece of work
+ * instead of starting over for each.
+ *
+ * What counts as "this batch" lives in the outbox entry (see queueOutbox), not in memory - so after
+ * the app is closed and reopened, "43 / 100 photos" is still 43 / 100.
+ * ------------------------------------------------------------------- */
+
+const SyncJobs = new Map(); // note id -> job
+let syncRenderTimer = 0;
+let syncSummaryShown = false; // the bar is showing the reopen summary, not a live upload
+
+function newSyncJob(noteId, title) {
+  return { noteId, title: title || '', files: {}, current: null, text: 'wait', textFraction: 0, prep: null };
+}
+
+// Fills a job's file list from what this device knows about them.
+async function fillJobFiles(job, batch) {
+  const names = Object.keys(batch || {});
+  if (!names.length || !window.KSMedia) return job;
+  try {
+    const d = await KSMedia.describe(job.noteId, names, batch);
+    for (const name of names) {
+      const f = d[name];
+      job.files[name] = { kind: f ? f.kind : batch[name], size: f ? f.size : 0, done: !(f && f.pending) };
+    }
+  } catch (e) { /* these numbers are only for display */ }
+  return job;
+}
+
+async function syncJobBegin(noteId, title, batch, owner) {
+  const job = newSyncJob(noteId, title);
+  job.owner = owner || 'editor';
+  SyncJobs.set(noteId, job);
+  syncSummaryShown = false;
+  await fillJobFiles(job, batch);
+  scheduleSyncRender();
+  return job;
+}
+
+function scheduleSyncRender() {
+  if (syncRenderTimer) return;
+  syncRenderTimer = setTimeout(() => { syncRenderTimer = 0; renderSyncJobs(); }, 80);
+}
+
+// What a job is told as its upload goes (passed to API.saveNote).
+function jobReporter(noteId) {
+  const job = () => SyncJobs.get(noteId);
+  return {
+    onPlan({ todo }) {
+      const j = job(); if (!j) return;
+      const sending = new Set(todo.map((t) => t.name));
+      for (const name of Object.keys(j.files)) if (!sending.has(name)) j.files[name].done = true; // already in the bucket
+      for (const t of todo) j.files[t.name] = { kind: t.kind, size: t.size, done: false };
+      scheduleSyncRender();
+    },
+    onFileStart(f) {
+      const j = job(); if (!j) return;
+      j.current = { name: f.name, kind: f.kind, size: f.size, fraction: 0, index: f.index, count: f.count };
+      j.prep = null;
+      scheduleSyncRender();
+    },
+    onFileProgress(p) {
+      const j = job(); if (!j || !j.current) return;
+      j.current.fraction = p.total ? Math.min(1, p.loaded / p.total) : 0;
+      scheduleSyncRender();
+    },
+    onFileDone(f) {
+      const j = job(); if (!j) return;
+      const e = j.files[f.name];
+      if (e) e.done = true; else j.files[f.name] = { kind: f.kind, size: f.size, done: true };
+      j.current = null;
+      scheduleSyncRender();
+    },
+    onText(state, frac) {
+      const j = job(); if (!j) return;
+      j.text = state; j.textFraction = frac;
+      scheduleSyncRender();
+    },
+  };
+}
+
+// Adds jobs up into what the bar shows.
+function summarizeJobs(jobs) {
+  const sum = {
+    photo: { total: 0, done: 0, bytes: 0, bytesDone: 0 },
+    audio: { total: 0, done: 0, bytes: 0, bytesDone: 0 },
+    notes: 0, textDone: 0, textFrac: 0, current: null, preparing: null, titles: [],
+  };
+  for (const j of jobs) {
+    sum.notes++;
+    sum.titles.push(j.title);
+    for (const f of Object.values(j.files)) {
+      const k = f.kind === 'audio' ? sum.audio : sum.photo;
+      k.total++; k.bytes += f.size || 0;
+      if (f.done) { k.done++; k.bytesDone += f.size || 0; }
+    }
+    if (j.current) {
+      const k = j.current.kind === 'audio' ? sum.audio : sum.photo;
+      k.bytesDone += (j.current.size || 0) * j.current.fraction;
+      sum.current = j.current;
+    }
+    if (j.prep) sum.preparing = j.prep;
+    if (j.text === 'done') { sum.textDone++; sum.textFrac += 1; } else if (j.text === 'active') sum.textFrac += j.textFraction || 0;
+  }
+  return sum;
+}
+
+function stepFromKind(key, label, k, active) {
+  const frac = k.bytes > 0 ? k.bytesDone / k.bytes : (k.total ? k.done / k.total : 0);
+  const finished = k.total > 0 && k.done >= k.total;
+  const state = finished ? 'done' : (active || k.done > 0 || k.bytesDone > 0) ? 'active' : 'wait';
+  const count = state === 'done' ? 'done' : state === 'wait' ? 'pending' : `${k.done} / ${k.total}`;
+  const noun = key === 'audio' ? (k.total === 1 ? 'clip' : 'clips') : (k.total === 1 ? 'photo' : 'photos');
+  return { key, label, frac: finished ? 1 : frac, state, count, aria: state === 'wait' ? `${k.total} ${noun} pending` : `${k.done} of ${k.total} ${noun} uploaded` };
+}
+
+function stepsFromSummary(sum) {
+  if (sum.photo.total + sum.audio.total === 0) return null; // a plain text save needs just the one line
+  const steps = [];
+  if (sum.photo.total) steps.push(stepFromKind('photo', 'Photos', sum.photo, !!(sum.current && sum.current.kind !== 'audio')));
+  if (sum.audio.total) steps.push(stepFromKind('audio', 'Audio', sum.audio, !!(sum.current && sum.current.kind === 'audio')));
+  const textFrac = sum.notes ? sum.textFrac / sum.notes : 0;
+  const textDone = sum.notes > 0 && sum.textDone >= sum.notes;
+  const textActive = !textDone && textFrac > 0;
+  steps.push({
+    key: 'text',
+    label: sum.notes > 1 ? 'Notes' : 'Note text',
+    frac: textDone ? 1 : textFrac,
+    state: textDone ? 'done' : textActive ? 'active' : 'wait',
+    count: textDone ? 'done' : textActive ? (sum.notes > 1 ? `${sum.textDone} / ${sum.notes}` : `${Math.round(textFrac * 100)}%`) : 'pending',
+    aria: textDone ? 'saved' : 'waiting until the photos and audio are up',
+  });
+  return steps;
+}
+
+function overallFraction(sum) {
+  const count = sum.photo.total + sum.audio.total;
+  const textFrac = sum.notes ? sum.textFrac / sum.notes : 0;
+  if (!count) return textFrac > 0 ? textFrac : null; // null = indeterminate
+  const media = sum.photo.bytes + sum.audio.bytes;
+  const mediaFrac = media > 0 ? (sum.photo.bytesDone + sum.audio.bytesDone) / media : (sum.photo.done + sum.audio.done) / count;
+  return Math.min(1, mediaFrac * 0.97 + textFrac * 0.03);
+}
+
+function jobHeadline(sum) {
+  const only = sum.notes === 1 && sum.titles[0] ? `\u201c${sum.titles[0].slice(0, 28)}\u201d` : '';
+  const hasMedia = sum.photo.total + sum.audio.total > 0;
+  if (sum.current) {
+    const c = sum.current;
+    const k = c.kind === 'audio' ? sum.audio : sum.photo; // same figures as the rows below, not just this run's share
+    const noun = c.kind === 'audio' ? 'audio clip' : 'photo';
+    return `Uploading ${noun} ${Math.min(k.total, k.done + 1)} of ${k.total} \u00b7 ${Math.round((overallFraction(sum) || 0) * 100)}%`;
+  }
+  if (sum.preparing) return `Getting ${sum.preparing.what} ready \u00b7 ${sum.preparing.done} of ${sum.preparing.total}`;
+  if (hasMedia && sum.textFrac > 0) return 'Saving the note itself\u2026';
+  if (hasMedia) return sum.notes > 1 ? `Uploading ${sum.notes} notes\u2026` : `Uploading${only ? ' ' + only : ''}\u2026`;
+  return only ? `Saving ${only}\u2026` : 'Saving\u2026';
+}
+
+function renderSyncJobs() {
+  if (!SyncJobs.size) return;
+  const sum = summarizeJobs(SyncJobs.values());
+  syncBarSet(jobHeadline(sum), overallFraction(sum), stepsFromSummary(sum));
+}
+
+// A job is over. If it was the last one, close the bar out.
+function syncJobEnd(noteId, outcome /* 'ok' | 'offline' | 'error' */, message, retry) {
+  const job = SyncJobs.get(noteId);
+  SyncJobs.delete(noteId);
+  clearTimeout(syncRenderTimer); syncRenderTimer = 0;
+  if (SyncJobs.size) { renderSyncJobs(); return; }
+  if (outcome === 'ok') {
+    if (job) {
+      for (const f of Object.values(job.files)) f.done = true;
+      job.text = 'done'; job.textFraction = 1; job.current = null;
+      syncBarSuccess(Object.keys(job.files).length ? 'Everything uploaded' : 'Saved', stepsFromSummary(summarizeJobs([job])));
+    } else syncBarSuccess('Saved');
+  } else if (outcome === 'error') {
+    syncBarError(message || 'Couldn\u2019t save \u2014 tap to retry', retry || (() => flushOutbox()));
+  } else {
+    syncBarHideSoon(300); // offline: the note is safe on this device; the header pill says what is waiting
+  }
+}
+
+// After the app is reopened with data still waiting to go up: say so right away, with the counts,
+// instead of sitting silent until the connection to Backblaze has been made.
+async function showUnsyncedSummary() {
+  if (SyncJobs.size || isFlushing) return;
+  const items = (await getOutbox()).filter((i) => i.op === 'save');
+  const jobs = [];
+  for (const it of items) {
+    if (it.batch && Object.keys(it.batch).length) jobs.push(await fillJobFiles(newSyncJob(it.id, it.title), it.batch));
+  }
+  const sum = summarizeJobs(jobs);
+  const remaining = (sum.photo.total - sum.photo.done) + (sum.audio.total - sum.audio.done);
+  if (!jobs.length || remaining <= 0) return;
+  if (SyncJobs.size || isFlushing) return; // a live upload started while this was being read
+  syncSummaryShown = true;
+  syncBarSet(navigator.onLine ? 'Picking up where the upload stopped\u2026' : 'Offline \u2014 this is waiting to upload', overallFraction(sum), stepsFromSummary(sum));
+  if (!navigator.onLine) syncBarHideSoon(7000);
 }
 
 /* ---------------------------------------------------------------------
@@ -957,19 +1272,41 @@ async function rerenderFromLocal() {
   renderStorageSection();
 }
 
-// Pushes every queued save/delete to the server, oldest first. Stops at the
-// first connection failure (the rest stay queued for next time); a real
-// server error on one note leaves just that note queued and carries on.
+function syncStateOf(noteId) {
+  let st = syncStateByNote.get(noteId);
+  if (!st) { st = { inFlight: false, queued: null }; syncStateByNote.set(noteId, st); }
+  return st;
+}
+
+const flushErrorSeen = new Map(); // note id -> last error shown, so a retry timer doesn't re-raise the same one
+
+// Pushes every queued save/delete to the server, oldest first, ONE note at a time and - inside a
+// note - one photo or clip at a time. Whatever the bucket already has is skipped, so after the app
+// was closed or the connection dropped this carries on from the next unsent file. Stops at the first
+// connection failure (the rest stay queued for next time); a real server error on one note leaves just
+// that note queued and carries on.
 async function flushOutbox() {
   if (isFlushing || !navigator.onLine) return;
   const items = (await getOutbox()).sort((a, b) => a.queuedAt - b.queuedAt);
-  if (!items.length) return;
+  if (!items.length) {
+    if (syncSummaryShown) { syncSummaryShown = false; syncBarHideSoon(300); }
+    return;
+  }
   isFlushing = true;
+  const mine = []; // jobs this flush opened (an editor's own job for the same note is never touched)
   try {
+    // Register every queued save first, so the bar shows the whole queue as one piece of work.
     for (const item of items) {
-      // A live editor/background save is already handling this note — let it.
-      const st = syncStateByNote.get(item.id);
-      if (st && st.inFlight) continue;
+      if (item.op !== 'save' || syncStateOf(item.id).inFlight || SyncJobs.has(item.id)) continue;
+      await syncJobBegin(item.id, item.title, item.batch || {}, 'flush');
+      mine.push(item.id);
+    }
+    for (const item of items) {
+      // A live editor/background save is already handling this note - let it. Marking the note
+      // in flight also makes the editor queue any new edit instead of racing this upload.
+      const st = syncStateOf(item.id);
+      if (st.inFlight) { if (mine.includes(item.id)) SyncJobs.delete(item.id); continue; }
+      st.inFlight = true;
       try {
         let result = null;
         let payload = null;
@@ -985,15 +1322,15 @@ async function flushOutbox() {
           }
         } else {
           payload = await getOutboxPayload(item.id);
-          if (!payload) { await clearOutbox(item.id); continue; } // nothing left to send
-          result = await API.saveNote(item.id, payload);
+          if (!payload) { await clearOutbox(item.id); SyncJobs.delete(item.id); continue; } // nothing left to send
+          result = await API.saveNote(item.id, payload, jobReporter(item.id));
         }
         setOnline(true);
         // If the note was edited again while this request was in flight, a
         // newer entry replaced this one in the outbox — leave that newer
         // one (and its cached copy) alone; the next flush sends it.
         const latest = await getOutboxItem(item.id);
-        if (latest && latest.queuedAt !== item.queuedAt) continue;
+        if (latest && latest.queuedAt !== item.queuedAt) { SyncJobs.delete(item.id); continue; }
         if (item.op === 'delete') {
           await removeCachedNote(item.id);
         } else {
@@ -1003,14 +1340,29 @@ async function flushOutbox() {
           }
         }
         await clearOutbox(item.id);
+        flushErrorSeen.delete(item.id);
+        if (item.op === 'save') syncJobEnd(item.id, 'ok');
       } catch (e) {
         if (e.isNetworkError) { setOnline(false); break; }
         // Real server error for this one item — leave it queued, keep going.
         // (Deletes of missing notes are handled above and never land here.)
+        if (item.op === 'save') {
+          const fresh = flushErrorSeen.get(item.id) !== e.message;
+          flushErrorSeen.set(item.id, e.message);
+          if (fresh) { toast(e.message || 'Couldn\u2019t finish saving.'); syncJobEnd(item.id, 'error', 'Couldn\u2019t finish saving \u2014 kept on this device, tap to retry', () => flushOutbox()); }
+          else syncJobEnd(item.id, 'offline');
+        }
+      } finally {
+        st.inFlight = false;
+        maybeContinueQueued(item.id, st);
       }
     }
   } finally {
     isFlushing = false;
+    // Anything this flush opened and did not finish (connection lost) goes quiet; it is still queued.
+    let dropped = false;
+    for (const id of mine) { const j = SyncJobs.get(id); if (j && j.owner === 'flush') { SyncJobs.delete(id); dropped = true; } }
+    if (dropped && !SyncJobs.size) syncBarHideSoon(300);
     await rerenderFromLocal();
   }
 }
@@ -1077,7 +1429,6 @@ function revealLockedCard(id) {
 }
 let editingNoteId = null;        // generated client-side the moment the editor opens — see openEditorWithContent
 let noteExistsOnServer = false;  // false until this note's first background save actually succeeds
-let editorImages = [];
 let editorAudio = {};            // clip id -> { data (audio data: URL), dur (seconds), name }
 let lightboxIndex = 0;
 let pendingLock = null;          // { type: 'quick'|'time', password?, password2?, unlockAt?, existing? }
@@ -1185,13 +1536,15 @@ setInterval(() => { if (notesCache.some((m) => m.lockType === 'time')) renderLoc
 // queued entry it supersedes, and redraws the grid — straight from the
 // response already in hand rather than re-fetching the whole list. This is
 // what makes a save actually feel instant in the list, not just the editor.
-async function applySavedNote(noteId, note, payload, title) {
+async function applySavedNote(noteId, note, payload, title, queuedAt) {
   const pending = await getOutboxItem(noteId);
   // Deleted while this save was in flight — leave the queued delete alone
   // (it'll clear the server copy this request just wrote) instead of
   // resurrecting the note in the cache.
   if (pending && pending.op === 'delete') return;
-  await clearOutbox(noteId);
+  // The outbox entry is cleared only if it is still the one this save wrote; an edit that has
+  // replaced it since stays queued, and its newer cached copy is left alone.
+  if (!(await clearOutboxIfCurrent(noteId, queuedAt))) return;
   await cacheNote(note, payload.content, lockedTitleFor(payload, title));
   if (payload.lockType === 'time' && payload.password2) await cacheVault(noteId, payload.password2, note.updatedAt);
   // Forget this device's copies of photos/audio the saved note no longer refers to.
@@ -1224,18 +1577,24 @@ function synthesizeMeta(id, payload) {
   };
 }
 
-async function applyOfflineSavedNote(noteId, payload, title) {
+// Local-first: before a single byte goes to the bucket, the note exactly as it is about to be sent
+// (text, lock, references to its photos and audio) is cached on this device AND queued in the outbox,
+// and the photos/audio themselves already sit in the media store. From that moment closing the app,
+// losing the connection or being killed mid-upload cannot lose the change - not even a lock - and the
+// upload simply carries on from where it stopped the next time. Resolves with the outbox stamp (0 if
+// the note was deleted meanwhile and nothing was written).
+async function persistLocalFirst(noteId, payload, title, info) {
   const pending = await getOutboxItem(noteId);
-  if (pending && pending.op === 'delete') return; // deleted meanwhile — don't resurrect it
+  if (pending && pending.op === 'delete') return 0; // deleted meanwhile - don't resurrect it
   const meta = synthesizeMeta(noteId, payload);
   await cacheNote(meta, payload.content, lockedTitleFor(payload, title));
   if (payload.lockType === 'time' && payload.password2) await cacheVault(noteId, payload.password2, meta.updatedAt);
-  await queueOutbox(noteId, 'save', payload);
+  const queuedAt = await queueOutbox(noteId, 'save', payload, { title, batch: (info && info.batch) || {} });
   if (payload.mediaKeep && window.KSMedia) { try { await KSMedia.reconcile(noteId, payload.mediaKeep); } catch (e) { /* best-effort */ } }
   // The outbox is now the durable local copy of this exact content, so the
   // abrupt-close draft would just be a duplicate of it.
   clearLocalDraft(noteId);
-  await rerenderFromLocal();
+  return queuedAt;
 }
 
 let lastListErrorMessage = null;
@@ -1366,13 +1725,42 @@ function switchView(view) {
  * Editor
  * ------------------------------------------------------------------- */
 
-// A 72px thumbnail used to be the full-size photo scaled down by CSS — so a
-// note with a few "Original"-quality photos made the browser decode several
-// 12-megapixel images just to draw a thumbnail strip. Draw from a small
-// decoded copy instead (made once per photo, kept only while the editor is open).
+// Photos live in the text, like audio clips: each is a <ks-photo data-id> element (see hydratePhotos),
+// and the photo's data: URL is kept here by id. A photo is part of the note only while its element
+// is still in the text - the same rule clips follow - and it is removed from the photo viewer, never
+// by a stray tap on the grid.
+const PHOTO_ID_RE = /^p[a-z0-9]{6,31}$/;
+let editorPhotos = {};   // photo id -> data: URL
+let lightboxIds = [];    // the photos the viewer is paging through, in text order
+
+function newPhotoId() {
+  return 'p' + Array.from(crypto.getRandomValues(new Uint8Array(8)), (x) => x.toString(16).padStart(2, '0')).join('');
+}
+
+// Ids of the photos still in the text, in the order they appear (a photo shown twice counts once).
+function photoIdsInBody() {
+  const seen = new Set();
+  const out = [];
+  document.querySelectorAll('#editor-body ks-photo').forEach((el) => {
+    const id = el.getAttribute('data-id');
+    if (editorPhotos[id] && !seen.has(id)) { seen.add(id); out.push(id); }
+  });
+  return out;
+}
+
+function editorImageList() { return photoIdsInBody().map((id) => editorPhotos[id]); }
+
+// A grid cell is at most ~170px wide, so a 360px copy stays sharp on a phone screen. Decoding a
+// full-size photo for every cell would be the slow part of a 100-photo note, so the copies are made
+// two at a time, and only for cells near the screen.
 const thumbUrls = new Map(); // fingerprint -> object URL
+const thumbQueue = [];
+let thumbActive = 0;
+let thumbObserver = null;
 
 function clearThumbUrls() {
+  thumbQueue.length = 0;
+  if (thumbObserver) { thumbObserver.disconnect(); thumbObserver = null; }
   for (const url of thumbUrls.values()) if (url.startsWith('blob:')) URL.revokeObjectURL(url);
   thumbUrls.clear();
 }
@@ -1384,9 +1772,9 @@ async function makeThumbURL(src) {
   try {
     const blob = await (await fetch(src)).blob();
     let bitmap;
-    try { bitmap = await createImageBitmap(blob, { resizeWidth: 160, resizeQuality: 'medium' }); }
+    try { bitmap = await createImageBitmap(blob, { resizeWidth: 360, resizeQuality: 'medium' }); }
     catch (e) { bitmap = await createImageBitmap(blob); }
-    const scale = Math.min(1, 160 / Math.max(bitmap.width, bitmap.height));
+    const scale = Math.min(1, 360 / Math.max(bitmap.width, bitmap.height));
     const canvas = document.createElement('canvas');
     canvas.width = Math.max(1, Math.round(bitmap.width * scale));
     canvas.height = Math.max(1, Math.round(bitmap.height * scale));
@@ -1402,46 +1790,153 @@ async function makeThumbURL(src) {
   return url;
 }
 
-function renderEditorThumbs() {
-  const wrap = document.getElementById('editor-thumbs');
-  wrap.textContent = '';
-  editorImages.forEach((src, i) => {
-    const thumb = document.createElement('div');
-    thumb.className = 'thumb';
+function pumpThumbs() {
+  while (thumbActive < 2 && thumbQueue.length) {
+    const job = thumbQueue.shift();
+    if (!job.img.isConnected) continue;
+    thumbActive++;
+    makeThumbURL(job.src)
+      .then((url) => { if (job.img.isConnected) job.img.src = url; })
+      .finally(() => { thumbActive--; pumpThumbs(); });
+  }
+}
+
+function wantThumb(img) {
+  const src = editorPhotos[img.dataset.photoId];
+  if (!src) return;
+  const cached = thumbUrls.get(mediaSig(src));
+  if (cached) { img.src = cached; return; }
+  thumbQueue.push({ img, src });
+  pumpThumbs();
+}
+
+function observeThumb(img) {
+  if (!('IntersectionObserver' in window)) { wantThumb(img); return; }
+  if (!thumbObserver) {
+    thumbObserver = new IntersectionObserver((entries) => {
+      for (const e of entries) if (e.isIntersecting) { thumbObserver.unobserve(e.target); wantThumb(e.target); }
+    }, { root: document.querySelector('.editor-scroll'), rootMargin: '700px 0px' });
+  }
+  thumbObserver.observe(img);
+}
+
+// Gives every <ks-photo> its tile: the picture, its size, and a button that opens the viewer.
+function hydratePhotos(root) {
+  root.querySelectorAll('ks-photo').forEach((el) => {
+    el.setAttribute('contenteditable', 'false');
+    el.textContent = '';
+    const id = el.getAttribute('data-id');
+    const tile = document.createElement('button');
+    tile.type = 'button';
+    tile.className = 'photo-tile';
+    tile.dataset.id = id;
+    const src = editorPhotos[id];
+    if (!src) {
+      tile.classList.add('is-missing');
+      tile.disabled = true;
+      tile.textContent = 'Photo missing';
+      el.appendChild(tile);
+      return;
+    }
     const img = document.createElement('img');
     img.alt = '';
-    img.dataset.idx = String(i);
-    const cached = thumbUrls.get(mediaSig(src));
-    if (cached) img.src = cached;
-    else makeThumbURL(src).then((url) => { if (img.isConnected && editorImages[Number(img.dataset.idx)] === src) img.src = url; });
-    img.addEventListener('click', () => openLightbox(Number(img.dataset.idx)));
+    img.draggable = false;
+    img.dataset.photoId = id;
     const size = document.createElement('span');
-    size.className = 'thumb-size';
+    size.className = 'photo-size';
     size.textContent = formatBytes(estimateImageBytes(src));
-    const remove = document.createElement('button');
-    remove.className = 'thumb-remove';
-    remove.setAttribute('aria-label', 'Remove image');
-    remove.textContent = '\u00d7';
-    remove.addEventListener('click', (e) => {
-      e.stopPropagation();
-      editorImages.splice(Number(img.dataset.idx), 1);
-      renderEditorThumbs();
-      updateSizeMeter();
-      onEditorContentChanged();
-    });
-    thumb.append(img, size, remove);
-    wrap.appendChild(thumb);
+    tile.append(img, size);
+    el.appendChild(tile);
+    observeThumb(img);
   });
+  labelPhotoTiles();
+}
+
+function labelPhotoTiles() {
+  const ids = photoIdsInBody();
+  document.querySelectorAll('#editor-body .photo-tile[data-id]').forEach((tile) => {
+    const n = ids.indexOf(tile.dataset.id) + 1;
+    if (n) tile.setAttribute('aria-label', `Open photo ${n} of ${ids.length}`);
+  });
+}
+
+// Where a batch of new photos goes: in a block of their own right after the line the cursor was in,
+// so they sit between lines of text rather than splitting one. Photos from one batch share the block
+// and so form one grid.
+function beginPhotoBatch() {
+  const body = document.getElementById('editor-body');
+  let anchor = null;
+  if (savedBodyRange && body.contains(savedBodyRange.endContainer)) {
+    let n = savedBodyRange.endContainer;
+    while (n && n.parentNode !== body) n = n.parentNode;
+    if (n && n.parentNode === body) anchor = n;
+  }
+  return { anchor, wrap: null };
+}
+
+function addPhotoToBatch(batch, dataUrl) {
+  const body = document.getElementById('editor-body');
+  const id = newPhotoId();
+  editorPhotos[id] = dataUrl;
+  if (!batch.wrap || !batch.wrap.isConnected) {
+    const wrap = document.createElement('div');
+    if (batch.anchor && batch.anchor.parentNode === body) body.insertBefore(wrap, batch.anchor.nextSibling);
+    else body.appendChild(wrap);
+    // Somewhere to keep typing underneath the photos.
+    if (!wrap.nextSibling) { const line = document.createElement('div'); line.appendChild(document.createElement('br')); body.appendChild(line); }
+    batch.wrap = wrap;
+  }
+  const el = document.createElement('ks-photo');
+  el.setAttribute('data-id', id);
+  batch.wrap.appendChild(el);
+  hydratePhotos(el.parentNode);
+  const range = document.createRange();
+  range.setStartAfter(batch.wrap);
+  range.collapse(true);
+  savedBodyRange = range;
+  return id;
+}
+
+function removePhoto(id) {
+  delete editorPhotos[id];
+  document.querySelectorAll(`#editor-body ks-photo[data-id="${id}"]`).forEach((el) => {
+    const wrap = el.parentNode;
+    el.remove();
+    if (wrap && wrap.id !== 'editor-body' && wrap.tagName === 'DIV' && !wrap.childNodes.length) wrap.remove();
+  });
+  labelPhotoTiles();
+  updateSizeMeter();
+  onEditorContentChanged();
+}
+
+// Backspace/Delete right next to a photo must not quietly take it out of the note.
+function photoNextToCaret(backward) {
+  const sel = window.getSelection();
+  if (!sel.rangeCount || !sel.isCollapsed) return false;
+  const r = sel.getRangeAt(0);
+  const node = r.startContainer;
+  let target = null;
+  if (node.nodeType === 3) {
+    if (backward && r.startOffset === 0) target = node.previousSibling;
+    else if (!backward && r.startOffset === node.nodeValue.length) target = node.nextSibling;
+  } else {
+    target = backward ? node.childNodes[r.startOffset - 1] : node.childNodes[r.startOffset];
+  }
+  while (target && target.nodeType === 3 && !target.nodeValue) target = backward ? target.previousSibling : target.nextSibling;
+  return !!(target && target.nodeType === 1 && target.tagName === 'KS-PHOTO');
 }
 
 /* ---------------------------------------------------------------------
  * Lightbox — full-screen photo viewer with left/right paging, opened by
- * tapping any thumbnail in the editor.
+ * tapping any photo in the text. It is also the only place a photo can be
+ * removed from a note, so that can't happen by a stray tap on the grid.
  * ------------------------------------------------------------------- */
 
-function openLightbox(index) {
-  if (!editorImages.length) return;
-  lightboxIndex = index;
+function openLightbox(id) {
+  const ids = photoIdsInBody();
+  const i = ids.indexOf(id);
+  if (i < 0) return;
+  lightboxIndex = i;
   renderLightbox();
   show('overlay-lightbox');
 }
@@ -1449,18 +1944,19 @@ function openLightbox(index) {
 function closeLightbox() { hide('overlay-lightbox'); }
 
 function lightboxStep(delta) {
-  const total = editorImages.length;
+  const total = photoIdsInBody().length;
   if (!total) return;
   lightboxIndex = (lightboxIndex + delta + total) % total;
   renderLightbox();
 }
 
 function renderLightbox() {
-  const total = editorImages.length;
+  lightboxIds = photoIdsInBody();
+  const total = lightboxIds.length;
   if (!total) { closeLightbox(); return; }
   if (lightboxIndex >= total) lightboxIndex = total - 1;
   if (lightboxIndex < 0) lightboxIndex = 0;
-  const src = editorImages[lightboxIndex];
+  const src = editorPhotos[lightboxIds[lightboxIndex]];
   document.getElementById('lightbox-img').src = src;
   document.getElementById('lightbox-caption').textContent =
     total > 1
@@ -1471,9 +1967,19 @@ function renderLightbox() {
   document.getElementById('btn-lightbox-next').style.visibility = showNav ? 'visible' : 'hidden';
 }
 
+function confirmRemovePhoto() {
+  const id = lightboxIds[lightboxIndex];
+  if (!id) return;
+  openConfirm('Remove this photo?', 'It is taken out of the note. This can\u2019t be undone once the note is saved.', () => {
+    removePhoto(id);
+    renderLightbox();
+  }, 'Remove photo');
+}
+
 function setupLightbox() {
   document.getElementById('btn-lightbox-close').addEventListener('click', closeLightbox);
   document.getElementById('btn-lightbox-compress').addEventListener('click', compressSavedPhoto);
+  document.getElementById('btn-lightbox-remove').addEventListener('click', confirmRemovePhoto);
   document.getElementById('btn-lightbox-prev').addEventListener('click', () => lightboxStep(-1));
   document.getElementById('btn-lightbox-next').addEventListener('click', () => lightboxStep(1));
 
@@ -1485,6 +1991,7 @@ function setupLightbox() {
 
   document.addEventListener('keydown', (e) => {
     if (document.getElementById('overlay-lightbox').classList.contains('hidden')) return;
+    if (document.querySelector('.overlay:not(.hidden)')) return; // a dialog (e.g. "Remove this photo?") is on top of the viewer
     if (e.key === 'Escape') closeLightbox();
     else if (e.key === 'ArrowLeft') lightboxStep(-1);
     else if (e.key === 'ArrowRight') lightboxStep(1);
@@ -1538,7 +2045,7 @@ function renderLockSummary() {
 function noteHasContent() {
   const title = document.getElementById('editor-title').value.trim();
   const body = document.getElementById('editor-body').textContent.trim();
-  return !!(title || body || editorImages.length || Ink.strokes.length
+  return !!(title || body || document.getElementById('editor-body').querySelector('ks-photo') || Ink.strokes.length
     || document.getElementById('editor-body').querySelector('ks-audio'));
 }
 
@@ -1559,8 +2066,26 @@ function setEditorContent(content) {
   bodyEl.innerHTML = content.html ? sanitizeHTML(content.html) : textToHTML(content.body);
   hydrateAudioChips(bodyEl);
   // Only real data: URLs ever reach the <img> markup.
-  editorImages = (content.images || []).filter((s) => typeof s === 'string' && /^data:image\//.test(s));
-  renderEditorThumbs();
+  editorPhotos = {};
+  const loose = [];
+  (content.images || []).forEach((s, i) => {
+    if (typeof s !== 'string' || !/^data:image\//.test(s)) return;
+    const given = Array.isArray(content.imageIds) ? content.imageIds[i] : '';
+    const id = PHOTO_ID_RE.test(given || '') && !editorPhotos[given] ? given : newPhotoId();
+    editorPhotos[id] = s;
+    loose.push(id);
+  });
+  // A photo element whose picture is gone is dropped; a picture with no element yet (notes from before
+  // photos could sit in the text kept them in a row under it) goes in one grid at the end.
+  bodyEl.querySelectorAll('ks-photo').forEach((el) => { if (!editorPhotos[el.getAttribute('data-id')]) el.remove(); });
+  const placed = new Set(Array.from(bodyEl.querySelectorAll('ks-photo')).map((el) => el.getAttribute('data-id')));
+  const unplaced = loose.filter((id) => !placed.has(id));
+  if (unplaced.length) {
+    const wrap = document.createElement('div');
+    for (const id of unplaced) { const el = document.createElement('ks-photo'); el.setAttribute('data-id', id); wrap.appendChild(el); }
+    bodyEl.appendChild(wrap);
+  }
+  hydratePhotos(bodyEl);
   inkLoad(content.drawing);
   updateSizeMeter();
 }
@@ -1671,11 +2196,13 @@ function resolveLockForSnapshot() {
 
 function captureSnapshot() {
   const html = sanitizeHTML(document.getElementById('editor-body').innerHTML);
+  const imageIds = photoIdsInBody();
   return {
     title: document.getElementById('editor-title').value.trim(),
     body: htmlToText(html), // plain-text copy: previews, search, and readers that predate formatting
     html,
-    images: editorImages.slice(),
+    images: imageIds.map((id) => editorPhotos[id]),
+    imageIds,
     audio: snapshotAudio(html),
     drawing: inkGetData(),
     lock: resolveLockForSnapshot(),
@@ -1695,14 +2222,16 @@ function snapshotAudio(html) {
 // Same, for the local-draft safety net.
 function saveDraftNow(noteId) {
   const html = sanitizeHTML(document.getElementById('editor-body').innerHTML);
+  const imageIds = photoIdsInBody();
   saveLocalDraft(noteId, document.getElementById('editor-title').value, htmlToText(html),
-    editorImages.slice(), html, inkGetData(), snapshotAudio(html));
+    imageIds.map((id) => editorPhotos[id]), imageIds, html, inkGetData(), snapshotAudio(html));
 }
 
-async function buildSavePayload(snapshot, noteId) {
+async function buildSavePayload(snapshot, noteId, onPrepare) {
   const { title, body, html, images, drawing, lock } = snapshot;
   const audio = snapshot.audio || {};
   const content = { title, body, html, images };
+  if (snapshot.imageIds && snapshot.imageIds.length) content.imageIds = snapshot.imageIds; // where each photo sits in the text
   if (Object.keys(audio).length) content.audio = audio;
   if (drawing) content.drawing = drawing;
 
@@ -1711,12 +2240,21 @@ async function buildSavePayload(snapshot, noteId) {
   let stored = content;
   let mediaKeep = null;
   let mediaBytes = 0;
+  let mediaKinds = {};
+  let mediaSizes = {};
+  let batch = {};
+  const hasAudioClips = Object.keys(audio).length > 0;
+  const prepWhat = hasAudioClips ? (images.length ? 'photos and audio' : 'audio') : 'photos';
   if (noteId && window.KSMedia && KSMedia.available()) {
     try {
-      const ext = await KSMedia.externalize(noteId, content, !!(lock && lock.type !== 'none'));
+      const ext = await KSMedia.externalize(noteId, content, !!(lock && lock.type !== 'none'),
+        onPrepare ? (done, total) => onPrepare(done, total, prepWhat) : null);
       stored = ext.content;
       mediaKeep = ext.keep;
       mediaBytes = ext.bytes;
+      mediaKinds = ext.kinds;
+      mediaSizes = ext.sizes;
+      batch = await KSMedia.pendingKinds(noteId, ext.keep, ext.kinds); // what still has to be sent
     } catch (e) {
       if (e && e.tooBig) throw e;
       // Couldn't move the media out (say this browser won't keep it locally): fall back to
@@ -1737,11 +2275,9 @@ async function buildSavePayload(snapshot, noteId) {
     const record = await encryptNote(combine(lock.password, lock.password2), stored);
     payload = { lockType: 'time', title, unlockAt: lock.unlockAt, password2: lock.password2, content: record };
   }
-  if (mediaKeep) { payload.mediaKeep = mediaKeep; payload.mediaBytes = mediaBytes; }
+  if (mediaKeep) { payload.mediaKeep = mediaKeep; payload.mediaBytes = mediaBytes; payload.mediaKinds = mediaKinds; payload.mediaSizes = mediaSizes; }
 
-  const hasAudio = Object.keys(audio).length > 0;
-  const mediaWhat = hasAudio ? (images.length ? 'photos & audio' : 'audio') : 'photos';
-  return { payload, hasImages: images.length > 0 || hasAudio, mediaWhat };
+  return { payload, batch, hasImages: images.length > 0 || hasAudioClips };
 }
 
 /* ---------------------------------------------------------------------
@@ -1775,80 +2311,82 @@ function runSync(noteId, snapshot) {
   syncRunOne(noteId, snapshot, state);
 }
 
-async function syncRunOne(noteId, snapshot, state) {
-  // Only the note currently open in the editor (or just closed from it)
-  // gets to talk in the sync bar — a background save finishing for some
-  // *other* note shouldn't interrupt whatever the person is looking at now.
-  const showInBar = () => noteId === editingNoteId;
+// editingNoteId is left set after the editor is hidden, so "is this note on screen right now?" needs the overlay too.
+function editorShowing(noteId) {
+  return noteId === editingNoteId && !document.getElementById('overlay-editor').classList.contains('hidden');
+}
 
+async function syncRunOne(noteId, snapshot, state) {
+  const editing = () => editorShowing(noteId);
+  const job = await syncJobBegin(noteId, snapshot.title, {}, 'editor');
+
+  // 1. Turn photos/audio into stored files (encrypting them first for a locked note). Each one is
+  //    saved on this device as it is made, so this is also where \"100 photos\" is worked through
+  //    one at a time rather than all at once.
   let built;
   try {
-    built = await buildSavePayload(snapshot, noteId);
+    built = await buildSavePayload(snapshot, noteId, (done, total, what) => {
+      job.prep = { done, total, what };
+      scheduleSyncRender();
+    });
   } catch (e) {
     state.inFlight = false;
     const tooBig = !!(e && e.tooBig);
-    toast(tooBig ? e.message : 'Could not lock note — try setting the lock again.');
-    if (showInBar()) syncBarError(tooBig ? 'Couldn\u2019t save — a file is too big' : 'Couldn\u2019t save — check the lock', () => runSync(noteId, snapshot));
+    toast(tooBig ? e.message : 'Could not lock note \u2014 try setting the lock again.');
+    syncJobEnd(noteId, 'error', tooBig ? 'Couldn\u2019t save \u2014 a file is too big' : 'Couldn\u2019t save \u2014 check the lock', () => runSync(noteId, snapshot));
     maybeContinueQueued(noteId, state);
     return;
   }
+  job.prep = null;
+  const { payload, batch } = built;
 
-  const { payload, hasImages, mediaWhat } = built;
+  // 2. Write it down - note, lock and queue - BEFORE uploading anything.
+  let queuedAt = 0;
+  try {
+    queuedAt = await persistLocalFirst(noteId, payload, snapshot.title, { batch });
+  } catch (e) { /* still try to send it below; the worst case is the old behaviour */ }
+  if (!queuedAt && (await getOutboxItem(noteId) || {}).op === 'delete') { // deleted while this was being prepared
+    SyncJobs.delete(noteId);
+    state.inFlight = false;
+    maybeContinueQueued(noteId, state);
+    return;
+  }
+  if (editing()) {
+    noteExistsOnServer = true;
+    setExistingNoteButtons(true);
+    document.getElementById('editor-heading').textContent = 'Edit note';
+    lastAutosavedJSON = snapshotKey(snapshot); // covered now: autosave need not send the same thing again
+  }
+  const queued = await getOutboxItem(noteId);
+  await fillJobFiles(job, (queued && queued.batch) || batch);
+  if (!editing()) await rerenderFromLocal(); // the card shows its lock / \"Not synced\" at once
+  scheduleSyncRender();
 
-  // Photos and audio only go up when they actually changed (the note itself
-  // is just text and references), so "saving photos" is only worth calling
-  // out when media is part of what changed. Otherwise a plain text edit on a
-  // photo-heavy note would misleadingly claim to be re-saving pictures on
-  // every autosave tick.
-  const imagesJSON = mediaKey(snapshot);
-  const imagesChanged = hasImages && imagesJSON !== state.lastSyncedImagesJSON;
-
-  const onProgress = imagesChanged && showInBar()
-    ? (fraction) => syncBarSet(`Saving ${mediaWhat}… ${Math.round(fraction * 100)}%`, fraction)
-    : null;
-  if (showInBar()) syncBarSet(imagesChanged ? `Saving ${mediaWhat}… 0%` : 'Saving…', imagesChanged ? 0 : null);
-
+  // 3. Send it.
   try {
     if (!navigator.onLine) {
-      // No point attempting a request that can't leave the device — go
-      // straight to the offline path below.
       const offlineErr = new Error('Offline');
       offlineErr.isNetworkError = true;
       throw offlineErr;
     }
-    const { note } = await API.saveNote(noteId, payload, onProgress);
+    const { note } = await API.saveNote(noteId, payload, jobReporter(noteId));
     setOnline(true);
     learnServerTitleSupport([note]);
-    if (noteId === editingNoteId) {
-      noteExistsOnServer = true;
-      setExistingNoteButtons(true);
-      document.getElementById('editor-heading').textContent = 'Edit note';
-      lastAutosavedJSON = snapshotKey(snapshot);
-    }
-    state.lastSyncedImagesJSON = imagesJSON;
-    clearLocalDraft(noteId);
-    await applySavedNote(noteId, note, payload, snapshot.title);
-    if (showInBar()) syncBarSuccess('Saved');
+    flushErrorSeen.delete(noteId);
+    state.lastSyncedImagesJSON = mediaKey(snapshot);
+    await applySavedNote(noteId, note, payload, snapshot.title, queuedAt);
+    syncJobEnd(noteId, 'ok');
     flushOutbox(); // a working connection is the moment to drain anything else that's queued
   } catch (e) {
     if (e.isNetworkError) {
-      // Offline (or the connection dropped mid-save). That's not a failure:
-      // the note is cached locally as if it had saved, queued for the next
-      // flush, and marked "Not synced" — no error toast, no retry prompt.
+      // Offline, or the connection dropped part-way. Not a failure: everything is already on this
+      // device and queued, marked \"Not synced\", and the upload picks up from the next unsent file.
       setOnline(false);
-      await applyOfflineSavedNote(noteId, payload, snapshot.title);
-      if (noteId === editingNoteId) {
-        noteExistsOnServer = true;
-        setExistingNoteButtons(true);
-        document.getElementById('editor-heading').textContent = 'Edit note';
-        lastAutosavedJSON = snapshotKey(snapshot);
-      }
-      state.lastSyncedImagesJSON = imagesJSON;
-      if (showInBar()) syncBarSuccess('Saved on this device — will sync later');
-    } else if (showInBar()) {
-      syncBarError('Couldn\u2019t save — tap to retry', () => runSync(noteId, snapshot));
+      syncJobEnd(noteId, 'offline');
+      syncBarSuccess('Saved on this device \u2014 will sync later');
     } else {
-      toast('Couldn\u2019t save "' + (snapshot.title || 'Untitled') + '" — it\u2019s still cached on this device.');
+      toast(e.message || 'Couldn\u2019t finish saving.');
+      syncJobEnd(noteId, 'error', 'Couldn\u2019t finish saving \u2014 kept on this device, tap to retry', () => flushOutbox());
     }
   } finally {
     state.inFlight = false;
@@ -2410,10 +2948,14 @@ function openSettings() {
   document.getElementById('settings-b2-endpoint').value = c.endpoint();
   document.getElementById('settings-b2-bucket').value = c.bucket();
   document.getElementById('settings-b2-keyid').value = c.keyId();
-  document.getElementById('settings-b2-appkey').value = c.appKey();
+  // The saved key is never written back into the field: nothing to reveal, select or copy. Leaving
+  // the field blank keeps the key that is already saved.
+  const keyField = document.getElementById('settings-b2-appkey');
+  keyField.value = '';
+  keyField.placeholder = c.appKey() ? 'Saved on this device \u2014 type a new key to replace it' : '';
   setB2Status('', '');
   fillClockLine();
-  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.8.1';
+  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.9.0';
   fillQualitySettings();
   show('overlay-settings');
   renderStorageSection();
@@ -2483,7 +3025,7 @@ async function saveSettings() {
     endpoint: document.getElementById('settings-b2-endpoint').value,
     bucket: document.getElementById('settings-b2-bucket').value,
     keyId: document.getElementById('settings-b2-keyid').value,
-    appKey: document.getElementById('settings-b2-appkey').value,
+    appKey: document.getElementById('settings-b2-appkey').value.trim() || KSB2.config.appKey(), // blank = keep the saved key
   };
   if (!vals.endpoint.trim() || !vals.bucket.trim() || !vals.keyId.trim() || !vals.appKey.trim()) {
     setB2Status('All four fields are needed.', 'bad');
@@ -2500,6 +3042,7 @@ async function saveSettings() {
     setB2Status(result.message, 'bad');
     return;
   }
+  document.getElementById('settings-b2-appkey').value = '';
   setB2Status('Connected to your bucket.', 'ok');
   hide('overlay-settings');
   refreshNotes();
@@ -2614,6 +3157,7 @@ function wireStaticEvents() {
     let dropped = 0;
     let refused = 0;
     const targetNoteId = editingNoteId; // photos belong to the note they were picked for
+    const batch = beginPhotoBatch(); // they go in the text, between lines, as one grid
 
     const results = [];
     for (let i = 0; i < files.length; i++) {
@@ -2627,8 +3171,7 @@ function wireStaticEvents() {
         // must not be attached to it.
         if (editingNoteId !== targetNoteId) { dropped++; continue; }
         if (!canFitMedia(dataUrl.length + 4).ok) { refused++; continue; }
-        editorImages.push(dataUrl);
-        renderEditorThumbs(); // show each photo as soon as it's ready, not all at once at the end
+        addPhotoToBatch(batch, dataUrl); // shown as soon as it's ready, not all at once at the end
         updateSizeMeter();
         onEditorContentChanged();
       } catch (err) {
@@ -2758,6 +3301,11 @@ function sanitizeHTML(html) {
         if (AUDIO_ID_RE.test(clipId)) out += '<ks-audio data-id="' + clipId + '"></ks-audio>';
         return;
       }
+      if (tag === 'KS-PHOTO') { // a photo in the text: only its id survives
+        const photoId = child.getAttribute('data-id') || '';
+        if (PHOTO_ID_RE.test(photoId)) out += '<ks-photo data-id="' + photoId + '"></ks-photo>';
+        return;
+      }
       if (RICH_DROP_TAGS.has(tag)) return;
       if (tag === 'BR') { out += '<br>'; return; }
       const inner = walk(child);
@@ -2789,6 +3337,7 @@ function htmlToText(html) {
       if (child.nodeType === 3) { cur += child.nodeValue; return; }
       if (child.nodeType !== 1) return;
       const tag = child.tagName.toUpperCase();
+      if (tag === 'KS-PHOTO') return; // photos have no text form
       if (tag === 'KS-AUDIO') { // shows in previews and plain-text readers as a marker
         const clip = editorAudio[child.getAttribute('data-id')];
         if (cur && !/\s$/.test(cur)) cur += ' ';
@@ -3188,37 +3737,64 @@ function canFitMedia(storedLen) {
 }
 
 // ---- playback ----
+//
+// One shared "voice" plays everything: a clip's chip in the text, the clip dialog and the recorder's
+// preview. It owns the timeline, so the bar never depends on what a browser reports about a file.
+// (A recording made in the browser has no length stored in it - the browser says Infinity - which is
+// why a player that trusted the file showed its bar stuck at the end.) The length comes from what was
+// measured when the clip was recorded or attached, and from the file itself once the browser knows.
+//
+// It plays through an <audio> element first. If that is refused, errors, or never actually moves,
+// it switches by itself to decoding the clip with Web Audio and playing that, from the same spot.
 
-const Player = { el: null, id: null };
 const audioUrls = new Map(); // clip id -> blob: URL
+const Voice = {
+  el: null, key: null, src: null, loadedKey: null,
+  mode: 'element', playing: false, ended: false, dur: 0,
+  ctx: null, unlocked: false, buf: null, node: null, startedAt: 0, offset: 0,
+  watchdog: 0, raf: 0, fallingBack: false,
+};
+const VOICE_FALLBACK_MAX_SECONDS = 15 * 60; // decoded audio is raw PCM in memory; keep it bounded
+const VOICE_FALLBACK_MAX_BYTES = 80 * 1024 * 1024;
+const MINI_PLAYERS = []; // { el, key(), known(), dragging }
 
-// Why a clip didn't play, in words. (Safari in particular refuses to start sound that isn't begun
-// directly by a tap, and some browsers can't play WebM at all.)
-function playbackProblem(err) {
-  const n = err && err.name;
-  if (n === 'AbortError') return ''; // another clip was started over this one \u2014 not a problem
-  if (n === 'NotAllowedError') return 'Your browser blocked the sound \u2014 tap play again.';
-  if (n === 'NotSupportedError') return 'This browser can\u2019t play this kind of audio. Open \u22ef and use Download to listen elsewhere.';
-  return 'Couldn\u2019t play this clip.';
+function voiceAudioSession(type) { // Safari: play through the speaker, even after the mic was used, and with the silent switch on
+  try { if (navigator.audioSession) navigator.audioSession.type = type; } catch (e) { /* not supported */ }
 }
 
-function ensurePlayer() {
-  if (Player.el) return Player.el;
+// Web Audio may only be started from a tap on some browsers (Safari), so it is readied inside the tap
+// that starts playback - even though it is only used if the <audio> element doesn't work out.
+function voiceUnlockContext() {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;
+  try {
+    if (!Voice.ctx) Voice.ctx = new AC();
+    if (Voice.ctx.state === 'suspended') Voice.ctx.resume().catch(() => {});
+    if (!Voice.unlocked) {
+      const s = Voice.ctx.createBufferSource();
+      s.buffer = Voice.ctx.createBuffer(1, 1, 22050);
+      s.connect(Voice.ctx.destination);
+      s.start(0);
+      Voice.unlocked = true;
+    }
+  } catch (e) { /* playback still has the <audio> element */ }
+}
+
+function voiceEnsureEl() {
+  if (Voice.el) return Voice.el;
   const el = new Audio();
   el.preload = 'auto';
-  ['play', 'pause', 'ended', 'timeupdate'].forEach((ev) => el.addEventListener(ev, syncChipStates));
-  el.addEventListener('error', () => {
-    if (!Player.id || !el.getAttribute('src')) return;
-    toast(el.error && el.error.code === 4 ? playbackProblem({ name: 'NotSupportedError' }) : 'Couldn\u2019t play this clip.');
-    syncChipStates();
-  });
-  Player.el = el;
+  const live = () => Voice.key && Voice.mode === 'element';
+  el.addEventListener('play', () => { if (live()) { Voice.playing = true; voiceChanged(); } });
+  el.addEventListener('pause', () => { if (live() && !Voice.fallingBack) { Voice.playing = false; voiceChanged(); } });
+  el.addEventListener('ended', () => { if (live()) { Voice.playing = false; Voice.ended = true; voiceChanged(); } });
+  el.addEventListener('durationchange', () => { if (live()) voiceChanged(); });
+  el.addEventListener('error', () => { if (live() && el.getAttribute('src')) voiceFallback('error'); });
+  Voice.el = el;
   return el;
 }
 
-// Turns a clip's data: URL into a playable blob: URL right away (no network or promise in
-// between). Starting playback has to happen inside the tap itself or Safari refuses it, and the old
-// version waited on an asynchronous fetch() first \u2014 which is why a recording could sit there silent.
+// Turns a clip's data: URL into a playable blob: URL right away (no network or promise in between).
 function audioUrlSync(id) {
   if (audioUrls.has(id)) return audioUrls.get(id);
   const clip = editorAudio[id];
@@ -3231,42 +3807,280 @@ function audioUrlSync(id) {
   return url;
 }
 
-function clearAudioUrls() {
-  if (Player.el) { Player.el.pause(); Player.el.removeAttribute('src'); Player.el.load(); }
-  Player.id = null;
-  for (const url of audioUrls.values()) URL.revokeObjectURL(url);
-  audioUrls.clear();
-  const clipEl = document.getElementById('clip-audio');
-  if (clipEl) { clipEl.pause(); clipEl.removeAttribute('src'); }
+function voiceSourceForClip(id) {
+  const clip = editorAudio[id];
+  if (!clip) return null;
+  return {
+    url: audioUrlSync(id),
+    dur: clip.dur || 0,
+    bytes: async () => b64ToBytes(clip.data.slice(clip.data.indexOf(',') + 1)).buffer,
+  };
 }
 
-function syncChipStates() {
-  const el = Player.el;
-  document.querySelectorAll('#editor-body .audio-chip').forEach((chip) => {
-    const mine = chip.dataset.id === Player.id;
-    const playing = !!(mine && el && !el.paused && !el.ended);
+function voiceSourceForPreview() {
+  if (!Rec.blob || !Rec.previewUrl) return null;
+  return { url: Rec.previewUrl, dur: Rec.dur || 0, bytes: () => Rec.blob.arrayBuffer() };
+}
+
+function voiceDuration() {
+  if (Voice.mode === 'webaudio' && Voice.buf) return Voice.buf.duration;
+  const d = Voice.el && Voice.key ? Voice.el.duration : NaN;
+  if (isFinite(d) && d > 0) return d;
+  return Voice.dur || 0; // the browser doesn't know (Infinity/NaN): use the measured length
+}
+
+function voicePosition() {
+  if (!Voice.key || (Voice.ended && !Voice.playing)) return 0; // a clip that has finished is back at the start
+  let t = 0;
+  if (Voice.mode === 'webaudio') t = Voice.playing && Voice.ctx ? Voice.offset + (Voice.ctx.currentTime - Voice.startedAt) : Voice.offset;
+  else if (Voice.el) t = Voice.el.currentTime || 0;
+  const d = voiceDuration();
+  return Math.max(0, d ? Math.min(t, d) : t);
+}
+
+function voiceStopNode() {
+  if (!Voice.node) return;
+  const n = Voice.node;
+  Voice.node = null;
+  n.onended = null;
+  try { n.stop(); } catch (e) { /* already stopped */ }
+}
+
+function voiceStop() {
+  clearTimeout(Voice.watchdog);
+  voiceStopNode();
+  if (Voice.el) { Voice.el.pause(); Voice.el.removeAttribute('src'); Voice.el.load(); }
+  Voice.key = null; Voice.src = null; Voice.loadedKey = null; Voice.buf = null;
+  Voice.mode = 'element'; Voice.playing = false; Voice.ended = false; Voice.dur = 0; Voice.offset = 0;
+  renderVoiceViews();
+}
+
+function voiceStopIf(key) { if (Voice.key === key) voiceStop(); }
+
+function voicePause() {
+  clearTimeout(Voice.watchdog);
+  if (Voice.mode === 'webaudio') {
+    Voice.offset = voicePosition();
+    voiceStopNode();
+    Voice.playing = false;
+  } else if (Voice.el) Voice.el.pause();
+  voiceChanged();
+}
+
+function voicePauseIf(key) { if (Voice.key === key && Voice.playing) voicePause(); }
+
+function voiceLoad(key, getSource) {
+  if (Voice.key === key) return true;
+  voiceStop();
+  let src = null;
+  try { src = getSource(); } catch (e) { toast('Couldn\u2019t read this clip.'); return false; }
+  if (!src || !src.url) return false;
+  Voice.key = key; Voice.src = src; Voice.dur = src.dur || 0;
+  return true;
+}
+
+// Called straight from the tap, with nothing awaited before it, so browsers count it as started by the tap.
+function voiceToggle(key, getSource) {
+  voiceUnlockContext();
+  voiceAudioSession('playback');
+  if (Voice.key === key && Voice.playing) { voicePause(); return; }
+  if (!voiceLoad(key, getSource)) return;
+  voicePlay();
+}
+
+function voicePlay() {
+  if (Voice.mode === 'webaudio') { voicePlayBuffer(); return; }
+  const el = voiceEnsureEl();
+  if (Voice.loadedKey !== Voice.key) { el.src = Voice.src.url; Voice.loadedKey = Voice.key; el.load(); }
+  if (Voice.ended) { try { el.currentTime = 0; } catch (e) { /* not seekable yet */ } Voice.ended = false; }
+  el.muted = false;
+  el.volume = 1;
+  Voice.playing = true;
+  const started = el.play();
+  voiceWatch();
+  if (started && started.catch) {
+    started.catch((e) => {
+      if (e && e.name === 'AbortError') return; // another clip was started over this one
+      if (e && e.name === 'NotAllowedError') { Voice.playing = false; toast('Your browser blocked the sound \u2014 tap play again.'); voiceChanged(); return; }
+      voiceFallback('rejected');
+    });
+  }
+  voiceChanged();
+}
+
+// If the <audio> element says it is playing but the clock is not moving, it is not really playing.
+function voiceWatch() {
+  clearTimeout(Voice.watchdog);
+  const key = Voice.key;
+  const from = Voice.el ? Voice.el.currentTime : 0;
+  Voice.watchdog = setTimeout(() => {
+    if (Voice.key !== key || Voice.mode !== 'element' || !Voice.playing || !Voice.el) return;
+    // We asked it to play (and it never reported a pause or the end), yet its clock has not moved.
+    if (!Voice.el.ended && Voice.el.currentTime - from < 0.05) voiceFallback('stuck');
+  }, 2200);
+}
+
+async function voiceFallback(reason) {
+  if (Voice.mode === 'webaudio' || Voice.fallingBack || !Voice.key || !Voice.src) return;
+  const key = Voice.key;
+  const wasPlaying = Voice.playing;
+  Voice.fallingBack = true;
+  const from = Voice.el ? (Voice.el.currentTime || 0) : 0;
+  try {
+    if (Voice.el) Voice.el.pause();
+    if (!Voice.ctx) throw new Error('no web audio');
+    const bytes = await Voice.src.bytes();
+    if (bytes.byteLength > VOICE_FALLBACK_MAX_BYTES) throw new Error('too big');
+    const buf = await Voice.ctx.decodeAudioData(bytes);
+    if (Voice.key !== key) return; // the person has moved on
+    if (buf.duration > VOICE_FALLBACK_MAX_SECONDS) throw new Error('too long');
+    Voice.buf = buf; Voice.dur = buf.duration; Voice.mode = 'webaudio';
+    Voice.offset = from >= buf.duration - 0.05 ? 0 : from;
+    voiceLearnDuration(key, buf.duration);
+    if (wasPlaying) voicePlayBuffer(); else voiceChanged();
+  } catch (e) {
+    if (Voice.key === key) {
+      Voice.playing = false;
+      voiceChanged();
+      toast('This browser can\u2019t play this clip. Open \u22ef and use Download to listen elsewhere.');
+    }
+  } finally {
+    Voice.fallingBack = false;
+  }
+}
+
+function voicePlayBuffer() {
+  const ctx = Voice.ctx;
+  if (!ctx || !Voice.buf) return;
+  try { if (ctx.state === 'suspended') ctx.resume(); } catch (e) { /* ignore */ }
+  voiceStopNode();
+  if (Voice.ended || Voice.offset >= Voice.buf.duration - 0.05) { Voice.offset = 0; Voice.ended = false; }
+  const node = ctx.createBufferSource();
+  node.buffer = Voice.buf;
+  node.connect(ctx.destination);
+  node.onended = () => {
+    if (Voice.node !== node) return;
+    Voice.node = null; Voice.playing = false; Voice.ended = true; Voice.offset = 0;
+    voiceChanged();
+  };
+  Voice.startedAt = ctx.currentTime;
+  node.start(0, Voice.offset);
+  Voice.node = node;
+  Voice.playing = true;
+  voiceChanged();
+}
+
+// Moves playback to a fraction (0..1) of the clip, loading it first if need be.
+function voiceSeek(key, getSource, frac) {
+  if (!voiceLoad(key, getSource)) return;
+  const d = voiceDuration();
+  if (!d) return;
+  const t = Math.max(0, Math.min(d - 0.05, frac * d));
+  Voice.ended = false;
+  if (Voice.mode === 'webaudio') {
+    Voice.offset = t;
+    if (Voice.playing) voicePlayBuffer(); else voiceChanged();
+    return;
+  }
+  const el = voiceEnsureEl();
+  if (Voice.loadedKey !== Voice.key) { el.src = Voice.src.url; Voice.loadedKey = Voice.key; el.load(); }
+  try { el.currentTime = t; } catch (e) { /* not seekable yet */ }
+  voiceChanged();
+}
+
+// A clip that had no length on record (an older note) learns it the first time anything measures it.
+function voiceLearnDuration(key, dur) {
+  if (!key.startsWith('clip:') || !(dur > 0)) return;
+  const id = key.slice(5);
+  const clip = editorAudio[id];
+  if (!clip || clip.dur > 0) return;
+  clip.dur = dur;
+  document.querySelectorAll(`#editor-body ks-audio[data-id="${id}"]`).forEach((el) => { el.innerHTML = audioChipHTML(id); });
+  onEditorContentChanged();
+}
+
+async function ensureClipDuration(id) {
+  const clip = editorAudio[id];
+  if (!clip || clip.dur > 0) return;
+  try {
+    const d = await probeAudioDuration(audioUrlSync(id));
+    if (d > 0) voiceLearnDuration('clip:' + id, d);
+  } catch (e) { /* the length just stays unknown */ }
+}
+
+function voiceTicker() {
+  if (Voice.raf) return;
+  const tick = () => {
+    Voice.raf = 0;
+    renderVoiceViews();
+    if (Voice.playing) Voice.raf = requestAnimationFrame(tick);
+  };
+  Voice.raf = requestAnimationFrame(tick);
+}
+
+function voiceChanged() {
+  renderVoiceViews();
+  if (Voice.playing) voiceTicker();
+}
+
+function renderVoiceViews() {
+  const dur = voiceDuration();
+  const pos = voicePosition();
+  document.querySelectorAll('#editor-body .audio-chip[data-id]').forEach((chip) => {
+    const mine = Voice.key === 'clip:' + chip.dataset.id;
+    const playing = mine && Voice.playing;
     chip.classList.toggle('is-playing', playing);
     const btn = chip.querySelector('.audio-play');
     if (btn) btn.setAttribute('aria-pressed', String(playing));
-    // A recording straight from the browser reports no length (Infinity), so fall back to the one we measured.
-    const known = mine && editorAudio[Player.id] ? editorAudio[Player.id].dur : 0;
-    const d = el && isFinite(el.duration) && el.duration > 0 ? el.duration : known;
-    chip.style.setProperty('--p', mine && d ? Math.min(1, el.currentTime / d).toFixed(3) : '0');
+    chip.style.setProperty('--p', mine && dur ? Math.min(1, pos / dur).toFixed(3) : '0');
   });
+  for (const mp of MINI_PLAYERS) updateMiniPlayer(mp);
+}
+
+function updateMiniPlayer(mp) {
+  const key = mp.key();
+  const mine = !!key && Voice.key === key;
+  const known = mp.known();
+  const dur = mine ? voiceDuration() || known : known;
+  const pos = mine ? voicePosition() : 0;
+  const playing = mine && Voice.playing;
+  const play = mp.el.querySelector('.mp-play');
+  play.classList.toggle('is-playing', playing);
+  play.setAttribute('aria-label', playing ? 'Pause' : 'Play');
+  const seek = mp.el.querySelector('.mp-seek');
+  const shown = mp.dragging ? Number(seek.value) / 1000 * dur : pos;
+  if (!mp.dragging) seek.value = dur ? String(Math.round(Math.min(1, pos / dur) * 1000)) : '0';
+  seek.style.setProperty('--p', dur ? Math.min(1, shown / dur).toFixed(3) : '0');
+  seek.disabled = !dur;
+  seek.setAttribute('aria-valuetext', `${mmss(shown)} of ${dur ? mmss(dur) : 'unknown length'}`);
+  mp.el.querySelector('.mp-pos').textContent = mmss(shown);
+  mp.el.querySelector('.mp-dur').textContent = dur ? mmss(dur) : '\u2013:\u2013\u2013';
+}
+
+function registerMiniPlayer(el, key, known, getSource) {
+  const mp = { el, key, known, dragging: false };
+  MINI_PLAYERS.push(mp);
+  el.querySelector('.mp-play').addEventListener('click', () => { const k = key(); if (k) voiceToggle(k, getSource); });
+  const seek = el.querySelector('.mp-seek');
+  seek.addEventListener('input', () => { mp.dragging = true; updateMiniPlayer(mp); });
+  seek.addEventListener('change', () => {
+    const k = key();
+    mp.dragging = false;
+    if (k) voiceSeek(k, getSource, Number(seek.value) / 1000);
+    updateMiniPlayer(mp);
+  });
+  updateMiniPlayer(mp);
+}
+
+function clearAudioUrls() {
+  voiceStop();
+  for (const url of audioUrls.values()) URL.revokeObjectURL(url);
+  audioUrls.clear();
 }
 
 function toggleClipPlayback(id) {
-  const el = ensurePlayer();
-  if (Player.id === id && !el.paused) { el.pause(); return; }
-  let url;
-  try { url = audioUrlSync(id); } catch (e) { toast('Couldn\u2019t read this clip.'); return; }
-  if (!url) return;
-  if (Player.id !== id || !el.getAttribute('src')) { el.src = url; Player.id = id; el.load(); }
-  else if (el.ended) el.currentTime = 0;
-  el.muted = false;
-  el.volume = 1;
-  const started = el.play(); // nothing awaited above: this still counts as started by the tap
-  if (started && started.catch) started.catch((e) => { const msg = playbackProblem(e); if (msg) toast(msg); syncChipStates(); });
+  voiceToggle('clip:' + id, () => voiceSourceForClip(id));
+  if (editorAudio[id] && !(editorAudio[id].dur > 0)) ensureClipDuration(id);
 }
 
 // ---- clip options dialog ----
@@ -3276,22 +4090,22 @@ let clipDialogId = null;
 function openClipDialog(id) {
   const clip = editorAudio[id];
   if (!clip) return;
-  if (Player.el) Player.el.pause();
+  voicePause();
   clipDialogId = id;
   document.getElementById('clip-heading').textContent = `Audio clip ${clipIndex(id)}`;
   document.getElementById('clip-meta').textContent = [
     fmtDur(clip.dur), formatBytes(estimateImageBytes(clip.data)), audioExtFor(clip).toUpperCase(), clip.name,
   ].filter(Boolean).join(' \u00b7 ');
-  const player = document.getElementById('clip-audio');
   const problem = document.getElementById('clip-error');
   problem.hidden = true;
-  try { player.src = audioUrlSync(id) || ''; } catch (e) { player.removeAttribute('src'); problem.hidden = false; }
+  try { audioUrlSync(id); } catch (e) { problem.hidden = false; }
+  renderVoiceViews();
   show('overlay-clip');
+  if (!(clip.dur > 0)) ensureClipDuration(id).then(() => { if (clipDialogId === id) renderVoiceViews(); });
 }
 
 function pauseClipPreview() {
-  const el = document.getElementById('clip-audio');
-  if (el) el.pause();
+  if (clipDialogId) voicePauseIf('clip:' + clipDialogId);
 }
 
 function clipFileName(id) {
@@ -3320,7 +4134,7 @@ async function downloadClip(id) {
 
 function deleteClip(id) {
   document.querySelectorAll(`#editor-body ks-audio[data-id="${id}"]`).forEach((el) => el.remove());
-  if (Player.id === id && Player.el) { Player.el.pause(); Player.id = null; }
+  voiceStopIf('clip:' + id);
   hide('overlay-clip');
   updateSizeMeter();
   onEditorContentChanged();
@@ -3339,7 +4153,8 @@ let compressingSaved = false;
 async function compressSavedPhoto() {
   if (compressingSaved) { toast('Another compression is still running'); return; }
   const idx = lightboxIndex;
-  const src = editorImages[idx];
+  const photoId = lightboxIds[idx];
+  const src = editorPhotos[photoId];
   if (!src) return;
   const targetNoteId = editingNoteId;
   const before = estimateImageBytes(src);
@@ -3363,9 +4178,9 @@ async function compressSavedPhoto() {
     openConfirm('Replace with the compressed copy?',
       `${formatBytes(before)} \u2192 ${formatBytes(after)} (${q.label}: ${q.hint}) The original is removed from this note, and the app can\u2019t get it back afterwards. Its file is cleared out of your bucket the next time this note is saved after an hour.`,
       () => {
-        if (editingNoteId !== targetNoteId || editorImages[idx] !== src) return;
-        editorImages[idx] = out;
-        renderEditorThumbs();
+        if (editingNoteId !== targetNoteId || editorPhotos[photoId] !== src) return;
+        editorPhotos[photoId] = out;
+        document.querySelectorAll(`#editor-body ks-photo[data-id="${photoId}"]`).forEach((el) => hydratePhotos(el.parentNode));
         updateSizeMeter();
         onEditorContentChanged();
         syncBarSuccess(`Compressed: ${formatBytes(before)} \u2192 ${formatBytes(after)}`);
@@ -3411,6 +4226,7 @@ async function compressSavedClip(id) {
         if (editingNoteId !== targetNoteId || !cur || cur.data !== clip.data) return;
         cur.data = data;
         if (cur.name) cur.name = cur.name.replace(/\.[^.]+$/, '') + (/mp4|aac/.test(out.type) ? '.m4a' : '.webm');
+        voiceStopIf('clip:' + id);
         const old = audioUrls.get(id);
         if (old) { URL.revokeObjectURL(old); audioUrls.delete(id); }
         updateSizeMeter();
@@ -3710,9 +4526,8 @@ function recorderTeardown() {
   }
   Rec.recorder = null;
   stopMicAndMeter();
+  voiceStopIf('preview');
   if (Rec.previewUrl) { URL.revokeObjectURL(Rec.previewUrl); Rec.previewUrl = null; }
-  const prev = document.getElementById('record-preview');
-  if (prev) { prev.pause(); prev.removeAttribute('src'); }
   Rec.chunks = []; Rec.blob = null; Rec.bytes = 0; Rec.autoStopped = false;
   Rec.state = 'idle';
 }
@@ -3765,6 +4580,8 @@ async function startRecording() {
   if (!recorderSupported()) { showRecError('Recording isn\u2019t available here. You can still attach an audio file.'); return; }
   const mode = await askMediaQuality('record');
   if (!mode) return;
+  voiceStop();
+  voiceAudioSession('play-and-record');
   // Original: the browser's own noise suppression, echo cancellation and auto-gain are switched off
   // (they muddy music and quiet sounds), and the recorder runs at its highest quality.
   const constraints = mode === 'original'
@@ -3819,12 +4636,14 @@ function finishRecording() {
   const type = (Rec.recorder && Rec.recorder.mimeType) || 'audio/webm';
   const blob = new Blob(Rec.chunks, { type });
   Rec.chunks = [];
+  voiceAudioSession('playback'); // the mic is closed: play through the speaker again
   if (!blob.size) { showRecError('Nothing was recorded \u2014 check that your microphone is working.'); setRecState('idle'); return; }
   Rec.blob = blob;
   Rec.dur = ((Rec.stopAt || performance.now()) - Rec.t0) / 1000;
   if (Rec.previewUrl) URL.revokeObjectURL(Rec.previewUrl);
   Rec.previewUrl = URL.createObjectURL(blob);
-  document.getElementById('record-preview').src = Rec.previewUrl;
+  voiceStopIf('preview');
+  renderVoiceViews();
   document.getElementById('record-result').textContent =
     `${mmss(Rec.dur)} \u00b7 ${formatBytes(blob.size)}${Rec.autoStopped ? ' \u00b7 stopped at the size limit' : ''}`;
   const fit = canFitMedia(Math.ceil(blob.size * 4 / 3) + 40);
@@ -3849,6 +4668,12 @@ async function warnIfSilent(blob) {
     let peak = 0;
     try {
       const buf = await ctx.decodeAudioData(await blob.arrayBuffer());
+      if (Rec.blob === blob && buf.duration > 0) { // the real length: the browser's own file says none
+        Rec.dur = buf.duration;
+        document.getElementById('record-result').textContent =
+          `${mmss(Rec.dur)} \u00b7 ${formatBytes(blob.size)}${Rec.autoStopped ? ' \u00b7 stopped at the size limit' : ''}`;
+        renderVoiceViews();
+      }
       for (let c = 0; c < buf.numberOfChannels; c++) {
         const ch = buf.getChannelData(c);
         for (let i = 0; i < ch.length; i += 4) { const v = Math.abs(ch[i]); if (v > peak) peak = v; }
@@ -3893,7 +4718,10 @@ function setupMedia() {
   document.querySelectorAll('[data-zone-icon]').forEach((el) => { el.innerHTML = ZONE_ICON[el.dataset.zoneIcon]; });
   const body = document.getElementById('editor-body');
   body.addEventListener('mousedown', (e) => { if (e.target.closest('.audio-chip button')) e.preventDefault(); }); // keep the caret where it was
+  body.addEventListener('mousedown', (e) => { if (e.target.closest('.photo-tile')) e.preventDefault(); });
   body.addEventListener('click', (e) => {
+    const tile = e.target.closest('.photo-tile[data-id]');
+    if (tile) { e.preventDefault(); openLightbox(tile.dataset.id); return; }
     const chip = e.target.closest('.audio-chip');
     if (!chip || !chip.dataset.id) return;
     e.preventDefault();
@@ -3919,9 +4747,14 @@ function setupMedia() {
     if (added && !document.getElementById('overlay-record').classList.contains('hidden')) hide('overlay-record');
   });
 
-  document.getElementById('clip-audio').addEventListener('error', () => {
-    if (document.getElementById('clip-audio').getAttribute('src')) document.getElementById('clip-error').hidden = false;
-  });
+  registerMiniPlayer(document.getElementById('clip-player'),
+    () => (clipDialogId && editorAudio[clipDialogId] ? 'clip:' + clipDialogId : null),
+    () => (clipDialogId && editorAudio[clipDialogId] ? editorAudio[clipDialogId].dur || 0 : 0),
+    () => voiceSourceForClip(clipDialogId));
+  registerMiniPlayer(document.getElementById('record-player'),
+    () => (Rec.blob ? 'preview' : null),
+    () => (Rec.blob ? Rec.dur || 0 : 0),
+    voiceSourceForPreview);
   document.getElementById('btn-clip-download').addEventListener('click', () => { if (clipDialogId) downloadClip(clipDialogId); });
   document.getElementById('btn-clip-compress').addEventListener('click', () => { if (clipDialogId) compressSavedClip(clipDialogId); });
   document.getElementById('btn-clip-delete').addEventListener('click', () => {
@@ -3964,6 +4797,15 @@ function setupRichText() {
     const h = body.innerHTML.trim();
     if (h === '<br>' || h === '<p><br></p>' || h === '<div><br></div>') body.innerHTML = '';
     onEditorContentChanged();
+  });
+
+  // Backspace/Delete beside a photo does nothing: photos are removed from the photo viewer, on purpose.
+  body.addEventListener('beforeinput', (e) => {
+    const back = e.inputType === 'deleteContentBackward';
+    if ((back || e.inputType === 'deleteContentForward') && photoNextToCaret(back)) {
+      e.preventDefault();
+      toast('Open the photo to remove it');
+    }
   });
 
   // Paste as plain text so formatting from other apps can't sneak in.
@@ -4373,7 +5215,7 @@ async function checkForRecoverableDrafts() {
       openUnlockFlow(meta);
       return;
     }
-    openEditorWithContent(meta, { title: draft.title, body: draft.body, html: draft.html, images: draft.images || [], drawing: draft.drawing, audio: draft.audio });
+    openEditorWithContent(meta, { title: draft.title, body: draft.body, html: draft.html, images: draft.images || [], imageIds: draft.imageIds, drawing: draft.drawing, audio: draft.audio });
     // If the note this draft belonged to no longer exists server-side,
     // openEditorWithContent treats it as a new note under a new id — so
     // this old entry is now orphaned and needs clearing explicitly, or
@@ -4394,12 +5236,13 @@ async function checkForRecoverableDrafts() {
 
 function init() {
   wireStaticEvents();
+  setupSecretFields();
   setupKeyboardViewportFix();
   setupLightbox();
   setupRichText();
   setupMedia();
   setupInk();
-  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.8.1');
+  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.9.0');
 
   // Connectivity: react the moment the browser notices, and keep retrying
   // on a timer since navigator.onLine can't see a connection that's up but
@@ -4409,10 +5252,19 @@ function init() {
   setInterval(() => { if (navigator.onLine && outboxCount > 0) flushOutbox(); }, 30000);
   updateSyncStatusUI();
 
+  // Leaving the app (switching away, closing the tab) with an edit not yet sent: start saving it
+  // now rather than waiting for the autosave timer. It is written to the device first, so even if
+  // the page is killed a moment later the change is not lost.
+  const editorOpen = () => editingNoteId && !document.getElementById('overlay-editor').classList.contains('hidden');
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden' && editorOpen()) triggerAutosave(); });
+  window.addEventListener('pagehide', () => { if (editorOpen()) triggerAutosave(); });
+
   if (!Config.configured()) {
     openSettings();
     toast('Add your Backblaze bucket details to get started');
   } else {
+    // Data left waiting by an earlier session? Say so straight away, with the counts.
+    showUnsyncedSummary().catch(() => {});
     refreshNotes().then(checkForRecoverableDrafts);
   }
 

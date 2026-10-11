@@ -111,7 +111,7 @@
     urlField.appendChild(url);
     const tokenField = el('div', { class: 'field' });
     tokenField.appendChild(el('label', { for: 'migrate-token' }, 'Old access token'));
-    const token = el('input', { type: 'password', id: 'migrate-token', autocomplete: 'off' });
+    const token = el('input', { type: 'password', id: 'migrate-token', autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false', 'data-secret': '1' });
     tokenField.appendChild(token);
     const go = el('button', { class: 'btn btn-ghost', id: 'btn-migrate', type: 'button' }, 'Copy everything to Backblaze');
     const status = el('p', { class: 'hint', id: 'migrate-status', role: 'status', 'aria-live': 'polite' });
@@ -125,7 +125,9 @@
 
     // Prefill from what this device used before.
     url.value = ls(OLD_URL_KEY);
-    token.value = ls(OLD_TOKEN_KEY);
+    // The saved token is not put back into the field (nothing to reveal or copy); blank means "use the saved one".
+    if (ls(OLD_TOKEN_KEY)) token.placeholder = 'Saved on this device \u2014 type a new one to replace it';
+    const tokenValue = () => token.value.trim() || ls(OLD_TOKEN_KEY).trim();
 
     function say(text) { status.hidden = !text; status.textContent = text; }
 
@@ -134,14 +136,14 @@
         say('Fill in the Backblaze details above and tap \u201cSave and test\u201d first.');
         return;
       }
-      if (!url.value.trim() || !token.value.trim()) { say('Enter the old Worker address and its access token.'); return; }
+      if (!url.value.trim() || !tokenValue()) { say('Enter the old Worker address and its access token.'); return; }
       go.disabled = true;
       forget.hidden = true;
       const failed = [];
       let copied = 0;
       let skipped = 0;
       try {
-        const old = oldClient(url.value, token.value);
+        const old = oldClient(url.value, tokenValue());
         say('Reading the list of notes\u2026');
         const notes = await old.listNotes();
         if (!notes.length) { say('The old address has no notes.'); return; }

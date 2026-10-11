@@ -190,6 +190,15 @@ their encrypted form, exactly as the bucket stores them. This is
 last-write-wins: if you edit the same note on two devices while one is
 offline, whichever syncs last overwrites the other.
 
+Every save is written to the device first - the note, its lock, and a list of the
+photos and audio still to send - and only then uploaded, so closing the app mid-upload
+loses nothing. Photos and clips go up **one at a time**; on the next launch the upload
+carries on with the next file rather than starting over (a file interrupted mid-send is
+sent again in full). Each file is verified against its SHA-256 before sending and against
+the bucket afterwards, and the note itself is written only after all of its files are
+confirmed. While data is waiting, the bar at the top shows a row each for photos, audio
+and note text.
+
 ## Limits worth knowing
 
 - The editor shows the **whole note's** size next to the Save button: its text and drawing plus

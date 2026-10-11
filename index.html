@@ -42,6 +42,7 @@
     --z-modal: 100;
     --z-toast: 200;
     --z-lightbox: 400;
+    --z-confirm: 500; /* above the photo viewer, so "Remove this photo?" can be answered */
     --gutter-l: max(20px, env(safe-area-inset-left, 0px));
     --gutter-r: max(20px, env(safe-area-inset-right, 0px));
     color-scheme: light;
@@ -123,10 +124,10 @@
   .sync-bar.error { background: var(--amber-bg); }
   .sync-bar.error.show { border-top-color: #e6d3ae; }
 
+  .sync-bar-body { overflow: hidden; min-height: 0; } /* the grid item that collapses to nothing */
+
   .sync-bar-inner {
-    overflow: hidden;
-    min-height: 0;
-    width: 100%; /* a grid item with auto margins otherwise shrink-wraps, collapsing the track */
+    width: 100%; /* auto margins otherwise shrink-wrap, collapsing the track */
     max-width: 980px;
     margin: 0 auto;
     padding: 8px var(--gutter-r) 8px var(--gutter-l);
@@ -196,6 +197,53 @@
   }
 
   .sync-bar-retry.hidden { display: none; }
+  .sync-bar.has-steps .sync-bar-track { display: none; } /* the per-kind rows below are the bars */
+  .sync-bar.has-steps .sync-bar-label { white-space: normal; }
+
+  /* ---------- Upload progress rows: Photos 3 / 60 \00b7 Audio pending \00b7 Note text pending ---------- */
+
+  .sync-steps {
+    width: 100%;
+    max-width: 980px;
+    margin: 0 auto;
+    padding: 0 var(--gutter-r) 10px var(--gutter-l);
+    display: grid;
+    gap: 6px;
+  }
+
+  .sync-step {
+    --f: 0;
+    display: grid;
+    grid-template-columns: 5.25rem minmax(0, 1fr) 4.5rem;
+    align-items: center;
+    gap: 10px;
+    font-size: 0.75rem;
+    line-height: 1.3;
+    color: var(--ink-soft);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .sync-step-name { font-weight: 600; color: var(--ink); }
+
+  .sync-step-track { height: 4px; border-radius: 999px; background: var(--line); overflow: hidden; }
+
+  .sync-step-fill {
+    display: block;
+    height: 100%;
+    background: var(--pine);
+    border-radius: 999px;
+    transform-origin: left;
+    transform: scaleX(var(--f)); /* transform, not width: no layout work on every progress tick */
+    transition: transform 0.2s ease-out;
+  }
+
+  .sync-step-count { text-align: end; white-space: nowrap; font-weight: 600; }
+  .sync-step[data-state="wait"] .sync-step-count { color: var(--ink-faint); font-weight: 500; }
+  .sync-step[data-state="wait"] .sync-step-fill { background: var(--line-strong); }
+  .sync-step[data-state="done"] .sync-step-count { color: var(--ok); }
+  .sync-step[data-state="done"] .sync-step-count::before { content: "\2713\00a0"; } /* a check mark and the word, not colour alone */
+  .sync-bar.error .sync-step-name,
+  .sync-bar.error .sync-step-count { color: var(--amber); }
 
   /* ---------- Draft recovery banner ---------- */
 
@@ -561,6 +609,7 @@
   }
 
   .overlay.hidden { display: none; }
+  #overlay-confirm { z-index: var(--z-confirm); }
 
   .modal {
     background: var(--card);
@@ -784,8 +833,7 @@
 
   /* While drawing, taps must not put a caret in the text underneath. */
   .editor-sheet.is-drawing .title-input,
-  .editor-sheet.is-drawing .rich-body,
-  .editor-sheet.is-drawing .thumb-row {
+  .editor-sheet.is-drawing .rich-body {
     pointer-events: none;
     -webkit-user-select: none;
     user-select: none;
@@ -904,54 +952,52 @@
     text-overflow: ellipsis;
   }
 
-  .thumb-row {
-    display: flex;
-    gap: 8px;
-    flex-wrap: wrap;
-    margin: 10px 0;
+  /* ---------- Photos in the text ----------
+     A photo is an inline element like an audio clip, so it sits between lines of text. Photos that
+     follow each other form a grid that fills the whole width: 3 across on a phone, 2 on a very narrow
+     one, 4 on a wide screen. Each is a button, so the whole tile is a 44px+ target for opening it -
+     and there is nothing on the tile that deletes it (that is in the photo viewer). */
+  .rich-body { --photo-cols: 3; --photo-gap: 8px; }
+  @media (max-width: 359px) { .rich-body { --photo-cols: 2; } }
+  @media (min-width: 720px) { .rich-body { --photo-cols: 4; } }
+
+  ks-photo {
+    display: inline-block;
+    vertical-align: top;
+    /* n tiles and n gaps per row; the 1px keeps rounding from ever pushing the last tile onto a new row */
+    width: calc((100% - var(--photo-cols) * var(--photo-gap) - 1px) / var(--photo-cols));
+    margin: 0 var(--photo-gap) var(--photo-gap) 0;
+    -webkit-user-select: none; user-select: none;
   }
 
-  .thumb-row { padding: 10px 10px 0 0; } /* room for the remove button hanging off each corner */
-
-  .thumb-row .thumb {
+  .photo-tile {
     position: relative;
-    width: 72px; height: 72px;
-  }
-
-  .thumb-row img {
-    width: 100%; height: 100%;
-    object-fit: cover;
-    border-radius: 8px;
+    display: block;
+    width: 100%;
+    aspect-ratio: 1;
+    padding: 0;
+    overflow: hidden;
     border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    background: var(--card-2);
     cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
   }
+  .photo-tile img { display: block; width: 100%; height: 100%; object-fit: cover; -webkit-user-drag: none; }
+  .photo-tile:active img { opacity: 0.85; }
+  .photo-tile.is-missing { display: grid; place-items: center; padding: 8px; color: var(--brick); font-size: 0.75rem; text-align: center; cursor: default; }
 
-  .thumb-size {
+  .photo-size {
     position: absolute;
-    left: 3px; bottom: 3px;
-    background: rgba(20,20,16,0.62);
+    left: 4px; bottom: 4px;
+    background: rgba(20,20,16,0.7);
     color: #fff;
     font-size: 0.6875rem;
     line-height: 1;
     font-weight: 600;
-    padding: 3px 5px;
+    padding: 3px 6px;
     border-radius: 5px;
     pointer-events: none;
-  }
-
-  .thumb-remove {
-    position: absolute;
-    top: -10px; right: -10px;
-    width: 32px; height: 32px;
-    background: var(--brick);
-    color: white;
-    border-radius: 50%;
-    font-size: 1.125rem;
-    line-height: 1;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border: 2px solid var(--card); /* separates it from the photo behind it */
   }
 
   /* ---------- Photo lightbox ---------- */
@@ -1291,6 +1337,18 @@
     background: rgba(0,0,0,0.45); color: #fff; font: inherit; font-size: 0.875rem; cursor: pointer;
   }
   .lightbox :focus-visible { outline-color: #fff; }
+  /* Removing is deliberate: it lives only here, top-left (the far corner from Close), and still asks first. */
+  .lightbox-remove {
+    position: absolute;
+    top: max(14px, env(safe-area-inset-top)); left: 14px;
+    display: inline-flex; align-items: center; gap: 8px;
+    min-height: 44px; padding: 8px 16px 8px 12px;
+    border-radius: 999px; border: 1px solid rgba(255,255,255,0.45);
+    background: rgba(143,45,45,0.85); color: #fff;
+    font: inherit; font-size: 0.875rem; cursor: pointer;
+  }
+  .lightbox-remove svg { width: 18px; height: 18px; flex: none; }
+  .lightbox-remove:active { background: rgba(143,45,45,1); }
   .b2-status { margin: 0 0 12px; padding: 10px 12px; border-radius: 10px; }
   .b2-status[data-kind="bad"] { background: var(--danger-bg); color: var(--danger); }
   .b2-status[data-kind="ok"] { background: var(--ok-bg); color: var(--ok); }
@@ -1351,8 +1409,30 @@
   .rec-projection:empty { display: none; }
   .rec-projection svg { width: 18px; height: 18px; flex: none; }
   .rec-result { margin: 0; font-weight: 600; font-variant-numeric: tabular-nums; }
-  #record-preview, #clip-audio { width: 100%; min-height: 44px; }
-  #clip-audio { margin: 6px 0 16px; }
+  /* Our own player instead of the browser's: it draws the position from the clip's real length,
+     so it is right even for a recording the browser says has no length. */
+  .mini-player {
+    --i-play:  url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M8 5v14l11-7z'/%3E%3C/svg%3E");
+    --i-pause: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M7 5h4v14H7zM13 5h4v14h-4z'/%3E%3C/svg%3E");
+    display: flex; align-items: center; gap: 8px; width: 100%; min-height: 52px;
+    padding: 4px 12px 4px 4px; border: 1px solid var(--line-strong); border-radius: 999px; background: var(--card-2);
+  }
+  #clip-player { margin: 6px 0 16px; }
+  .mp-play { display: grid; place-items: center; flex: none; width: 44px; height: 44px; border-radius: 50%; background: var(--pine); color: #fff; }
+  .mp-play::before { content: ""; width: 22px; height: 22px; background: currentColor; -webkit-mask: var(--i-play) center / contain no-repeat; mask: var(--i-play) center / contain no-repeat; }
+  .mp-play.is-playing::before { -webkit-mask-image: var(--i-pause); mask-image: var(--i-pause); }
+  .mp-seek {
+    --p: 0;
+    flex: 1 1 auto; min-width: 0; height: 44px; margin: 0; background: transparent; cursor: pointer;
+    -webkit-appearance: none; appearance: none;
+  }
+  .mp-seek:disabled { cursor: default; opacity: 0.6; }
+  .mp-seek::-webkit-slider-runnable-track { height: 6px; border-radius: 999px; background: linear-gradient(90deg, var(--pine) calc(var(--p) * 100%), var(--line) calc(var(--p) * 100%)); }
+  .mp-seek::-moz-range-track { height: 6px; border-radius: 999px; background: var(--line); }
+  .mp-seek::-moz-range-progress { height: 6px; border-radius: 999px; background: var(--pine); }
+  .mp-seek::-webkit-slider-thumb { -webkit-appearance: none; width: 20px; height: 20px; margin-top: -7px; border-radius: 50%; background: var(--pine); border: 2px solid var(--card); box-shadow: 0 0 0 1px var(--pine); }
+  .mp-seek::-moz-range-thumb { width: 16px; height: 16px; border-radius: 50%; background: var(--pine); border: 2px solid var(--card); box-shadow: 0 0 0 1px var(--pine); }
+  .mp-time { flex: none; font-size: 0.8125rem; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--ink-soft); white-space: nowrap; }
   .clip-meta { margin: 0; }
 
   @media (max-width: 340px) {
@@ -1372,7 +1452,7 @@
   <div class="top-inner">
     <div class="brand">
       <span class="brand-mark">Keepsake</span>
-      <span class="version-badge" id="version-badge">v1.8.1</span>
+      <span class="version-badge" id="version-badge">v1.9.0</span>
       <span class="sync-status hidden" id="sync-status" role="status" aria-live="polite"></span>
       <button class="storage-pill" id="storage-pill" type="button" data-zone="heavy" hidden>
         <span class="storage-pill-icon" id="storage-pill-icon" aria-hidden="true"></span>
@@ -1394,11 +1474,15 @@
        tick. Being part of the header means the full-screen editor
        automatically covers it while you're writing. -->
   <div class="sync-bar" id="sync-bar" role="status" aria-live="polite">
-    <div class="sync-bar-inner">
-      <span class="sync-bar-spin" aria-hidden="true"></span>
-      <span class="sync-bar-label" id="sync-bar-label">Saved</span>
-      <div class="sync-bar-track" id="sync-bar-track"><div class="sync-bar-fill" id="sync-bar-fill"></div></div>
-      <button class="sync-bar-retry hidden" id="sync-bar-retry">Retry</button>
+    <div class="sync-bar-body">
+      <div class="sync-bar-inner">
+        <span class="sync-bar-spin" aria-hidden="true"></span>
+        <span class="sync-bar-label" id="sync-bar-label">Saved</span>
+        <div class="sync-bar-track" id="sync-bar-track"><div class="sync-bar-fill" id="sync-bar-fill"></div></div>
+        <button class="sync-bar-retry hidden" id="sync-bar-retry">Retry</button>
+      </div>
+      <!-- One row per kind of thing being sent (photos, audio, note text), each with its own bar. -->
+      <div class="sync-steps" id="sync-steps" hidden></div>
     </div>
   </div>
 </header>
@@ -1437,7 +1521,6 @@
     <div class="editor-sheet" id="editor-sheet">
       <input type="text" class="title-input" id="editor-title" placeholder="Title" aria-label="Title">
       <div id="editor-body" class="rich-body" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Note" data-placeholder="What's on your mind…"></div>
-      <div class="thumb-row" id="editor-thumbs"></div>
       <canvas class="ink-layer" id="ink-canvas" aria-hidden="true"></canvas>
       <canvas class="ink-layer ink-live" id="ink-live" aria-hidden="true"></canvas>
     </div>
@@ -1534,6 +1617,10 @@
   <img class="lightbox-img" id="lightbox-img" src="" alt="">
   <button class="lightbox-nav lightbox-next" id="btn-lightbox-next" aria-label="Next photo">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 6l6 6-6 6"/></svg>
+  </button>
+  <button class="lightbox-remove" id="btn-lightbox-remove" type="button">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M4 7h16M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2m1 0-.8 12.2a2 2 0 0 1-2 1.8H8.8a2 2 0 0 1-2-1.8L6 7"/></svg>
+    Remove photo
   </button>
   <button class="lightbox-compress" id="btn-lightbox-compress" type="button">Compress this photo</button>
   <div class="lightbox-caption" id="lightbox-caption"></div>
@@ -1645,7 +1732,11 @@
 
       <div class="rec-panel" data-panel="review" hidden>
         <p class="rec-result" id="record-result"></p>
-        <audio id="record-preview" controls preload="metadata"></audio>
+        <div class="mini-player" id="record-player">
+          <button type="button" class="mp-play" aria-label="Play"></button>
+          <input type="range" class="mp-seek" min="0" max="1000" step="1" value="0" aria-label="Playback position" disabled>
+          <span class="mp-time"><span class="mp-pos">0:00</span> / <span class="mp-dur">–:––</span></span>
+        </div>
         <p class="rec-projection" id="record-review-note" data-zone="ok"></p>
         <button class="btn btn-primary btn-block" id="btn-record-add" type="button">Add to note</button>
         <div class="btn-row">
@@ -1666,7 +1757,11 @@
     </div>
     <div class="modal-body">
       <p class="hint clip-meta" id="clip-meta"></p>
-      <audio id="clip-audio" controls preload="metadata"></audio>
+      <div class="mini-player" id="clip-player">
+        <button type="button" class="mp-play" aria-label="Play"></button>
+        <input type="range" class="mp-seek" min="0" max="1000" step="1" value="0" aria-label="Playback position" disabled>
+        <span class="mp-time"><span class="mp-pos">0:00</span> / <span class="mp-dur">–:––</span></span>
+      </div>
       <p class="rec-error" id="clip-error" role="alert" hidden>This browser can’t play this clip. Use “Download this clip” to listen to it elsewhere.</p>
       <div class="btn-row">
         <button class="btn btn-primary" id="btn-clip-download" type="button">Download this clip</button>
@@ -1747,8 +1842,8 @@
       </div>
       <div class="field">
         <label for="settings-b2-appkey">Application key</label>
-        <input type="password" id="settings-b2-appkey" autocomplete="off">
-        <p class="hint">Stored only in this browser. Anyone who has this key can read and delete everything in the bucket.</p>
+        <input type="password" id="settings-b2-appkey" autocomplete="off" autocapitalize="off" spellcheck="false" data-secret="1">
+        <p class="hint">Stored only in this browser. Anyone who has this key can read and delete everything in the bucket. Once saved it is never shown or copyable again; leave this blank to keep it.</p>
       </div>
       <p class="hint" id="settings-clock"></p>
       <p class="hint">In Backblaze, set the bucket’s <b>Lifecycle</b> to “Keep only the last version of the file”. Otherwise every save keeps the old copy too, and deleted notes and photos stay in your storage.</p>
@@ -1841,7 +1936,7 @@
 <script>
 // Bump this on EVERY change to the app, no matter how small — a typo fix,
 // a copy tweak, whatever. See CHANGELOG.md for the policy and history.
-window.KEEPSAKE_VERSION = "1.8.1";
+window.KEEPSAKE_VERSION = "1.9.0";
 </script>
 <script src="b2.js"></script>
 <script src="media.js"></script>

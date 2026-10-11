@@ -264,8 +264,34 @@
   }
 
   // PUT with upload progress (XHR rather than fetch). `bytes` is a Uint8Array.
+  // Backblaze answers 503 "busy" now and then and asks clients to simply try again, so a
+  // transient refusal (or one dropped connection while the device still says it is online) is
+  // retried a couple of times before it is reported. Every attempt is signed afresh, and the
+  // payload hash travels with the request, so Backblaze itself rejects a body that arrives damaged.
+  const RETRY_STATUS = new Set([408, 429, 500, 502, 503, 504]);
+  const RETRY_DELAYS_MS = [800, 2400];
+  const sleep = (ms) => new Promise((r) => root.setTimeout(r, ms));
+
   async function putBytes(key, bytes, sha, onProgress) {
-    const req = await prepare('PUT', key, {}, sha || await sha256Hex(bytes));
+    const hash = sha || await sha256Hex(bytes);
+    let lastErr = null;
+    for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
+      try {
+        return await putBytesOnce(key, bytes, hash, onProgress);
+      } catch (e) {
+        lastErr = e;
+        const online = !root.navigator || root.navigator.onLine !== false;
+        const transient = (e.status && RETRY_STATUS.has(e.status)) || (e.isNetworkError && online && attempt === 0);
+        if (!transient || attempt === RETRY_DELAYS_MS.length) throw e;
+        if (onProgress) onProgress(0, bytes.length); // the file starts over: so does its progress
+        await sleep(RETRY_DELAYS_MS[attempt]);
+      }
+    }
+    throw lastErr;
+  }
+
+  async function putBytesOnce(key, bytes, sha, onProgress) {
+    const req = await prepare('PUT', key, {}, sha);
     return new Promise((resolve, reject) => {
       const xhr = new root.XMLHttpRequest();
       xhr.open('PUT', req.url);
@@ -345,6 +371,25 @@
       } else break;
     }
     return items;
+  }
+
+  // How many bytes the bucket holds for exactly this key, or null if there is no such object.
+  // (A listing by exact key works with the CORS rule the app has always needed - no HEAD required.)
+  async function objectSize(key) {
+    const hit = (await listAll(key)).find((o) => o.key === key);
+    return hit ? hit.size : null;
+  }
+
+  // Reads back what the bucket actually stored and insists it is the size we sent. Nothing is
+  // ever treated as saved until this passes.
+  async function verifyStored(key, expectedBytes) {
+    const got = await objectSize(key);
+    if (got === expectedBytes) return;
+    const err = new Error(got === null
+      ? 'Backblaze didn\u2019t keep a file that was just sent \u2014 it will be sent again.'
+      : 'Backblaze stored a file at the wrong size (' + got + ' of ' + expectedBytes + ' bytes) \u2014 it will be sent again.');
+    err.verifyFailed = true;
+    throw err;
   }
 
   /* ------------------------------------------------------------ connection test */
@@ -488,8 +533,13 @@
     const meta = metaFromBody(existing, { ...body, id }, now, contentJSON.length);
 
     // Content first, then meta: a note never shows up in the list without its content.
-    await putText(contentKey(id), contentJSON, onProgress ? (loaded, total) => onProgress(total ? loaded / total : 1) : null);
-    await putText(metaKey(id), JSON.stringify(meta));
+    // Each is read back (size) before the save counts as done.
+    const contentBytes = enc.encode(contentJSON);
+    await putBytes(contentKey(id), contentBytes, await sha256Hex(contentBytes), onProgress ? (loaded, total) => onProgress(total ? loaded / total : 1) : null);
+    await verifyStored(contentKey(id), contentBytes.length);
+    const metaBytes = enc.encode(JSON.stringify(meta));
+    await putBytes(metaKey(id), metaBytes, await sha256Hex(metaBytes), null);
+    await verifyStored(metaKey(id), metaBytes.length);
 
     if (meta.lockType === 'time' && body.password2) await putText(vaultKey(id), String(body.password2));
     else if (meta.lockType !== 'time') await deleteObject(vaultKey(id)).catch(() => {});
@@ -581,7 +631,7 @@
     clock,
     testConnection,
     // storage primitives (also used by media.js)
-    getBytes, getBytesOrNull, getText, putBytes, putText, deleteObject, listAll, sha256Hex,
+    getBytes, getBytesOrNull, getText, putBytes, putText, deleteObject, listAll, sha256Hex, objectSize, verifyStored,
     // notes
     listNotes, getNote, saveNote, deleteNote, getVault, exportNote,
     // media

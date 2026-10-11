@@ -6,6 +6,46 @@ All notable changes to this project are recorded here, following
 small — gets a version bump. If the version number hasn't moved,
 nothing changed; that's the whole point of keeping one.
 
+## v1.9.0 — 2026-10-11
+
+- **Photos live in the text, in a bigger grid, and can't be deleted by accident.** The little × on every
+  thumbnail is gone. A photo is now an inline item like an audio clip: it goes in right after the line
+  your cursor was in (between lines, never splitting one), and photos added together form one grid that
+  fills the full width (3 across on a phone, 2 on a very narrow screen, 4 on a wide one) instead of a row
+  of 72px squares. Tap a photo to open it; **Remove photo** is in the viewer only (top-left, away from
+  Close), and asks first. Backspace/Delete next to a photo no longer takes it out of the note. Notes
+  from before open with their photos in one grid at the end of the text. Thumbnails are made two at a
+  time and only near the screen, so a 100-photo note opens without decoding 100 full-size pictures.
+- **Quick lock after lots of photos now sticks.** Locking (or any edit) re-encrypts and re-uploads every
+  photo before the note itself is saved - minutes for a big note - and nothing had been written down
+  yet, so closing the app in that time silently lost the lock. Now the note, its lock and a to-do list
+  of what is left are written to the device **before** the first byte is uploaded, and the note shows as
+  locked straight away. The app also starts saving the moment you switch away from it.
+- **Uploads are one file at a time, resumable, and checked.** Close the app mid-upload and, on reopening,
+  it carries on with the next file: it asks the bucket what it already has instead of starting over
+  (a file cut off mid-send is sent again in full, since S3 stores a file whole or not at all). Every file
+  is checked against the SHA-256 taken when it was made before it is sent, and read back from the bucket
+  (size) afterwards; the note is written only once every one of its files is verified, so it can never
+  point at a missing or short file. Files saved from now on also carry their SHA-256, which is checked on
+  every download. A short "busy" answer (503) from Backblaze is retried. A file missing from both the
+  device and the bucket stops the save with a clear message.
+- **Progress for every part.** The bar now shows a row per kind - *Photos 3 / 60*, *Audio pending*,
+  *Note text pending* - each with its own bar, counted across a whole queue of notes. On reopening with
+  data still waiting it appears immediately ("Picking up where the upload stopped...") with the counts
+  where it left off, before the connection to Backblaze is even made.
+- **Audio.** The clip dialog and the recorder's preview used the browser's own player, which reports an
+  infinite length for a recording - so its bar sat at the end. Both now use our own player (play/pause,
+  a seek bar that works, elapsed / total) driven by the real length, and the chip's fill resets to the
+  start when a clip finishes instead of staying full. Playback goes through the <audio> element first;
+  if that is refused, errors, or never actually moves, it switches by itself to decoding the clip with
+  Web Audio and plays from the same spot. On Safari the audio session is set to "playback" so sound
+  comes from the speaker, even after the microphone was used.
+- **Application key and old access token:** no eye icon, and they can't be copied or cut (also no
+  drag-out or context menu). The saved value is never put back into the field - it shows a placeholder
+  and a blank field means "keep the saved one" - so there is nothing to reveal, select or copy.
+- Smaller: a draft is written as two records, so typing rewrites a few kilobytes instead of the note's
+  whole 150 MB of media every second; "Remove this photo?" appears above the photo viewer.
+
 ## v1.8.1 — 2026-10-10
 
 - **The size at the top of a note is the whole note now.** It used to read "x / 25 MB" and ignore
