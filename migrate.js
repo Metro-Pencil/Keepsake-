@@ -89,7 +89,11 @@
     if (await B.sha256Hex(back) !== contentSha) throw new Error('did not read back identically');
 
     // Meta last, so a note never appears in the list without its content.
-    const newMeta = { ...meta, size: contentJSON.length };
+    let migMediaSize = meta.mediaSize;
+    if (!migMediaSize && manifest && typeof manifest === "object") {
+      migMediaSize = Object.values(manifest).reduce((s, e) => s + (e && typeof e.n === "number" ? e.n : 0), 0) || undefined;
+    }
+    const newMeta = { ...meta, size: contentJSON.length, ...(migMediaSize ? { mediaSize: migMediaSize } : {}) };
     await B.putText('meta/' + id + '.json', JSON.stringify(newMeta));
     return 'copied';
   }

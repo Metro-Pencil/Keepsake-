@@ -6,6 +6,18 @@ All notable changes to this project are recorded here, following
 small — gets a version bump. If the version number hasn't moved,
 nothing changed; that's the whole point of keeping one.
 
+## v1.10.1 — 2026-10-14
+
+- **Photo-sized video tiles in notes, with full Video Studio on click.** `<ks-video>` in the note body now uses the exact same compact square tile area and multi-column float grid as `<ks-photo>` (`.video-tile` matching `.photo-tile`), displaying the poster thumbnail, play badge, duration, size, and packet status pill without taking up the whole note. Clicking any video tile opens the unified **Video Studio** (`#overlay-video`) with full playback controls, quality/compression preset selector, file actions (Download, Compress/Re-compress, Delete), and the Sliced Cloud Packets inspector.
+- **Automatic background verification & re-upload of video packets (plus manual button).** Added `KSMedia.backgroundVerifyAndRepair()` and `runBackgroundPacketCheck()`, which automatically verify uploaded and pending video packets in the background (after saves, when opening a note, on reconnect/foreground, and on a periodic timer) and re-upload any missing or corrupted packets automatically while keeping the manual **Verify & re-upload lost packets now** button in the Video Studio. Service worker cache bumped to v20.
+
+## v1.10.0 — 2026-10-14
+
+- **Fixed "Biggest notes" in Settings → Storage ignoring attached photos and media.** `storageUsage()` previously ranked notes by `m._bytes` (the JSON text size alone, which is only a few hundred bytes once photos live in Backblaze) instead of `m._bytes + m._media`. Each note in **Biggest notes** now counts its written text, photos, videos and audio together, and updates immediately when media is added.
+- **Video uploads with Original or Compressed quality and final compressed size preview.** Added the **Add video** button in the editor toolbar and **Settings → Compressed quality → Videos** (Standard 720p and High 1080p). Before adding any video, Keepsake probes its resolution and duration and shows both the original size and the **final size after compressing** (per file and total, with MB and percentage saved) right in the Original / Compressed dialog, and reports the final compressed size once compression finishes. Already-saved videos can also be compressed later from the video options or theater viewer.
+- **Sliced packet cloud uploads with section tagging and automatic lost-data re-upload.** Instead of uploading a large video as one fragile request that fails if the phone sleeps, videos are sliced into multiple tagged sections (`<mediaId>_s0001of0004_<sha8>`) with per-section SHA-256 hashes and byte offsets, and uploaded packet by packet. If an upload is interrupted, already-verified packets in Backblaze B2 are kept and skipped on resume; any missing, truncated, or corrupted packet is detected and re-uploaded automatically.
+- **Custom video playback UI, Cinema Theater viewer, and Cloud Packet Inspector (`css-pro-max`).** Built an inline `<ks-video>` player card and full-screen theater lightbox with reserved `aspect-ratio` (`contain: layout paint`), poster frame extraction, 44×44px touch targets with 8px spacing, `transform: scaleX()` progress and buffer bars, `tabular-nums` timers and size badges, playback speed cycling (`0.75×`–`2×`), keyboard `:focus-visible` rings, `prefers-reduced-motion` and `forced-colors` support, and a live **Sliced Cloud Packets** inspector with on-demand packet verification and re-upload. Service worker cache bumped to v19.
+
 ## v1.9.1 — 2026-10-11
 
 - **Text now flows around photos, like a newspaper.** A photo grid used to be a solid block, so the

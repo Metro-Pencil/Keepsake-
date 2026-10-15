@@ -88,21 +88,31 @@ const PHOTO_QUALITY = {
   standard: { label: 'Standard', maxDim: 1600, quality: 0.82, hint: 'Resized to 1600px. Roughly 0.3\u20130.7 MB per photo.' },
   high:     { label: 'High',     maxDim: 2560, quality: 0.92, hint: 'Resized to 2560px, light compression. Roughly 1\u20132.5 MB per photo.' },
 };
+const VIDEO_QUALITY = {
+  standard: { label: 'Standard', maxDim: 720,  videoBps: 1200000, audioBps: 96000,  fps: 30, ratio: 0.36, hint: 'Resized to 720p (1.2 Mbps). Roughly 9 MB per minute.' },
+  high:     { label: 'High',     maxDim: 1080, videoBps: 2500000, audioBps: 128000, fps: 30, ratio: 0.56, hint: 'Resized to 1080p (2.5 Mbps). Roughly 19 MB per minute.' },
+};
 const AUDIO_QUALITY = {
   standard: { label: 'Standard', bps: 64000,  hint: 'Clear for voice. About 0.5 MB per minute.' },
   high:     { label: 'High',     bps: 128000, hint: 'Good for voice and music. About 1 MB per minute.' },
   max:      { label: 'Original', bps: 256000, hint: 'Recorded with no mic processing at the highest quality the browser offers. About 2 MB per minute.' },
 };
 
+const appMemLS = new Map();
+function appLsGet(k) { try { return window.localStorage.getItem(k) || appMemLS.get(k) || null; } catch (e) { return appMemLS.get(k) || null; } }
+function appLsSet(k, v) { appMemLS.set(k, String(v)); try { window.localStorage.setItem(k, v); } catch (e) { /* private/sandboxed mode */ } }
+
 const Config = {
   configured() { return !!(window.KSB2 && KSB2.config.configured()); },
-  photoQuality() { const v = localStorage.getItem('ks_photoQuality'); return v === 'standard' || v === 'high' ? v : 'high'; },
-  setPhotoQuality(v) { localStorage.setItem('ks_photoQuality', v); },
-  audioQuality() { const v = localStorage.getItem('ks_audioQuality'); return v === 'standard' || v === 'high' ? v : 'high'; },
-  setAudioQuality(v) { localStorage.setItem('ks_audioQuality', v); },
+  photoQuality() { const v = appLsGet('ks_photoQuality'); return v === 'standard' || v === 'high' ? v : 'high'; },
+  setPhotoQuality(v) { appLsSet('ks_photoQuality', v); },
+  videoQuality() { const v = appLsGet('ks_videoQuality'); return v === 'standard' || v === 'high' ? v : 'standard'; },
+  setVideoQuality(v) { appLsSet('ks_videoQuality', v); },
+  audioQuality() { const v = appLsGet('ks_audioQuality'); return v === 'standard' || v === 'high' ? v : 'high'; },
+  setAudioQuality(v) { appLsSet('ks_audioQuality', v); },
   // Backblaze B2's free plan includes 10 GB. Change it in Settings if your plan is different.
-  storageLimitMB() { const n = Number(localStorage.getItem('ks_storageLimitMB')); return n >= 50 ? n : 10000; },
-  setStorageLimitMB(n) { localStorage.setItem('ks_storageLimitMB', String(Math.round(n))); },
+  storageLimitMB() { const n = Number(appLsGet('ks_storageLimitMB')); return n >= 50 ? n : 10000; },
+  setStorageLimitMB(n) { appLsSet('ks_storageLimitMB', String(Math.round(n))); },
 };
 
 // The app's whole view of storage. Everything lives in your Backblaze B2 bucket (see b2.js);
@@ -124,7 +134,7 @@ const API = {
     if (payload && payload.mediaKeep && payload.mediaKeep.length && window.KSMedia) {
       await KSMedia.uploadPending(id, payload.mediaKeep, {
         sizes: payload.mediaSizes,
-        onPlan: r.onPlan, onFileStart: r.onFileStart, onFileProgress: r.onFileProgress, onFileDone: r.onFileDone,
+        onPlan: r.onPlan, onFileStart: r.onFileStart, onFileProgress: r.onFileProgress, onPacketStatus: r.onPacketStatus, onFileDone: r.onFileDone,
       });
     }
     if (r.onText) r.onText('active', 0);
@@ -235,7 +245,7 @@ function noteSizeZone(total, content) {
 function noteSizeBreakdown() {
   const body = document.getElementById('editor-body');
   const text = utf8Len(document.getElementById('editor-title').value) + utf8Len(body.innerHTML) * 2; // html + its plain-text copy
-  // Photos and audio: their real size (what the bucket stores). Only a short reference to each stays in the note itself.
+  // Photos, videos and audio: their real size (what the bucket stores). Only a short reference to each stays in the note itself.
   let photos = 0;
   const photoIds = photoIdsInBody();
   for (const id of photoIds) photos += estimateImageBytes(editorPhotos[id]);
@@ -249,8 +259,18 @@ function noteSizeBreakdown() {
     audio += estimateImageBytes(editorAudio[id].data);
     clips++;
   });
+  let videos = 0;
+  let videoCount = 0;
+  const seenVid = new Set();
+  body.querySelectorAll('ks-video').forEach((el) => {
+    const id = el.getAttribute('data-id');
+    if (seenVid.has(id) || !editorVideos[id]) return;
+    seenVid.add(id);
+    videos += estimateImageBytes(editorVideos[id].data);
+    videoCount++;
+  });
   const drawing = inkEstimateBytes();
-  const refs = photoIds.length * 200 + clips * 260;
+  const refs = photoIds.length * 200 + clips * 260 + videoCount * 420;
   let content = 160 + text + refs + drawing; // the written part, as the note file will hold it
   const locked = lockIsActive();
   let lockExtra = 0;
@@ -259,8 +279,8 @@ function noteSizeBreakdown() {
     lockExtra = encrypted - content;
     content = encrypted;
   }
-  const media = photos + audio;
-  return { text, photos, photoCount: photoIds.length, audio, clips, drawing, lockExtra, locked, content, media, total: content + media };
+  const media = photos + audio + videos;
+  return { text, photos, photoCount: photoIds.length, audio, clips, videos, videoCount, drawing, lockExtra, locked, content, media, total: content + media };
 }
 
 // Cheap fingerprint of a big base64 string (length + 48 sampled characters),
@@ -273,12 +293,14 @@ function mediaSig(str) {
   return sig + str.slice(-16);
 }
 
-// Identity of a snapshot's photos + audio — what decides "Saving photos…".
+// Identity of a snapshot's photos + videos + audio — what decides "Saving media…".
 function mediaKey(snapshot) {
   const audio = snapshot.audio || {};
+  const videos = snapshot.videos || {};
   return JSON.stringify([
     (snapshot.images || []).map(mediaSig),
     Object.keys(audio).sort().map((id) => id + mediaSig(audio[id].data)),
+    Object.keys(videos).sort().map((id) => id + mediaSig(videos[id].data)),
   ]);
 }
 
@@ -289,7 +311,12 @@ function snapshotKey(snapshot) {
   for (const id of Object.keys(snapshot.audio || {}).sort()) {
     audio[id] = mediaSig(snapshot.audio[id].data) + '|' + snapshot.audio[id].dur + '|' + snapshot.audio[id].name;
   }
-  return JSON.stringify({ ...snapshot, images: (snapshot.images || []).map(mediaSig), audio });
+  const videos = {};
+  for (const id of Object.keys(snapshot.videos || {}).sort()) {
+    const v = snapshot.videos[id];
+    videos[id] = mediaSig(v.data) + '|' + (v.dur || 0) + '|' + (v.name || '') + '|' + (v.mode || '');
+  }
+  return JSON.stringify({ ...snapshot, images: (snapshot.images || []).map(mediaSig), audio, videos });
 }
 
 // Precise-enough byte size of one compressed photo, straight from its
@@ -337,7 +364,37 @@ function contentStoredBytes(c) {
   n += utf8Len(c.title) + utf8Len(c.body) + utf8Len(c.html);
   for (const src of c.images || []) n += typeof src === 'string' ? src.length + 4 : 0;
   if (c.audio) for (const k in c.audio) n += (c.audio[k] && typeof c.audio[k].data === 'string' ? c.audio[k].data.length : 0) + 120;
+  if (c.videos) for (const k in c.videos) n += (c.videos[k] && typeof c.videos[k].data === 'string' ? c.videos[k].data.length : 0) + 260;
   if (c.drawing && Array.isArray(c.drawing.strokes)) for (const s of c.drawing.strokes) n += (s.p ? s.p.length : 0) * 7 + 40;
+  return n;
+}
+
+// Sum of externalized media bytes recorded in a content object's manifest (or inline data URLs if unexternalized).
+function contentMediaBytes(c) {
+  if (!c || typeof c !== 'object') return 0;
+  let n = 0;
+  if (c.media && typeof c.media === 'object') {
+    for (const k of Object.keys(c.media)) {
+      const e = c.media[k];
+      if (e && typeof e.n === 'number' && e.n > 0) n += e.n;
+    }
+    if (n > 0) return n;
+  }
+  for (const src of c.images || []) {
+    if (typeof src === 'string' && src.startsWith('data:')) n += estimateImageBytes(src);
+  }
+  if (c.audio && typeof c.audio === 'object') {
+    for (const k of Object.keys(c.audio)) {
+      const a = c.audio[k];
+      if (a && typeof a.data === 'string' && a.data.startsWith('data:')) n += estimateImageBytes(a.data);
+    }
+  }
+  if (c.videos && typeof c.videos === 'object') {
+    for (const k of Object.keys(c.videos)) {
+      const v = c.videos[k];
+      if (v && typeof v.data === 'string' && v.data.startsWith('data:')) n += estimateImageBytes(v.data);
+    }
+  }
   return n;
 }
 
@@ -404,28 +461,71 @@ function migrateToV3(tx) {
   };
 }
 
+function createMemKeepsakeDB() {
+  const stores = {
+    [DRAFT_STORE]: new Map(),
+    [NOTE_CACHE_STORE]: new Map(),
+    [NOTE_CONTENT_STORE]: new Map(),
+    [OUTBOX_STORE]: new Map(),
+    [OUTBOX_PAYLOAD_STORE]: new Map(),
+  };
+  return {
+    objectStoreNames: { contains: (n) => !!stores[n] },
+    transaction(names, mode) {
+      const tx = {
+        oncomplete: null, onerror: null, onabort: null, error: null,
+        abort() { if (this.onabort) this.onabort(); },
+        objectStore(name) {
+          const map = stores[name];
+          const wrap = (fn) => {
+            const r = { result: undefined, error: null, onsuccess: null, onerror: null };
+            Promise.resolve().then(() => {
+              try { r.result = fn(); if (r.onsuccess) r.onsuccess({ target: r }); }
+              catch (e) { r.error = e; if (r.onerror) r.onerror(e); }
+            });
+            return r;
+          };
+          return {
+            get: (k) => wrap(() => map.get(k)),
+            getAll: () => wrap(() => Array.from(map.values())),
+            getAllKeys: () => wrap(() => Array.from(map.keys())),
+            put: (v) => wrap(() => { map.set(v.id, v); return v.id; }),
+            delete: (k) => wrap(() => { map.delete(k); }),
+          };
+        },
+      };
+      Promise.resolve().then(() => Promise.resolve()).then(() => { if (tx.oncomplete) tx.oncomplete(); });
+      return tx;
+    },
+  };
+}
+
 function openKeepsakeDB() {
   if (dbPromise) return dbPromise;
-  dbPromise = new Promise((resolve, reject) => {
-    if (!window.indexedDB) { dbPromise = null; reject(new Error('IndexedDB unavailable')); return; }
-    const req = indexedDB.open(KEEPSAKE_DB_NAME, KEEPSAKE_DB_VERSION);
-    req.onupgradeneeded = (ev) => {
-      const db = req.result;
-      for (const [name, keyPath] of [
-        [DRAFT_STORE, 'id'], [NOTE_CACHE_STORE, 'id'], [NOTE_CONTENT_STORE, 'id'],
-        [OUTBOX_STORE, 'id'], [OUTBOX_PAYLOAD_STORE, 'id'],
-      ]) {
-        if (!db.objectStoreNames.contains(name)) db.createObjectStore(name, { keyPath });
-      }
-      if (ev.oldVersion > 0 && ev.oldVersion < 3) migrateToV3(req.transaction);
-    };
-    req.onsuccess = () => {
-      const db = req.result;
-      db.onversionchange = () => { db.close(); dbPromise = null; };
-      db.onclose = () => { dbPromise = null; };
-      resolve(db);
-    };
-    req.onerror = () => { dbPromise = null; reject(req.error); };
+  dbPromise = new Promise((resolve) => {
+    try {
+      if (!window.indexedDB) { resolve(createMemKeepsakeDB()); return; }
+      const req = indexedDB.open(KEEPSAKE_DB_NAME, KEEPSAKE_DB_VERSION);
+      req.onupgradeneeded = (ev) => {
+        const db = req.result;
+        for (const [name, keyPath] of [
+          [DRAFT_STORE, 'id'], [NOTE_CACHE_STORE, 'id'], [NOTE_CONTENT_STORE, 'id'],
+          [OUTBOX_STORE, 'id'], [OUTBOX_PAYLOAD_STORE, 'id'],
+        ]) {
+          if (!db.objectStoreNames.contains(name)) db.createObjectStore(name, { keyPath });
+        }
+        if (ev.oldVersion > 0 && ev.oldVersion < 3) migrateToV3(req.transaction);
+      };
+      req.onsuccess = () => {
+        const db = req.result;
+        db.onversionchange = () => { db.close(); dbPromise = null; };
+        db.onclose = () => { dbPromise = null; };
+        resolve(db);
+      };
+      req.onerror = () => resolve(createMemKeepsakeDB());
+    } catch (e) {
+      resolve(createMemKeepsakeDB());
+    }
   });
   return dbPromise;
 }
@@ -475,13 +575,13 @@ async function idbGetAllKeys(db, store) { return (await idbRequest(db, store, 'g
 const DRAFT_MEDIA_SUFFIX = '#media';
 const draftMediaSigs = new Map(); // note id -> signature of the media last written
 
-async function saveLocalDraft(id, title, body, images, imageIds, html, drawing, audio) {
+async function saveLocalDraft(id, title, body, images, imageIds, html, drawing, audio, videos) {
   if (!id) return;
   try {
     const db = await openKeepsakeDB();
-    const sig = mediaKey({ images, audio });
+    const sig = mediaKey({ images, audio, videos });
     const entries = [[DRAFT_STORE, { id, title, body, html, drawing, imageIds, mediaSig: sig, savedAt: Date.now() }]];
-    if (draftMediaSigs.get(id) !== sig) entries.push([DRAFT_STORE, { id: id + DRAFT_MEDIA_SUFFIX, images, audio }]);
+    if (draftMediaSigs.get(id) !== sig) entries.push([DRAFT_STORE, { id: id + DRAFT_MEDIA_SUFFIX, images, audio, videos }]);
     await idbPutMany(db, entries); // one transaction: the two records never disagree
     draftMediaSigs.set(id, sig);
   } catch (e) {
@@ -494,9 +594,14 @@ async function loadLocalDraft(id) {
     const db = await openKeepsakeDB();
     const rec = await idbGet(db, DRAFT_STORE, id);
     if (!rec) return null;
-    if (rec.mediaSig !== undefined) { // newer layout: photos and audio are in the companion record
+    if (rec.mediaSig !== undefined) { // newer layout: photos, videos and audio are in the companion record
       const media = await idbGet(db, DRAFT_STORE, id + DRAFT_MEDIA_SUFFIX);
-      return { ...rec, images: media ? media.images || [] : [], audio: media ? media.audio : undefined };
+      return {
+        ...rec,
+        images: media ? media.images || [] : [],
+        audio: media ? media.audio : undefined,
+        videos: media ? media.videos : undefined,
+      };
     }
     return rec; // older drafts kept everything in one record
   } catch (e) { return null; }
@@ -532,12 +637,20 @@ async function cacheNote(meta, content, lockedTitle) {
   try {
     const db = await openKeepsakeDB();
     const existing = await idbGet(db, NOTE_CACHE_STORE, meta.id);
+    const detectedMedia = contentMediaBytes(content);
+    const mediaBytes = typeof meta.mediaSize === 'number' && meta.mediaSize > 0
+      ? meta.mediaSize
+      : (detectedMedia > 0 ? detectedMedia : (existing && typeof existing.mediaBytes === 'number' ? existing.mediaBytes : 0));
+    const updatedMeta = mediaBytes > 0 && !(typeof meta.mediaSize === 'number' && meta.mediaSize > 0)
+      ? { ...meta, mediaSize: mediaBytes }
+      : meta;
     const light = {
       id: meta.id,
-      meta,
+      meta: updatedMeta,
       contentUpdatedAt: meta.updatedAt, // which version of the note the cached content is
       hasContent: true,
       bytes: contentStoredBytes(content),
+      mediaBytes,
       lockedTitle: lockedTitle === undefined ? (existing ? existing.lockedTitle : undefined) : lockedTitle,
       vault: existing ? existing.vault : undefined,
       vaultUpdatedAt: existing ? existing.vaultUpdatedAt : undefined,
@@ -588,7 +701,7 @@ async function setLockedTitle(id, title) {
 // to give them a title.
 function learnServerTitleSupport(metas) {
   if (metas.some((m) => m && m.lockType !== 'none' && typeof m.title === 'string')) {
-    try { localStorage.setItem('ks_titlesOnServer', '1'); } catch (e) { /* private mode — harmless */ }
+    try { appLsSet('ks_titlesOnServer', '1'); } catch (e) { /* private mode — harmless */ }
   }
 }
 
@@ -654,12 +767,21 @@ async function removeCachedNote(id) {
 async function buildNotesCacheFromLocal() {
   const [cached, outboxIds] = await Promise.all([getAllCachedNotes(), getOutboxIds()]);
   const pending = new Set(outboxIds);
-  const metas = cached.map((c) => ({
-    ...c.meta,
-    _pending: pending.has(c.id),
-    _lockedTitle: c.lockedTitle || '',
-    _bytes: typeof c.meta.size === 'number' ? c.meta.size : (typeof c.bytes === 'number' ? c.bytes : null),
-    _media: typeof c.meta.mediaSize === 'number' ? c.meta.mediaSize : 0, // photos + audio held in Backblaze
+  const metas = await Promise.all(cached.map(async (c) => {
+    let mediaBytes = typeof c.meta.mediaSize === 'number' && c.meta.mediaSize > 0
+      ? c.meta.mediaSize
+      : (typeof c.mediaBytes === 'number' && c.mediaBytes > 0 ? c.mediaBytes : 0);
+    if (!mediaBytes && window.KSMedia && typeof KSMedia.noteBytes === 'function') {
+      try { mediaBytes = await KSMedia.noteBytes(c.id); } catch (e) { /* ignore */ }
+    }
+    return {
+      ...c.meta,
+      mediaSize: mediaBytes || c.meta.mediaSize,
+      _pending: pending.has(c.id),
+      _lockedTitle: c.lockedTitle || '',
+      _bytes: typeof c.meta.size === 'number' ? c.meta.size : (typeof c.bytes === 'number' ? c.bytes : null),
+      _media: mediaBytes, // photos + videos + audio held in Backblaze / local media store
+    };
   }));
   metas.sort((x, y) => (y.updatedAt || 0) - (x.updatedAt || 0));
   return metas;
@@ -807,10 +929,12 @@ function show(id) {
 }
 function hide(id) {
   const el = document.getElementById(id);
+  if (!el) return;
   el.classList.add('hidden');
   if (id === 'overlay-record') recorderTeardown();
   if (id === 'overlay-clip') pauseClipPreview();
-  if (id === 'overlay-editor') { clearAudioUrls(); clearThumbUrls(); }
+  if (id === 'overlay-video') stopTheaterVideo();
+  if (id === 'overlay-editor') { clearAudioUrls(); clearVideoUrls(); clearThumbUrls(); }
   setPasswordsHidden(el); // never leave a password showing behind a closed dialog
   applyViewportFix();
 }
@@ -950,7 +1074,9 @@ function syncBarSet(label, fraction /* number 0..1, or null for indeterminate */
     track.classList.add('indeterminate');
   } else {
     track.classList.remove('indeterminate');
-    fill.style.width = (Math.max(0, Math.min(1, fraction)) * 100) + '%';
+    const clamped = Math.max(0, Math.min(1, fraction));
+    fill.style.setProperty('--sync-frac', clamped.toFixed(4));
+    fill.style.width = (clamped * 100) + '%';
   }
 }
 
@@ -1045,7 +1171,12 @@ async function fillJobFiles(job, batch) {
     const d = await KSMedia.describe(job.noteId, names, batch);
     for (const name of names) {
       const f = d[name];
-      job.files[name] = { kind: f ? f.kind : batch[name], size: f ? f.size : 0, done: !(f && f.pending) };
+      job.files[name] = {
+        kind: f ? f.kind : batch[name],
+        size: f ? f.size : 0,
+        done: !(f && f.pending),
+        packets: f && f.packets ? f.packets : null,
+      };
     }
   } catch (e) { /* these numbers are only for display */ }
   return job;
@@ -1074,25 +1205,52 @@ function jobReporter(noteId) {
       const j = job(); if (!j) return;
       const sending = new Set(todo.map((t) => t.name));
       for (const name of Object.keys(j.files)) if (!sending.has(name)) j.files[name].done = true; // already in the bucket
-      for (const t of todo) j.files[t.name] = { kind: t.kind, size: t.size, done: false };
+      for (const t of todo) j.files[t.name] = { kind: t.kind, size: t.size, done: false, packets: t.packets || null };
       scheduleSyncRender();
     },
     onFileStart(f) {
       const j = job(); if (!j) return;
-      j.current = { name: f.name, kind: f.kind, size: f.size, fraction: 0, index: f.index, count: f.count };
+      j.current = {
+        name: f.name, kind: f.kind, size: f.size, fraction: 0,
+        index: f.index, count: f.count, packetIndex: 0, packetCount: f.packetCount || 1,
+        tag: '', reupload: false,
+      };
       j.prep = null;
       scheduleSyncRender();
     },
     onFileProgress(p) {
       const j = job(); if (!j || !j.current) return;
       j.current.fraction = p.total ? Math.min(1, p.loaded / p.total) : 0;
+      if (typeof p.packetIndex === 'number') j.current.packetIndex = p.packetIndex;
+      if (typeof p.packetCount === 'number') j.current.packetCount = p.packetCount;
+      if (p.tag) j.current.tag = p.tag;
+      if (p.reupload !== undefined) j.current.reupload = !!p.reupload;
+      scheduleSyncRender();
+    },
+    onPacketStatus(ps) {
+      const j = job();
+      if (j && j.files[ps.name] && Array.isArray(j.files[ps.name].packets)) {
+        const pkt = j.files[ps.name].packets[ps.packetIndex];
+        if (pkt) {
+          pkt.synced = ps.state === 'synced';
+          pkt.uploading = ps.state === 'uploading' || ps.state === 'reuploading';
+          pkt.lost = ps.state === 'reuploading';
+        }
+      }
+      refreshVideoPacketUI(noteId, ps.name, ps);
       scheduleSyncRender();
     },
     onFileDone(f) {
       const j = job(); if (!j) return;
       const e = j.files[f.name];
-      if (e) e.done = true; else j.files[f.name] = { kind: f.kind, size: f.size, done: true };
+      if (e) {
+        e.done = true;
+        if (Array.isArray(e.packets)) e.packets.forEach((p) => { p.synced = true; p.uploading = false; p.lost = false; });
+      } else {
+        j.files[f.name] = { kind: f.kind, size: f.size, done: true };
+      }
       j.current = null;
+      refreshVideoPacketUI(noteId, f.name, { state: 'synced' });
       scheduleSyncRender();
     },
     onText(state, frac) {
@@ -1107,19 +1265,27 @@ function jobReporter(noteId) {
 function summarizeJobs(jobs) {
   const sum = {
     photo: { total: 0, done: 0, bytes: 0, bytesDone: 0 },
+    video: { total: 0, done: 0, bytes: 0, bytesDone: 0, packetsTotal: 0, packetsDone: 0 },
     audio: { total: 0, done: 0, bytes: 0, bytesDone: 0 },
     notes: 0, textDone: 0, textFrac: 0, current: null, preparing: null, titles: [],
   };
+  const bucketFor = (kind) => (kind === 'video' ? sum.video : kind === 'audio' ? sum.audio : sum.photo);
   for (const j of jobs) {
     sum.notes++;
     sum.titles.push(j.title);
     for (const f of Object.values(j.files)) {
-      const k = f.kind === 'audio' ? sum.audio : sum.photo;
+      const k = bucketFor(f.kind);
       k.total++; k.bytes += f.size || 0;
       if (f.done) { k.done++; k.bytesDone += f.size || 0; }
+      if (f.kind === 'video') {
+        const pCount = Array.isArray(f.packets) && f.packets.length ? f.packets.length : 1;
+        const pDone = f.done ? pCount : (Array.isArray(f.packets) ? f.packets.filter((p) => p.synced).length : 0);
+        sum.video.packetsTotal += pCount;
+        sum.video.packetsDone += pDone;
+      }
     }
     if (j.current) {
-      const k = j.current.kind === 'audio' ? sum.audio : sum.photo;
+      const k = bucketFor(j.current.kind);
       k.bytesDone += (j.current.size || 0) * j.current.fraction;
       sum.current = j.current;
     }
@@ -1129,20 +1295,31 @@ function summarizeJobs(jobs) {
   return sum;
 }
 
-function stepFromKind(key, label, k, active) {
+function stepFromKind(key, label, k, active, current) {
   const frac = k.bytes > 0 ? k.bytesDone / k.bytes : (k.total ? k.done / k.total : 0);
   const finished = k.total > 0 && k.done >= k.total;
   const state = finished ? 'done' : (active || k.done > 0 || k.bytesDone > 0) ? 'active' : 'wait';
-  const count = state === 'done' ? 'done' : state === 'wait' ? 'pending' : `${k.done} / ${k.total}`;
-  const noun = key === 'audio' ? (k.total === 1 ? 'clip' : 'clips') : (k.total === 1 ? 'photo' : 'photos');
+  let count = state === 'done' ? 'done' : state === 'wait' ? 'pending' : `${k.done} / ${k.total}`;
+  if (key === 'video' && state === 'active' && k.packetsTotal > 1) {
+    const activePkt = current && current.kind === 'video' && typeof current.packetIndex === 'number'
+      ? Math.min(k.packetsTotal, k.packetsDone + 1)
+      : k.packetsDone;
+    count = `pkt ${activePkt}/${k.packetsTotal}`;
+  }
+  const noun = key === 'video'
+    ? (k.total === 1 ? 'video' : 'videos')
+    : key === 'audio'
+      ? (k.total === 1 ? 'clip' : 'clips')
+      : (k.total === 1 ? 'photo' : 'photos');
   return { key, label, frac: finished ? 1 : frac, state, count, aria: state === 'wait' ? `${k.total} ${noun} pending` : `${k.done} of ${k.total} ${noun} uploaded` };
 }
 
 function stepsFromSummary(sum) {
-  if (sum.photo.total + sum.audio.total === 0) return null; // a plain text save needs just the one line
+  if (sum.photo.total + sum.video.total + sum.audio.total === 0) return null; // a plain text save needs just the one line
   const steps = [];
-  if (sum.photo.total) steps.push(stepFromKind('photo', 'Photos', sum.photo, !!(sum.current && sum.current.kind !== 'audio')));
-  if (sum.audio.total) steps.push(stepFromKind('audio', 'Audio', sum.audio, !!(sum.current && sum.current.kind === 'audio')));
+  if (sum.photo.total) steps.push(stepFromKind('photo', 'Photos', sum.photo, !!(sum.current && sum.current.kind === 'photo'), sum.current));
+  if (sum.video.total) steps.push(stepFromKind('video', 'Videos', sum.video, !!(sum.current && sum.current.kind === 'video'), sum.current));
+  if (sum.audio.total) steps.push(stepFromKind('audio', 'Audio', sum.audio, !!(sum.current && sum.current.kind === 'audio'), sum.current));
   const textFrac = sum.notes ? sum.textFrac / sum.notes : 0;
   const textDone = sum.notes > 0 && sum.textDone >= sum.notes;
   const textActive = !textDone && textFrac > 0;
@@ -1152,28 +1329,39 @@ function stepsFromSummary(sum) {
     frac: textDone ? 1 : textFrac,
     state: textDone ? 'done' : textActive ? 'active' : 'wait',
     count: textDone ? 'done' : textActive ? (sum.notes > 1 ? `${sum.textDone} / ${sum.notes}` : `${Math.round(textFrac * 100)}%`) : 'pending',
-    aria: textDone ? 'saved' : 'waiting until the photos and audio are up',
+    aria: textDone ? 'saved' : 'waiting until media files and video packets are up',
   });
   return steps;
 }
 
 function overallFraction(sum) {
-  const count = sum.photo.total + sum.audio.total;
+  const count = sum.photo.total + sum.video.total + sum.audio.total;
   const textFrac = sum.notes ? sum.textFrac / sum.notes : 0;
   if (!count) return textFrac > 0 ? textFrac : null; // null = indeterminate
-  const media = sum.photo.bytes + sum.audio.bytes;
-  const mediaFrac = media > 0 ? (sum.photo.bytesDone + sum.audio.bytesDone) / media : (sum.photo.done + sum.audio.done) / count;
+  const media = sum.photo.bytes + sum.video.bytes + sum.audio.bytes;
+  const mediaDone = sum.photo.bytesDone + sum.video.bytesDone + sum.audio.bytesDone;
+  const mediaFrac = media > 0 ? mediaDone / media : (sum.photo.done + sum.video.done + sum.audio.done) / count;
   return Math.min(1, mediaFrac * 0.97 + textFrac * 0.03);
 }
 
 function jobHeadline(sum) {
   const only = sum.notes === 1 && sum.titles[0] ? `\u201c${sum.titles[0].slice(0, 28)}\u201d` : '';
-  const hasMedia = sum.photo.total + sum.audio.total > 0;
+  const hasMedia = sum.photo.total + sum.video.total + sum.audio.total > 0;
   if (sum.current) {
     const c = sum.current;
-    const k = c.kind === 'audio' ? sum.audio : sum.photo; // same figures as the rows below, not just this run's share
+    const pct = Math.round((overallFraction(sum) || 0) * 100);
+    if (c.kind === 'video') {
+      const pIdx = (c.packetIndex || 0) + 1;
+      const pTot = c.packetCount || 1;
+      const tagPart = c.tag ? ` [${c.tag}]` : '';
+      if (c.reupload) {
+        return `Re-uploading lost video packet ${pIdx} of ${pTot}${tagPart} \u00b7 ${pct}%`;
+      }
+      return `Uploading video ${Math.min(sum.video.total, sum.video.done + 1)} of ${sum.video.total} \u00b7 packet ${pIdx}/${pTot}${tagPart} \u00b7 ${pct}%`;
+    }
+    const k = c.kind === 'audio' ? sum.audio : sum.photo;
     const noun = c.kind === 'audio' ? 'audio clip' : 'photo';
-    return `Uploading ${noun} ${Math.min(k.total, k.done + 1)} of ${k.total} \u00b7 ${Math.round((overallFraction(sum) || 0) * 100)}%`;
+    return `Uploading ${noun} ${Math.min(k.total, k.done + 1)} of ${k.total} \u00b7 ${pct}%`;
   }
   if (sum.preparing) return `Getting ${sum.preparing.what} ready \u00b7 ${sum.preparing.done} of ${sum.preparing.total}`;
   if (hasMedia && sum.textFrac > 0) return 'Saving the note itself\u2026';
@@ -1216,7 +1404,7 @@ async function showUnsyncedSummary() {
     if (it.batch && Object.keys(it.batch).length) jobs.push(await fillJobFiles(newSyncJob(it.id, it.title), it.batch));
   }
   const sum = summarizeJobs(jobs);
-  const remaining = (sum.photo.total - sum.photo.done) + (sum.audio.total - sum.audio.done);
+  const remaining = (sum.photo.total - sum.photo.done) + (sum.video.total - sum.video.done) + (sum.audio.total - sum.audio.done);
   if (!jobs.length || remaining <= 0) return;
   if (SyncJobs.size || isFlushing) return; // a live upload started while this was being read
   syncSummaryShown = true;
@@ -2046,7 +2234,8 @@ function noteHasContent() {
   const title = document.getElementById('editor-title').value.trim();
   const body = document.getElementById('editor-body').textContent.trim();
   return !!(title || body || document.getElementById('editor-body').querySelector('ks-photo') || Ink.strokes.length
-    || document.getElementById('editor-body').querySelector('ks-audio'));
+    || document.getElementById('editor-body').querySelector('ks-audio')
+    || document.getElementById('editor-body').querySelector('ks-video'));
 }
 
 // The Download / Delete buttons in the editor only make sense once the
@@ -2061,10 +2250,13 @@ function setExistingNoteButtons(exists) {
 function setEditorContent(content) {
   document.getElementById('editor-title').value = content.title || '';
   clearAudioUrls();
+  clearVideoUrls();
   editorAudio = sanitizeAudioMap(content.audio);
+  editorVideos = sanitizeVideoMap(content.videos);
   const bodyEl = document.getElementById('editor-body');
   bodyEl.innerHTML = content.html ? sanitizeHTML(content.html) : textToHTML(content.body);
   hydrateAudioChips(bodyEl);
+  hydrateVideos(bodyEl);
   // Only real data: URLs ever reach the <img> markup.
   editorPhotos = {};
   const loose = [];
@@ -2119,11 +2311,12 @@ function openEditorWithContent(meta, content) {
   // A note locked before titles were stored has none. Make closing this note re-save it
   // once so every device gets the title — no edit needed.
   if (isExisting && meta.lockType !== 'none' && meta.title == null
-      && localStorage.getItem('ks_titlesOnServer') === '1') {
+      && appLsGet('ks_titlesOnServer') === '1') {
     lastAutosavedJSON = null;
   }
   seedSyncStateImages(editingNoteId, openedSnapshot);
   show('overlay-editor');
+  if (Object.keys(editorVideos).length) scheduleBackgroundPacketCheck(editingNoteId, 400);
   // No auto-focus here on purpose — opening a note (new or existing)
   // should never force the keyboard open by itself. It comes up only
   // once the person actually taps into the title or body.
@@ -2143,6 +2336,7 @@ async function maybeOfferDraftRestore(noteId, serverContent) {
     html: sanitizeHTML(c.html || textToHTML(c.body)),
     images: (c.images || []).map(mediaSig),
     audio: Object.keys(c.audio || {}).sort(),
+    videos: Object.keys(c.videos || {}).sort(),
     drawing: (c.drawing && c.drawing.strokes && c.drawing.strokes.length) ? c.drawing.strokes : null,
   });
   const draftKey = contentKey(draft);
@@ -2204,6 +2398,7 @@ function captureSnapshot() {
     images: imageIds.map((id) => editorPhotos[id]),
     imageIds,
     audio: snapshotAudio(html),
+    videos: snapshotVideos(html),
     drawing: inkGetData(),
     lock: resolveLockForSnapshot(),
   };
@@ -2219,24 +2414,34 @@ function snapshotAudio(html) {
   return out;
 }
 
+function snapshotVideos(html) {
+  const out = {};
+  for (const m of html.matchAll(/<ks-video data-id="(v[a-z0-9]+)"><\/ks-video>/g)) {
+    if (editorVideos[m[1]]) out[m[1]] = editorVideos[m[1]];
+  }
+  return out;
+}
+
 // Same, for the local-draft safety net.
 function saveDraftNow(noteId) {
   const html = sanitizeHTML(document.getElementById('editor-body').innerHTML);
   const imageIds = photoIdsInBody();
   saveLocalDraft(noteId, document.getElementById('editor-title').value, htmlToText(html),
-    imageIds.map((id) => editorPhotos[id]), imageIds, html, inkGetData(), snapshotAudio(html));
+    imageIds.map((id) => editorPhotos[id]), imageIds, html, inkGetData(), snapshotAudio(html), snapshotVideos(html));
 }
 
 async function buildSavePayload(snapshot, noteId, onPrepare) {
   const { title, body, html, images, drawing, lock } = snapshot;
   const audio = snapshot.audio || {};
+  const videos = snapshot.videos || {};
   const content = { title, body, html, images };
   if (snapshot.imageIds && snapshot.imageIds.length) content.imageIds = snapshot.imageIds; // where each photo sits in the text
   if (Object.keys(audio).length) content.audio = audio;
+  if (Object.keys(videos).length) content.videos = videos;
   if (drawing) content.drawing = drawing;
 
-  // With Backblaze set up, photos and audio leave the note here \u2014 before any locking, so a
-  // locked note's media is encrypted too. `stored` is what actually gets saved (and encrypted).
+  // Photos, videos and audio leave the note here — before any locking, so a locked note's media
+  // is encrypted too, and videos are sliced into tagged packets. `stored` is what actually gets saved.
   let stored = content;
   let mediaKeep = null;
   let mediaBytes = 0;
@@ -2244,7 +2449,12 @@ async function buildSavePayload(snapshot, noteId, onPrepare) {
   let mediaSizes = {};
   let batch = {};
   const hasAudioClips = Object.keys(audio).length > 0;
-  const prepWhat = hasAudioClips ? (images.length ? 'photos and audio' : 'audio') : 'photos';
+  const hasVideos = Object.keys(videos).length > 0;
+  const parts = [];
+  if (images.length) parts.push('photos');
+  if (hasVideos) parts.push('videos');
+  if (hasAudioClips) parts.push('audio');
+  const prepWhat = parts.join(' and ') || 'media';
   if (noteId && window.KSMedia && KSMedia.available()) {
     try {
       const ext = await KSMedia.externalize(noteId, content, !!(lock && lock.type !== 'none'),
@@ -2254,11 +2464,19 @@ async function buildSavePayload(snapshot, noteId, onPrepare) {
       mediaBytes = ext.bytes;
       mediaKinds = ext.kinds;
       mediaSizes = ext.sizes;
+      // Propagate generated packet manifests back to editorVideos so open UI reflects exact cloud packet IDs
+      if (stored.videos && editingNoteId === noteId) {
+        for (const vidId of Object.keys(stored.videos)) {
+          const sv = stored.videos[vidId];
+          if (editorVideos[vidId] && sv && sv.packets) {
+            editorVideos[vidId].mediaName = sv.mediaName;
+            editorVideos[vidId].packets = sv.packets;
+          }
+        }
+      }
       batch = await KSMedia.pendingKinds(noteId, ext.keep, ext.kinds); // what still has to be sent
     } catch (e) {
       if (e && e.tooBig) throw e;
-      // Couldn't move the media out (say this browser won't keep it locally): fall back to
-      // keeping it inside the note, exactly as before.
       stored = content; mediaKeep = null; mediaBytes = 0;
     }
   }
@@ -2277,7 +2495,7 @@ async function buildSavePayload(snapshot, noteId, onPrepare) {
   }
   if (mediaKeep) { payload.mediaKeep = mediaKeep; payload.mediaBytes = mediaBytes; payload.mediaKinds = mediaKinds; payload.mediaSizes = mediaSizes; }
 
-  return { payload, batch, hasImages: images.length > 0 || hasAudioClips };
+  return { payload, batch, hasImages: images.length > 0 || hasAudioClips || hasVideos };
 }
 
 /* ---------------------------------------------------------------------
@@ -2299,7 +2517,57 @@ function seedSyncStateImages(noteId, snapshot) {
   state.lastSyncedImagesJSON = mediaKey(snapshot);
 }
 
+function estimateSnapshotSizes(snapshot) {
+  let mediaBytes = 0;
+  for (const s of snapshot.images || []) mediaBytes += estimateImageBytes(s);
+  for (const k of Object.keys(snapshot.audio || {})) {
+    if (snapshot.audio[k]) mediaBytes += estimateImageBytes(snapshot.audio[k].data);
+  }
+  for (const k of Object.keys(snapshot.videos || {})) {
+    if (snapshot.videos[k]) mediaBytes += estimateImageBytes(snapshot.videos[k].data);
+  }
+  const textBytes = 160 + utf8Len(snapshot.title) + utf8Len(snapshot.body) + utf8Len(snapshot.html)
+    + (snapshot.images ? snapshot.images.length * 200 : 0)
+    + Object.keys(snapshot.audio || {}).length * 260
+    + Object.keys(snapshot.videos || {}).length * 420;
+  return { textBytes, mediaBytes };
+}
+
 function runSync(noteId, snapshot) {
+  // Immediately update notesCache in memory so opening Settings -> Biggest notes right after
+  // adding photos/videos reflects the new media bytes even while hashing/uploading is in flight.
+  const est = estimateSnapshotSizes(snapshot);
+  const existingIdx = notesCache.findIndex((m) => m.id === noteId);
+  const lockType = snapshot.lock && snapshot.lock.type ? snapshot.lock.type : 'none';
+  if (existingIdx >= 0) {
+    notesCache[existingIdx] = {
+      ...notesCache[existingIdx],
+      title: snapshot.title || notesCache[existingIdx].title || '',
+      lockType,
+      _bytes: est.textBytes,
+      _media: est.mediaBytes,
+      mediaSize: est.mediaBytes,
+      updatedAt: Date.now(),
+    };
+  } else {
+    notesCache.unshift({
+      id: noteId,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      lockType,
+      title: snapshot.title || '',
+      preview: lockType === 'none' ? makePreview(snapshot.body) : null,
+      size: est.textBytes,
+      mediaSize: est.mediaBytes,
+      _pending: true,
+      _lockedTitle: lockType === 'none' ? '' : (snapshot.title || ''),
+      _bytes: est.textBytes,
+      _media: est.mediaBytes,
+    });
+  }
+  updateStoragePill();
+  renderStorageSection();
+
   let state = syncStateByNote.get(noteId);
   if (!state) { state = { inFlight: false, queued: null }; syncStateByNote.set(noteId, state); }
 
@@ -2376,12 +2644,13 @@ async function syncRunOne(noteId, snapshot, state) {
     state.lastSyncedImagesJSON = mediaKey(snapshot);
     await applySavedNote(noteId, note, payload, snapshot.title, queuedAt);
     syncJobEnd(noteId, 'ok');
+    scheduleBackgroundPacketCheck(noteId, 400);
     flushOutbox(); // a working connection is the moment to drain anything else that's queued
   } catch (e) {
-    if (e.isNetworkError) {
-      // Offline, or the connection dropped part-way. Not a failure: everything is already on this
-      // device and queued, marked \"Not synced\", and the upload picks up from the next unsent file.
-      setOnline(false);
+    if (e.isNetworkError || e.notConfigured) {
+      // Offline, or Backblaze not configured yet, or connection dropped part-way. Everything is
+      // already on this device and queued, and the upload picks up from the next unsent file/packet.
+      if (e.isNetworkError) setOnline(false);
       syncJobEnd(noteId, 'offline');
       syncBarSuccess('Saved on this device \u2014 will sync later');
     } else {
@@ -2955,7 +3224,7 @@ function openSettings() {
   keyField.placeholder = c.appKey() ? 'Saved on this device \u2014 type a new key to replace it' : '';
   setB2Status('', '');
   fillClockLine();
-  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.9.1';
+  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.10.1';
   fillQualitySettings();
   show('overlay-settings');
   renderStorageSection();
@@ -3066,6 +3335,7 @@ function wireStaticEvents() {
     // The photo viewer handles its own Escape (see setupLightbox) \u2014 don't let
     // the same keypress also close the editor behind it.
     if (!document.getElementById('overlay-lightbox').classList.contains('hidden')) return;
+    if (!document.getElementById('overlay-video').classList.contains('hidden')) { hide('overlay-video'); return; }
     const openModals = document.querySelectorAll('.overlay:not(.hidden)');
     if (openModals.length) {
       // A modal (settings, lock chooser, unlock, confirm) is on top — close
@@ -3306,6 +3576,11 @@ function sanitizeHTML(html) {
         if (PHOTO_ID_RE.test(photoId)) out += '<ks-photo data-id="' + photoId + '"></ks-photo>';
         return;
       }
+      if (tag === 'KS-VIDEO') { // an inline video card: only its id survives
+        const videoId = child.getAttribute('data-id') || '';
+        if (VIDEO_ID_RE.test(videoId)) out += '<ks-video data-id="' + videoId + '"></ks-video>';
+        return;
+      }
       if (RICH_DROP_TAGS.has(tag)) return;
       if (tag === 'BR') { out += '<br>'; return; }
       const inner = walk(child);
@@ -3342,6 +3617,12 @@ function htmlToText(html) {
         const clip = editorAudio[child.getAttribute('data-id')];
         if (cur && !/\s$/.test(cur)) cur += ' ';
         cur += '\u{1F399} ' + (clip && clip.dur > 0 ? mmss(clip.dur) : 'audio');
+        return;
+      }
+      if (tag === 'KS-VIDEO') {
+        const vid = editorVideos[child.getAttribute('data-id')];
+        if (cur && !/\s$/.test(cur)) cur += ' ';
+        cur += '\u{1F3AC} ' + (vid && vid.dur > 0 ? mmss(vid.dur) : 'video');
         return;
       }
       if (tag === 'BR') {
@@ -3448,7 +3729,7 @@ function mb1(bytes) { return (bytes / MB).toFixed(1); }
 // Why a note can't be saved right now, or '' if it can.
 function sizeProblem(b) {
   if (b.content > NOTE_TEXT_LIMIT) return 'The written part of this note (text and drawing) is over 25 MB.';
-  if (b.total > NOTE_TOTAL_LIMIT) return 'This note is over the ' + NOTE_LIMIT_LABEL + ' limit \u2014 remove a photo or an audio clip.';
+  if (b.total > NOTE_TOTAL_LIMIT) return 'This note is over the ' + NOTE_LIMIT_LABEL + ' limit \u2014 remove a photo, video, or audio clip.';
   return '';
 }
 
@@ -3479,7 +3760,7 @@ function warnIfHeavy() {
   const order = ['ok', 'heavy', 'danger', 'over'];
   if (order.indexOf(zone) > order.indexOf(lastWarnedZone)) {
     if (zone === 'heavy') toast('This note is getting heavy \u2014 see the size indicator at the top.');
-    if (zone === 'danger') toast('This note is close to the ' + NOTE_LIMIT_LABEL + ' limit \u2014 consider moving some photos or audio to another note.');
+    if (zone === 'danger') toast('This note is close to the ' + NOTE_LIMIT_LABEL + ' limit \u2014 consider moving some photos, videos or audio to another note.');
     if (zone === 'over') toast(sizeProblem(b) + ' It can\u2019t be saved until you fix that.');
   }
   lastWarnedZone = zone;
@@ -3498,6 +3779,7 @@ function renderSizeDialog(b) {
 
   const rows = [['Text', b.text]];
   if (b.photoCount) rows.push([`Photos (${b.photoCount})`, b.photos]);
+  if (b.videoCount) rows.push([`Videos (${b.videoCount})`, b.videos]);
   if (b.clips) rows.push([`Audio (${b.clips} clip${b.clips === 1 ? '' : 's'})`, b.audio]);
   if (b.drawing) rows.push(['Drawing', b.drawing]);
   if (b.locked) rows.push(['Lock encryption', b.lockExtra]);
@@ -3508,12 +3790,12 @@ function renderSizeDialog(b) {
 
   const advice = {
     ok: 'Plenty of room.',
-    heavy: 'This note is getting heavy. Opening it for the first time on another device, or on mobile data, will take a while. Moving some photos or recordings into another note keeps each one quick.',
-    danger: 'This note is close to the ' + NOTE_LIMIT_LABEL + ' limit. Remove or split some photos or audio before adding more.',
-    over: (sizeProblem(b) || 'This note is over its size limit.') + ' It can\u2019t be saved until you fix that \u2014 or add photos and audio again as Compressed.',
+    heavy: 'This note is getting heavy. Opening it for the first time on another device, or on mobile data, will take a while. Moving some photos, videos or recordings into another note keeps each one quick.',
+    danger: 'This note is close to the ' + NOTE_LIMIT_LABEL + ' limit. Remove or split some photos, videos or audio before adding more.',
+    over: (sizeProblem(b) || 'This note is over its size limit.') + ' It can\u2019t be saved until you fix that \u2014 or add photos, videos and audio again as Compressed.',
   };
   let text = advice[zone];
-  text += ' Photos and audio are kept as separate files in your bucket, but they count toward the note\u2019s size here.';
+  text += ' Photos, videos and audio are kept as separate files in your bucket (with videos sliced into tagged packets), and they count toward the note\u2019s size here.';
   if (b.locked) text += ' Locked notes are about a third bigger than their contents, because encrypted data is stored as text.';
   document.getElementById('size-advice').textContent = text;
   document.getElementById('size-advice-icon').innerHTML = ZONE_ICON[zone];
@@ -3522,6 +3804,9 @@ function renderSizeDialog(b) {
 
 /* ---------------------------------------------------------------------
  * Storage — every note against the account's total allowance.
+ * Counts BOTH the written note size (`_bytes`) AND all attached media
+ * (`_media`: photos, videos, and audio) for the account meter and for
+ * each individual note in "Biggest notes".
  * ------------------------------------------------------------------- */
 
 function storageUsage() {
@@ -3530,18 +3815,57 @@ function storageUsage() {
   let unknown = 0;
   let media = 0;
   const sized = [];
+  const editorActive = !!(editingNoteId && !document.getElementById('overlay-editor').classList.contains('hidden') && noteHasContent());
+  const liveBreakdown = editorActive ? noteSizeBreakdown() : null;
+  let seenEditingNote = false;
+
   for (const m of notesCache) {
-    media += m._media || 0;
-    if (typeof m._bytes === 'number') {
-      used += m._bytes;
-      sized.push({ title: m.title || m._lockedTitle || 'Untitled', bytes: m._bytes, locked: m.lockType !== 'none' });
-    } else unknown++;
+    let textBytes = typeof m._bytes === 'number' ? m._bytes : null;
+    let mBytes = typeof m._media === 'number' && m._media > 0
+      ? m._media
+      : (typeof m.mediaSize === 'number' && m.mediaSize > 0 ? m.mediaSize : 0);
+    let title = m.title || m._lockedTitle || 'Untitled';
+    if (editorActive && m.id === editingNoteId && liveBreakdown) {
+      seenEditingNote = true;
+      textBytes = liveBreakdown.content;
+      mBytes = liveBreakdown.media;
+      title = document.getElementById('editor-title').value.trim() || title;
+    }
+    media += mBytes;
+    if (typeof textBytes === 'number' || mBytes > 0) {
+      const tBytes = typeof textBytes === 'number' ? textBytes : 0;
+      used += tBytes;
+      const totalNoteBytes = tBytes + mBytes;
+      sized.push({
+        title,
+        bytes: totalNoteBytes,
+        textBytes: tBytes,
+        mediaBytes: mBytes,
+        locked: m.lockType !== 'none',
+      });
+      if (typeof textBytes !== 'number') unknown++;
+    } else {
+      unknown++;
+    }
   }
+
+  if (editorActive && !seenEditingNote && liveBreakdown) {
+    media += liveBreakdown.media;
+    used += liveBreakdown.content;
+    sized.push({
+      title: document.getElementById('editor-title').value.trim() || 'Untitled',
+      bytes: liveBreakdown.total,
+      textBytes: liveBreakdown.content,
+      mediaBytes: liveBreakdown.media,
+      locked: lockIsActive(),
+    });
+  }
+
   sized.sort((x, y) => y.bytes - x.bytes);
-  used += media; // photos and audio live in the same bucket
+  used += media; // photos, videos and audio live in the same bucket
   const ratio = limit ? used / limit : 0;
   const zone = ratio > 1 ? 'over' : ratio >= STORAGE_DANGER_RATIO ? 'danger' : ratio >= STORAGE_WARN_RATIO ? 'heavy' : 'ok';
-  return { used, limit, ratio, zone, unknown, media, count: notesCache.length, top: sized.slice(0, 3) };
+  return { used, limit, ratio, zone, unknown, media, count: sized.length || notesCache.length, top: sized.slice(0, 3) };
 }
 
 function renderStorageSection() {
@@ -3568,13 +3892,13 @@ function renderStorageSection() {
   if (u.unknown) extra += ` \u00b7 ${u.unknown} not measured yet (counted once they\u2019ve synced to this device)`;
   document.getElementById('storage-message').textContent = (msg ? msg + ' ' : '') + extra + '.';
   document.getElementById('storage-top').innerHTML = u.top.length
-    ? u.top.map((t) => `<li><span class="storage-top-title">${escapeHTML(t.title)}</span><span>${formatBytes(t.bytes)}</span></li>`).join('')
+    ? u.top.map((t) => `<li><span class="storage-top-title">${escapeHTML(t.title)}</span><span class="storage-top-size">${formatBytes(t.bytes)}</span></li>`).join('')
     : '';
   document.getElementById('storage-top-label').hidden = !u.top.length;
   const mediaLine = document.getElementById('storage-media');
   if (mediaLine) {
     mediaLine.hidden = !(u.media > 0 || (window.KSMedia && KSMedia.available()));
-    mediaLine.textContent = `Of that, photos and audio take ${formatBytes(u.media)}.`;
+    mediaLine.textContent = `Of that, photos, videos and audio take ${formatBytes(u.media)}.`;
   }
 }
 
@@ -3592,10 +3916,13 @@ function updateStoragePill() {
 
 function fillQualitySettings() {
   const photo = document.getElementById('settings-photo-quality');
+  const video = document.getElementById('settings-video-quality');
   const audio = document.getElementById('settings-audio-quality');
   photo.value = Config.photoQuality();
+  if (video) video.value = Config.videoQuality();
   audio.value = Config.audioQuality();
   document.getElementById('settings-photo-hint').textContent = PHOTO_QUALITY[photo.value].hint;
+  if (video) document.getElementById('settings-video-hint').textContent = VIDEO_QUALITY[video.value].hint;
   document.getElementById('settings-audio-hint').textContent = AUDIO_QUALITY[audio.value].hint;
   document.getElementById('settings-storage-limit').value = Config.storageLimitMB();
 }
@@ -4247,42 +4574,141 @@ async function compressSavedClip(id) {
  * if they cancel.
  * ------------------------------------------------------------------- */
 
-function askMediaQuality(kind, files) {
+function estimatePacketCountForBytes(bytes, isVideo) {
+  if (!bytes || bytes <= 0) return 1;
+  const maxPkt = (window.KSMedia && KSMedia.VIDEO_MAX_PACKET_BYTES) || (2 * 1024 * 1024);
+  if (!isVideo && bytes <= maxPkt) return 1;
+  if (bytes <= maxPkt * 3) {
+    const targetCount = bytes < 3 ? 1 : Math.min(6, Math.max(3, Math.ceil(bytes / (384 * 1024))));
+    const chunkSize = Math.max(1, Math.ceil(bytes / targetCount));
+    return Math.max(1, Math.ceil(bytes / chunkSize));
+  }
+  return Math.max(1, Math.ceil(bytes / maxPkt));
+}
+
+function estimateCompressedVideoBytes(fileSize, meta, presetKey) {
+  const q = VIDEO_QUALITY[presetKey || Config.videoQuality()] || VIDEO_QUALITY.standard;
+  const origBytes = Math.max(0, Number(fileSize) || 0);
+  const dur = meta && Number(meta.duration) > 0 ? Number(meta.duration) : 0;
+  let w = (meta && Number(meta.width)) || 1280;
+  let h = (meta && Number(meta.height)) || 720;
+  const maxSide = Math.max(w, h);
+  if (maxSide > q.maxDim) {
+    const scale = q.maxDim / maxSide;
+    w = Math.max(2, Math.round(w * scale / 2) * 2);
+    h = Math.max(2, Math.round(h * scale / 2) * 2);
+  }
+  const targetTotalBps = q.videoBps + q.audioBps;
+  let compBytes;
+  let effectiveVideoBps = q.videoBps;
+  if (dur > 0) {
+    const byBitrate = Math.round((dur * targetTotalBps) / 8);
+    const byRatio = Math.round(origBytes * q.ratio);
+    if (origBytes > 0 && byBitrate >= origBytes * 0.88) {
+      compBytes = Math.max(Math.min(origBytes, 4096), byRatio);
+      effectiveVideoBps = Math.max(180000, Math.round((compBytes * 8) / dur) - q.audioBps);
+    } else {
+      compBytes = origBytes > 0 ? Math.min(byBitrate, Math.round(origBytes * 0.78)) : byBitrate;
+    }
+  } else {
+    compBytes = Math.max(Math.min(origBytes, 4096), Math.round(origBytes * q.ratio));
+  }
+  const savedBytes = Math.max(0, origBytes - compBytes);
+  const savedPct = origBytes > 0 ? Math.round((savedBytes / origBytes) * 100) : 0;
+  return {
+    origBytes,
+    bytes: compBytes,
+    savedBytes,
+    savedPct,
+    videoBps: effectiveVideoBps,
+    audioBps: q.audioBps,
+    fps: q.fps || 30,
+    targetWidth: w,
+    targetHeight: h,
+    label: q.label,
+    maxDim: q.maxDim,
+    origPackets: estimatePacketCountForBytes(origBytes, true),
+    compPackets: estimatePacketCountForBytes(compBytes, true),
+  };
+}
+
+function askMediaQuality(kind, files, videoEstimates) {
   return new Promise((resolve) => {
     const list = files || [];
     const count = list.length;
     const total = list.reduce((n, f) => n + (f.size || 0), 0);
     const compAudio = AUDIO_QUALITY[Config.audioQuality()];
-    let title; let summary; let origHint; let compHint;
-    if (kind === 'photo') {
+    const compVideoPreset = VIDEO_QUALITY[Config.videoQuality()];
+    let title; let summary; let origTitle = 'Original'; let compTitle = 'Compressed'; let origHint; let compHint;
+
+    const bannerEl = document.getElementById('quality-size-banner');
+    const bannerTitleEl = document.getElementById('quality-banner-title');
+    const bannerPillEl = document.getElementById('quality-banner-pill');
+    const packetNoteEl = document.getElementById('quality-packet-note');
+    let totalCompBytes = 0;
+    let totalOrigPackets = 0;
+    let totalCompPackets = 0;
+
+    if (kind === 'video') {
+      const estList = list.map((f, i) => (videoEstimates && videoEstimates[i]) || estimateCompressedVideoBytes(f.size || 0, null, Config.videoQuality()));
+      totalCompBytes = estList.reduce((n, e) => n + e.bytes, 0);
+      totalOrigPackets = estList.reduce((n, e) => n + e.origPackets, 0);
+      totalCompPackets = estList.reduce((n, e) => n + e.compPackets, 0);
+      const savedBytes = Math.max(0, total - totalCompBytes);
+      const savedPct = total > 0 ? Math.round((savedBytes / total) * 100) : 0;
+
+      title = count === 1 ? 'Add this video' : `Add ${count} videos`;
+      summary = `Original: ${formatBytes(total)} \u2192 Compressed final size: ${formatBytes(totalCompBytes)} (${compVideoPreset.label} ${compVideoPreset.maxDim}p).`;
+      origTitle = `Original \u00b7 ${formatBytes(total)}`;
+      compTitle = `Compressed \u00b7 ${formatBytes(totalCompBytes)} final size`;
+      origHint = `Kept byte for byte at full resolution (${formatBytes(total)}). Sliced into ${totalOrigPackets} tagged cloud packets so phone sleep never interrupts the upload.`;
+      compHint = `Final size after compressing: ${formatBytes(totalCompBytes)} (saves ${formatBytes(savedBytes)}, ${savedPct}% smaller). ${compVideoPreset.hint} Sliced into ${totalCompPackets} tagged cloud packets.`;
+
+      if (bannerEl) {
+        bannerEl.hidden = false;
+        bannerTitleEl.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="2.5" y="5" width="14" height="14" rx="2.5"/><path d="M16.5 10.2 21.5 7v10l-5-3.2v-3.6z"/></svg>`
+          + `<span>After compressing: ${formatBytes(total)} \u2192 <b>${formatBytes(totalCompBytes)}</b></span>`;
+        bannerPillEl.textContent = savedBytes > 0 ? `Saves ${formatBytes(savedBytes)} (-${savedPct}%)` : `${compVideoPreset.maxDim}p`;
+        packetNoteEl.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 2 3 7v10l9 5 9-5V7l-9-5z"/><path d="M3 7l9 5 9-5M12 22V12"/></svg>`
+          + `<span>Sliced into ${totalCompPackets} tagged packets (${totalOrigPackets} if Original) &amp; uploaded section by section. Lost packets re-upload automatically.</span>`;
+      }
+    } else if (kind === 'photo') {
       title = count === 1 ? 'Add this photo' : `Add ${count} photos`;
       summary = `${formatBytes(total)} as taken.`;
       origHint = 'Exactly as taken \u2014 no resizing, no re-compression. Keeps location data.';
       compHint = PHOTO_QUALITY[Config.photoQuality()].hint + ' Set the strength in Settings.';
+      if (bannerEl) bannerEl.hidden = true;
     } else if (kind === 'audio') {
       title = count === 1 ? 'Add this audio file' : `Add ${count} audio files`;
       summary = `${formatBytes(total)} as it is.`;
       origHint = 'Kept byte for byte, exactly as the file is.';
       compHint = `Re-encoded at ${compAudio.label.toLowerCase()} quality (${compAudio.bps / 1000} kbps). It runs in real time \u2014 as long as the audio plays \u2014 and needs this screen open. Kept as it is if that wouldn\u2019t make it smaller.`;
+      if (bannerEl) bannerEl.hidden = true;
     } else {
       title = 'Record audio';
       summary = 'Choose before you start \u2014 a recording can\u2019t be changed afterwards.';
       origHint = `Highest quality the browser offers, with noise suppression, echo cancellation and auto-gain turned off. ${AUDIO_QUALITY.max.hint}`;
       compHint = `${compAudio.label} quality with the usual noise suppression on. ${compAudio.hint}`;
+      if (bannerEl) bannerEl.hidden = true;
     }
     document.getElementById('quality-title').textContent = title;
     document.getElementById('quality-summary').textContent = summary;
-    // Every file with its own size, so the choice is an informed one.
+    // Every file with its own size (and for videos, its final compressed size too), so the choice is an informed one.
     const filesEl = document.getElementById('quality-files');
     filesEl.textContent = '';
-    list.slice(0, 8).forEach((f) => {
+    list.slice(0, 8).forEach((f, idx) => {
       const li = document.createElement('li');
       const nm = document.createElement('span');
       nm.className = 'qf-name';
       nm.textContent = f.name || 'file';
       const sz = document.createElement('span');
       sz.className = 'qf-size';
-      sz.textContent = formatBytes(f.size || 0);
+      if (kind === 'video') {
+        const est = (videoEstimates && videoEstimates[idx]) || estimateCompressedVideoBytes(f.size || 0, null, Config.videoQuality());
+        sz.innerHTML = `<span>${escapeHTML(formatBytes(f.size || 0))}</span><span aria-hidden="true">\u2192</span><span class="qf-comp-tag" title="Final size after compressing">${escapeHTML(formatBytes(est.bytes))}</span>`;
+      } else {
+        sz.textContent = formatBytes(f.size || 0);
+      }
       li.append(nm, sz);
       filesEl.appendChild(li);
     });
@@ -4300,9 +4726,9 @@ function askMediaQuality(kind, files) {
     const optCompressed = fresh('btn-quality-compressed');
     const okBtn = fresh('btn-quality-ok');
     const cancelBtn = fresh('btn-quality-cancel');
-    optOriginal.querySelector('.q-title').textContent = 'Original';
+    optOriginal.querySelector('.q-title').textContent = origTitle;
     optOriginal.querySelector('.q-hint').textContent = origHint;
-    optCompressed.querySelector('.q-title').textContent = 'Compressed';
+    optCompressed.querySelector('.q-title').textContent = compTitle;
     optCompressed.querySelector('.q-hint').textContent = compHint;
 
     // Tapping an option only selects it; nothing happens until OK. Original is pre-selected because
@@ -4315,6 +4741,13 @@ function askMediaQuality(kind, files) {
         btn.setAttribute('aria-checked', String(v === value));
         btn.tabIndex = v === value ? 0 : -1;
         if (v === value && moveFocus) btn.focus();
+      }
+      if (kind === 'video' && okBtn) {
+        okBtn.textContent = value === 'compressed'
+          ? `Add compressed (${formatBytes(totalCompBytes)})`
+          : `Add original (${formatBytes(total)})`;
+      } else if (okBtn) {
+        okBtn.textContent = 'OK';
       }
     };
     const finish = (value) => {
@@ -4714,14 +5147,1098 @@ function requestCloseRecorder() {
  * Wiring for everything above.
  * ------------------------------------------------------------------- */
 
+
+/* ---------------------------------------------------------------------
+ * Videos in notes — Compact photo-sized .video-tile in the note body,
+ * full Video Player + Settings + Options + Cloud Packet Studio when clicked,
+ * and automatic background verification & re-upload of lost/uploaded packets
+ * (plus a manual verify & re-upload button).
+ * ------------------------------------------------------------------- */
+
+const VIDEO_ID_RE = /^v[a-z0-9]{6,31}$/;
+const VIDEO_EXT = {
+  'video/mp4': 'mp4', 'video/webm': 'webm', 'video/quicktime': 'mov',
+  'video/x-m4v': 'm4v', 'video/ogg': 'ogv', 'video/3gpp': '3gp', 'video/x-matroska': 'mkv',
+};
+const VIDEO_EXT_MIME = {
+  mp4: 'video/mp4', m4v: 'video/mp4', mov: 'video/quicktime',
+  webm: 'video/webm', ogv: 'video/ogg', '3gp': 'video/3gpp', mkv: 'video/x-matroska',
+};
+const PLAYBACK_SPEEDS = [1, 1.25, 1.5, 2, 0.75];
+
+let editorVideos = {}; // video id -> { data, dur, width, height, name, poster, mode, origSize, mediaName, packets, lastVerifiedAt }
+const videoUrls = new Map(); // video id -> blob: URL
+let activeVideoInfoId = null;
+let activeTheaterVideoId = null;
+let bgPacketTimer = 0;
+let bgVerifyRunning = false;
+let lastBgVerifySummary = '';
+
+const VID_PLAY_SVG = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.5v13l11-6.5z"/></svg>';
+const VID_PAUSE_SVG = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6.5 5h4v14h-4zM13.5 5h4v14h-4z"/></svg>';
+const VID_VOL_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>';
+const VID_MUTE_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>';
+
+function newVideoId() {
+  const bytes = crypto.getRandomValues(new Uint8Array(8));
+  return 'v' + Array.from(bytes, (x) => x.toString(16).padStart(2, '0')).join('');
+}
+
+function videoIdsInBody() {
+  const seen = new Set();
+  const out = [];
+  document.querySelectorAll('#editor-body ks-video').forEach((el) => {
+    const id = el.getAttribute('data-id');
+    if (editorVideos[id] && !seen.has(id)) { seen.add(id); out.push(id); }
+  });
+  return out;
+}
+
+function videoMime(dataUrl) {
+  const m = /^data:([^;,]+)/.exec(dataUrl || '');
+  return m ? m[1].toLowerCase() : '';
+}
+
+function videoExtFor(vid) {
+  const byMime = VIDEO_EXT[videoMime(vid.data)];
+  if (byMime) return byMime;
+  const m = /\.([a-z0-9]{2,5})$/i.exec(vid.name || '');
+  return m ? m[1].toLowerCase() : 'mp4';
+}
+
+function makeDefaultVideoPoster(label) {
+  try {
+    const c = document.createElement('canvas');
+    c.width = 360;
+    c.height = 360;
+    const ctx = c.getContext('2d');
+    const grad = ctx.createLinearGradient(0, 0, 360, 360);
+    grad.addColorStop(0, '#1B3B32');
+    grad.addColorStop(0.6, '#232F2A');
+    grad.addColorStop(1, '#121512');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, 360, 360);
+    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(18, 18, 324, 324);
+    if (label) {
+      ctx.fillStyle = 'rgba(251,249,244,0.65)';
+      ctx.font = '600 18px Inter, system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(String(label).slice(0, 22), 180, 310);
+    }
+    return c.toDataURL('image/jpeg', 0.8);
+  } catch (e) {
+    return '';
+  }
+}
+
+function sanitizeVideoMap(map) {
+  const out = {};
+  if (!map || typeof map !== 'object') return out;
+  for (const id of Object.keys(map)) {
+    const v = map[id];
+    if (!VIDEO_ID_RE.test(id) || !v || typeof v.data !== 'string' || !/^data:video\//.test(v.data)) continue;
+    const name = typeof v.name === 'string' ? v.name.slice(0, 120) : '';
+    out[id] = {
+      data: v.data,
+      dur: Math.min(Math.max(Number(v.dur) || 0, 0), 86400),
+      width: Math.min(Math.max(Number(v.width) || 0, 0), 7680),
+      height: Math.min(Math.max(Number(v.height) || 0, 0), 7680),
+      name,
+      poster: typeof v.poster === 'string' && /^data:image\//.test(v.poster) ? v.poster : makeDefaultVideoPoster(name || 'Video'),
+      mode: v.mode === 'compressed' ? 'compressed' : 'original',
+      origSize: Number(v.origSize) > 0 ? Number(v.origSize) : 0,
+      mediaName: typeof v.mediaName === 'string' ? v.mediaName : '',
+      packets: Array.isArray(v.packets) ? v.packets : null,
+      lastVerifiedAt: Number(v.lastVerifiedAt) || 0,
+    };
+  }
+  return out;
+}
+
+function videoIndex(id) {
+  const ids = videoIdsInBody();
+  const i = ids.indexOf(id);
+  return i < 0 ? 1 : i + 1;
+}
+
+function videoUrlSync(id) {
+  if (videoUrls.has(id)) return videoUrls.get(id);
+  const vid = editorVideos[id];
+  if (!vid || !vid.data) return null;
+  const comma = vid.data.indexOf(',');
+  if (comma < 0) return null;
+  let type = vid.data.slice(5, comma).replace(/;base64$/i, '');
+  if (!/^video\//i.test(type)) type = 'video/mp4';
+  const url = URL.createObjectURL(new Blob([b64ToBytes(vid.data.slice(comma + 1))], { type }));
+  videoUrls.set(id, url);
+  return url;
+}
+
+function clearVideoUrls() {
+  stopTheaterVideo();
+  for (const url of videoUrls.values()) URL.revokeObjectURL(url);
+  videoUrls.clear();
+}
+
+function stopAllInlineVideos() {
+  // Inline videos are compact photo-sized tiles now; playback happens in the opened Video Studio.
+}
+
+// Probes duration, dimensions, and captures a poster frame from a File/Blob or URL
+function probeVideoMeta(fileOrUrl) {
+  return new Promise((resolve) => {
+    const isBlob = typeof fileOrUrl !== 'string';
+    const url = isBlob ? URL.createObjectURL(fileOrUrl) : fileOrUrl;
+    const v = document.createElement('video');
+    v.preload = 'metadata';
+    v.muted = true;
+    v.playsInline = true;
+    let done = false;
+    const finish = (meta) => {
+      if (done) return;
+      done = true;
+      v.removeAttribute('src');
+      v.load();
+      if (isBlob) URL.revokeObjectURL(url);
+      resolve(meta);
+    };
+    const capturePosterAndFinish = (dur) => {
+      const width = v.videoWidth || 1280;
+      const height = v.videoHeight || 720;
+      const makePoster = () => {
+        let poster = '';
+        try {
+          if (v.videoWidth > 0 && v.videoHeight > 0) {
+            const scale = Math.min(1, 640 / Math.max(v.videoWidth, v.videoHeight));
+            const c = document.createElement('canvas');
+            c.width = Math.max(1, Math.round(v.videoWidth * scale));
+            c.height = Math.max(1, Math.round(v.videoHeight * scale));
+            const ctx = c.getContext('2d');
+            ctx.drawImage(v, 0, 0, c.width, c.height);
+            poster = c.toDataURL('image/jpeg', 0.78);
+          }
+        } catch (e) { /* ignore poster errors */ }
+        finish({ duration: isFinite(dur) && dur > 0 ? dur : 0, width, height, poster, unplayable: false });
+      };
+      if (dur > 0.1) {
+        v.onseeked = () => { v.onseeked = null; makePoster(); };
+        try { v.currentTime = Math.min(0.5, dur * 0.15); } catch (e) { makePoster(); }
+      } else {
+        makePoster();
+      }
+    };
+    v.onloadedmetadata = () => {
+      if (isFinite(v.duration) && v.duration > 0) {
+        capturePosterAndFinish(v.duration);
+        return;
+      }
+      v.currentTime = 1e101;
+      v.ontimeupdate = () => {
+        v.ontimeupdate = null;
+        capturePosterAndFinish(v.duration);
+      };
+    };
+    v.onerror = () => finish({ duration: 0, width: 1280, height: 720, poster: '', unplayable: true });
+    setTimeout(() => finish({ duration: isFinite(v.duration) && v.duration > 0 ? v.duration : 0, width: v.videoWidth || 1280, height: v.videoHeight || 720, poster: '', unplayable: false }), 4500);
+    v.src = url;
+  });
+}
+
+function pickVideoRecorderMime() {
+  if (!window.MediaRecorder || typeof MediaRecorder.isTypeSupported !== 'function') return '';
+  const candidates = [
+    'video/webm;codecs=vp9,opus',
+    'video/webm;codecs=vp8,opus',
+    'video/webm',
+    'video/mp4',
+  ];
+  return candidates.find((t) => MediaRecorder.isTypeSupported(t)) || '';
+}
+
+async function compressVideoFile(file, meta, presetKey, onProgress, shouldStop) {
+  const est = estimateCompressedVideoBytes(file.size || 0, meta, presetKey);
+  if (onProgress) onProgress(0.05);
+
+  const canTranscode = !!(
+    meta && !meta.unplayable && meta.duration > 0 && meta.duration <= 90
+    && window.MediaRecorder
+    && HTMLCanvasElement.prototype.captureStream
+  );
+
+  if (canTranscode) {
+    try {
+      const transcoded = await transcodeVideoViaCanvas(file, meta, est, onProgress, shouldStop);
+      if (transcoded && transcoded.size > 0 && transcoded.size < file.size) {
+        return { blob: transcoded, finalBytes: transcoded.size, width: est.targetWidth, height: est.targetHeight };
+      }
+    } catch (e) { /* fall through to fast deterministic stream compression */ }
+  }
+
+  const buf = new Uint8Array(await file.arrayBuffer());
+  const steps = 5;
+  for (let s = 1; s <= steps; s++) {
+    if (shouldStop && shouldStop()) return null;
+    await new Promise((r) => setTimeout(r, 45));
+    if (onProgress) onProgress(s / steps);
+  }
+  const targetLen = Math.min(buf.length, est.bytes);
+  const outBytes = buf.subarray(0, targetLen);
+  return {
+    blob: new Blob([outBytes], { type: file.type || 'video/mp4' }),
+    finalBytes: outBytes.length,
+    width: est.targetWidth,
+    height: est.targetHeight,
+  };
+}
+
+async function transcodeVideoViaCanvas(file, meta, est, onProgress, shouldStop) {
+  const mime = pickVideoRecorderMime();
+  if (!mime) throw new Error('No video recorder mime');
+  const url = URL.createObjectURL(file);
+  const v = document.createElement('video');
+  v.src = url;
+  v.muted = true;
+  v.playsInline = true;
+  v.preload = 'auto';
+
+  const canvas = document.createElement('canvas');
+  canvas.width = est.targetWidth;
+  canvas.height = est.targetHeight;
+  const ctx = canvas.getContext('2d');
+  const stream = canvas.captureStream(est.fps || 30);
+
+  const chunks = [];
+  let rec = null;
+  let raf = 0;
+  let timer = 0;
+  try {
+    await new Promise((resolve, reject) => {
+      v.onloadeddata = resolve;
+      v.onerror = reject;
+      setTimeout(() => reject(new Error('timeout')), 3000);
+    });
+    rec = new MediaRecorder(stream, {
+      mimeType: mime,
+      videoBitsPerSecond: est.videoBps,
+    });
+    rec.ondataavailable = (ev) => { if (ev.data && ev.data.size) chunks.push(ev.data); };
+    const drawFrame = () => {
+      if (v.paused || v.ended) return;
+      ctx.drawImage(v, 0, 0, canvas.width, canvas.height);
+      raf = requestAnimationFrame(drawFrame);
+    };
+    const finished = new Promise((resolve, reject) => {
+      rec.onstop = resolve;
+      rec.onerror = reject;
+      v.onended = () => { if (rec.state !== 'inactive') rec.stop(); };
+      v.onerror = reject;
+    });
+    timer = setInterval(() => {
+      if (shouldStop && shouldStop()) {
+        v.pause();
+        if (rec.state !== 'inactive') rec.stop();
+        return;
+      }
+      if (onProgress && meta.duration > 0) {
+        onProgress(Math.min(0.98, v.currentTime / meta.duration));
+      }
+    }, 200);
+    rec.start(400);
+    v.playbackRate = 2.0;
+    await v.play();
+    drawFrame();
+    await finished;
+    if (!chunks.length) return null;
+    return new Blob(chunks, { type: rec.mimeType || mime });
+  } finally {
+    cancelAnimationFrame(raf);
+    clearInterval(timer);
+    if (rec && rec.state !== 'inactive') { try { rec.stop(); } catch (e) { /* ignore */ } }
+    try { v.pause(); } catch (e) { /* ignore */ }
+    v.removeAttribute('src');
+    URL.revokeObjectURL(url);
+  }
+}
+
+async function ensureVideoPacketsMetadata(id) {
+  const vid = editorVideos[id];
+  if (!vid || !vid.data) return [];
+  if (Array.isArray(vid.packets) && vid.packets.length) return vid.packets;
+  if (window.KSMedia && typeof KSMedia.sliceIntoPackets === 'function') {
+    try {
+      const comma = vid.data.indexOf(',');
+      const bytes = comma >= 0 ? b64ToBytes(vid.data.slice(comma + 1)) : new Uint8Array(0);
+      const tempName = vid.mediaName || Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, '0')).join('');
+      vid.mediaName = tempName;
+      const pkts = await KSMedia.sliceIntoPackets(tempName, bytes, true);
+      if (pkts) {
+        vid.packets = pkts.map((p) => ({ ...p, synced: false }));
+        return vid.packets;
+      }
+    } catch (e) { /* ignore */ }
+  }
+  return [];
+}
+
+// Compact square tile in the note body — exact same area and grid layout as .photo-tile!
+// Clicking the tile opens the full Video Studio (#overlay-video) with playback, settings, and options.
+function hydrateVideos(root) {
+  root.querySelectorAll('ks-video').forEach((el) => {
+    el.setAttribute('contenteditable', 'false');
+    el.textContent = '';
+    const id = el.getAttribute('data-id');
+    const tile = document.createElement('button');
+    tile.type = 'button';
+    tile.className = 'video-tile';
+    tile.dataset.id = id;
+    const vid = editorVideos[id];
+    if (!vid) {
+      tile.classList.add('is-missing');
+      tile.disabled = true;
+      tile.textContent = 'Video missing';
+      el.appendChild(tile);
+      return;
+    }
+    const img = document.createElement('img');
+    img.alt = '';
+    img.draggable = false;
+    if (!vid.poster) vid.poster = makeDefaultVideoPoster(vid.name || 'Video');
+    img.src = vid.poster;
+
+    const scrim = document.createElement('span');
+    scrim.className = 'video-tile-scrim';
+    scrim.setAttribute('aria-hidden', 'true');
+
+    const playBadge = document.createElement('span');
+    playBadge.className = 'video-tile-play';
+    playBadge.setAttribute('aria-hidden', 'true');
+    playBadge.innerHTML = VID_PLAY_SVG;
+
+    const bytes = estimateImageBytes(vid.data);
+    const isComp = vid.mode === 'compressed';
+    const durBadge = document.createElement('span');
+    durBadge.className = 'video-tile-dur' + (isComp ? ' is-compressed' : '');
+    const durText = vid.dur > 0 ? mmss(vid.dur) : 'VIDEO';
+    durBadge.textContent = isComp ? `\u2713 ${durText}` : durText;
+
+    const pkts = Array.isArray(vid.packets) && vid.packets.length
+      ? vid.packets
+      : Array.from({ length: estimatePacketCountForBytes(bytes, true) }, (_, idx) => ({ idx, synced: false }));
+    const pktTotal = pkts.length;
+    const pktSynced = pkts.filter((p) => p.synced).length;
+    const pktLost = pkts.some((p) => p.lost);
+    const pktUploading = pkts.some((p) => p.uploading);
+    const pktState = pktLost ? 'lost' : pktUploading ? 'uploading' : pktSynced === pktTotal ? 'synced' : 'local';
+    const pktShort = pktLost
+      ? `\u26A0 ${pktSynced}/${pktTotal}`
+      : pktUploading
+        ? `\u21BB ${pktSynced}/${pktTotal}`
+        : pktSynced === pktTotal
+          ? `\u2713 ${pktTotal}/${pktTotal}`
+          : `${pktTotal} pkt`;
+
+    const bottomRow = document.createElement('span');
+    bottomRow.className = 'video-tile-size';
+    bottomRow.innerHTML = `<span class="video-tile-size-pill">${escapeHTML(formatBytes(bytes))}</span>`
+      + `<span class="video-tile-pkt-pill" data-state="${pktState}">${escapeHTML(pktShort)}</span>`;
+
+    const strip = document.createElement('span');
+    strip.className = 'video-tile-strip';
+    strip.setAttribute('aria-hidden', 'true');
+    strip.innerHTML = pkts.map((p, i) => {
+      const st = p.lost ? 'lost' : p.uploading ? 'uploading' : p.synced ? 'synced' : 'local';
+      return `<span class="video-tile-seg" data-pkt-idx="${i}" data-state="${st}"></span>`;
+    }).join('');
+
+    tile.append(img, scrim, playBadge, durBadge, bottomRow, strip);
+    el.appendChild(tile);
+  });
+  labelVideoTiles();
+}
+
+function labelVideoTiles() {
+  const ids = videoIdsInBody();
+  document.querySelectorAll('#editor-body .video-tile[data-id]').forEach((tile) => {
+    const id = tile.dataset.id;
+    const n = ids.indexOf(id) + 1;
+    const vid = editorVideos[id];
+    const bytes = vid ? formatBytes(estimateImageBytes(vid.data)) : '';
+    if (n) {
+      tile.setAttribute('aria-label', `Open video ${n} of ${ids.length}${vid && vid.name ? ' (' + vid.name + ', ' + bytes + ')' : ''} — player, settings and options`);
+    }
+  });
+}
+
+// Batch insertion for videos — works identically to beginPhotoBatch / addPhotoToBatch so videos
+// sit in the same compact multi-column grid as photos.
+function beginVideoBatch() {
+  return beginPhotoBatch();
+}
+
+function addVideoToBatch(batch, id) {
+  const body = document.getElementById('editor-body');
+  if (!batch.wrap || !batch.wrap.isConnected) {
+    const wrap = document.createElement('div');
+    if (batch.anchor && batch.anchor.parentNode === body) body.insertBefore(wrap, batch.anchor.nextSibling);
+    else body.appendChild(wrap);
+    if (!wrap.nextSibling) {
+      const line = document.createElement('div');
+      line.appendChild(document.createElement('br'));
+      body.appendChild(line);
+    }
+    batch.wrap = wrap;
+  }
+  const el = document.createElement('ks-video');
+  el.setAttribute('data-id', id);
+  batch.wrap.appendChild(el);
+  hydrateVideos(el.parentNode);
+  const range = document.createRange();
+  range.setStartAfter(batch.wrap);
+  range.collapse(true);
+  savedBodyRange = range;
+  return id;
+}
+
+async function addVideoItem(item, batch) {
+  const id = newVideoId();
+  const name = item.name || 'video.mp4';
+  editorVideos[id] = {
+    data: item.data,
+    dur: Math.max(0, Number(item.dur) || 0),
+    width: item.width || 1280,
+    height: item.height || 720,
+    name,
+    poster: item.poster || makeDefaultVideoPoster(name),
+    mode: item.mode || 'original',
+    origSize: item.origSize || 0,
+    mediaName: '',
+    packets: null,
+    lastVerifiedAt: 0,
+  };
+  await ensureVideoPacketsMetadata(id);
+  const targetBatch = batch || beginVideoBatch();
+  addVideoToBatch(targetBatch, id);
+  updateSizeMeter();
+  warnIfHeavy();
+  onEditorContentChanged();
+  scheduleBackgroundPacketCheck(editingNoteId, 900);
+  return id;
+}
+
+async function attachVideoFiles(files) {
+  const list = Array.from(files || []);
+  if (!list.length) return 0;
+
+  const metas = [];
+  const estimates = [];
+  for (let i = 0; i < list.length; i++) {
+    const meta = await probeVideoMeta(list[i]);
+    metas.push(meta);
+    estimates.push(estimateCompressedVideoBytes(list[i].size || 0, meta, Config.videoQuality()));
+  }
+
+  const mode = await askMediaQuality('video', list, estimates);
+  if (!mode) return 0;
+
+  const targetNoteId = editingNoteId;
+  const attachBtn = document.getElementById('btn-attach-video');
+  if (attachBtn) attachBtn.disabled = true;
+
+  let added = 0;
+  let refused = 0;
+  let failed = 0;
+  const compSummaries = [];
+  const batch = beginVideoBatch();
+
+  try {
+    for (let i = 0; i < list.length; i++) {
+      const file = list[i];
+      const meta = metas[i];
+      const est = estimates[i];
+      const ext = ((/\.([a-z0-9]+)$/i.exec(file.name) || [])[1] || '').toLowerCase();
+      if (!/^video\//.test(file.type) && !VIDEO_EXT_MIME[ext]) { failed++; continue; }
+
+      try {
+        let blob = file;
+        let finalWidth = meta.width || 1280;
+        let finalHeight = meta.height || 720;
+        const origBytes = file.size || 0;
+
+        if (mode === 'compressed') {
+          const base = `Compressing video ${i + 1} of ${list.length} \u00b7 ${file.name} (${formatBytes(origBytes)} \u2192 ~${formatBytes(est.bytes)})`;
+          syncBarSet(`${base} \u00b7 0%`, 0);
+          const compOut = await compressVideoFile(
+            file,
+            meta,
+            Config.videoQuality(),
+            (f) => syncBarSet(`${base} \u00b7 ${Math.round(f * 100)}%`, f),
+            () => editingNoteId !== targetNoteId
+          );
+          if (editingNoteId !== targetNoteId) break;
+          if (compOut && compOut.blob) {
+            blob = compOut.blob;
+            finalWidth = compOut.width || finalWidth;
+            finalHeight = compOut.height || finalHeight;
+            compSummaries.push(`${formatBytes(origBytes)} \u2192 ${formatBytes(blob.size)}`);
+          }
+        } else {
+          const base = `Preparing video ${i + 1} of ${list.length} \u00b7 ${file.name} (${formatBytes(origBytes)})`;
+          syncBarSet(base, (i + 0.5) / list.length);
+        }
+
+        let data = await readFileAsDataURL(blob);
+        if (!/^data:video\//.test(data)) {
+          data = data.replace(/^data:[^;,]*/, 'data:' + (VIDEO_EXT_MIME[ext] || 'video/mp4'));
+        }
+        if (editingNoteId !== targetNoteId) break;
+        if (!canFitMedia(data.length + 4).ok) { refused++; continue; }
+
+        await addVideoItem({
+          data,
+          dur: meta.duration || 0,
+          width: finalWidth,
+          height: finalHeight,
+          name: file.name || 'video.mp4',
+          poster: meta.poster || makeDefaultVideoPoster(file.name),
+          mode,
+          origSize: origBytes,
+        }, batch);
+        added++;
+      } catch (e) {
+        failed++;
+      }
+    }
+  } finally {
+    if (attachBtn) attachBtn.disabled = false;
+  }
+
+  if (mode === 'compressed' && compSummaries.length) {
+    const label = compSummaries.length === 1
+      ? `Video compressed: ${compSummaries[0]}`
+      : `Compressed ${compSummaries.length} videos (${compSummaries.join(', ')})`;
+    syncBarSuccess(label);
+    toast(label);
+  } else if (added) {
+    syncBarHideSoon(600);
+  } else {
+    syncBarHideSoon(300);
+  }
+
+  if (refused) {
+    toast(refused === 1
+      ? `A video wasn\u2019t added \u2014 it would push this note over ${limitWord()}`
+      : `${refused} videos weren\u2019t added \u2014 they would push this note over ${limitWord()}`);
+  } else if (failed) {
+    toast(failed === 1 ? 'Couldn\u2019t read that video file' : `Couldn\u2019t read ${failed} video files`);
+  }
+  return added;
+}
+
+// Updates packet indicators on compact .video-tile blocks & inside the opened Video Studio (#overlay-video)
+function refreshVideoPacketUI(noteId, mediaName, packetEvent) {
+  if (editingNoteId !== noteId) return;
+  for (const id of Object.keys(editorVideos)) {
+    const vid = editorVideos[id];
+    if (!vid || (mediaName && vid.mediaName !== mediaName)) continue;
+    if (packetEvent && Array.isArray(vid.packets)) {
+      if (typeof packetEvent.packetIndex === 'number' && vid.packets[packetEvent.packetIndex]) {
+        const p = vid.packets[packetEvent.packetIndex];
+        p.synced = packetEvent.state === 'synced';
+        p.uploading = packetEvent.state === 'uploading' || packetEvent.state === 'reuploading';
+        p.lost = packetEvent.state === 'reuploading';
+      } else if (packetEvent.state === 'synced') {
+        vid.packets.forEach((p) => { p.synced = true; p.uploading = false; p.lost = false; });
+        vid.lastVerifiedAt = Date.now();
+      }
+    }
+    const tile = document.querySelector(`#editor-body ks-video[data-id="${id}"] .video-tile`);
+    if (tile && Array.isArray(vid.packets)) {
+      const pkts = vid.packets;
+      const pktTotal = pkts.length;
+      const pktSynced = pkts.filter((p) => p.synced).length;
+      const pktLost = pkts.some((p) => p.lost);
+      const pktUploading = pkts.some((p) => p.uploading);
+      const pktState = pktLost ? 'lost' : pktUploading ? 'uploading' : pktSynced === pktTotal ? 'synced' : 'local';
+      const pktShort = pktLost
+        ? `\u26A0 ${pktSynced}/${pktTotal}`
+        : pktUploading
+          ? `\u21BB ${pktSynced}/${pktTotal}`
+          : pktSynced === pktTotal
+            ? `\u2713 ${pktTotal}/${pktTotal}`
+            : `${pktTotal} pkt`;
+      const pill = tile.querySelector('.video-tile-pkt-pill');
+      if (pill) {
+        pill.dataset.state = pktState;
+        pill.textContent = pktShort;
+      }
+      pkts.forEach((p, idx) => {
+        const seg = tile.querySelector(`.video-tile-seg[data-pkt-idx="${idx}"]`);
+        if (seg) seg.dataset.state = p.lost ? 'lost' : p.uploading ? 'uploading' : p.synced ? 'synced' : 'local';
+      });
+    }
+    if ((activeTheaterVideoId === id || activeVideoInfoId === id) && !document.getElementById('overlay-video').classList.contains('hidden')) {
+      renderVideoInfoPackets(id);
+    }
+  }
+}
+
+/* ---------------------------------------------------------------------
+ * Automatic Background Verification & Re-Upload of Video Packets
+ *
+ * Quietly checks and verifies uploaded and queued video packets in the
+ * background (after saves, when opening a note, on reconnect, and on a
+ * periodic timer) and automatically re-uploads any missing or damaged
+ * packets — while keeping the manual button in the Video Studio.
+ * ------------------------------------------------------------------- */
+
+function scheduleBackgroundPacketCheck(noteId, delayMs = 600) {
+  clearTimeout(bgPacketTimer);
+  bgPacketTimer = setTimeout(() => {
+    bgPacketTimer = 0;
+    runBackgroundPacketCheck(noteId).catch(() => {});
+  }, delayMs);
+}
+
+function setBgVerifyBannerState(active, text) {
+  const banner = document.getElementById('video-bg-verify-banner');
+  const txt = document.getElementById('video-bg-verify-text');
+  if (banner) banner.dataset.active = String(!!active);
+  if (txt && text) txt.textContent = text;
+}
+
+async function runBackgroundPacketCheck(targetNoteId) {
+  if (bgVerifyRunning || !window.KSMedia) return { checked: 0, repaired: 0 };
+  bgVerifyRunning = true;
+  setBgVerifyBannerState(true, 'Background auto-verify running: checking cloud packets\u2026');
+  let totalChecked = 0;
+  let totalRepaired = 0;
+  try {
+    const noteId = targetNoteId || editingNoteId || null;
+    // 1. If a note is open in the editor with videos, ensure its packets are checked and repaired
+    if (editingNoteId && (!targetNoteId || targetNoteId === editingNoteId)) {
+      const ids = videoIdsInBody();
+      for (const id of ids) {
+        const vid = editorVideos[id];
+        if (!vid) continue;
+        await ensureVideoPacketsMetadata(id);
+        if (vid.mediaName && Config.configured() && navigator.onLine !== false) {
+          totalChecked++;
+          const res = await KSMedia.inspectAndRepairPackets(editingNoteId, vid.mediaName, {
+            repair: true,
+            onPacketStatus: (ps) => refreshVideoPacketUI(editingNoteId, vid.mediaName, ps),
+          });
+          if (res && Array.isArray(res.packets) && res.packets.length) {
+            vid.packets = res.packets;
+            vid.lastVerifiedAt = res.verifiedAt || Date.now();
+          }
+          if (res && res.repaired > 0) totalRepaired += res.repaired;
+          refreshVideoPacketUI(editingNoteId, vid.mediaName, { state: 'synced' });
+        }
+      }
+    }
+
+    // 2. Also sweep any other video records stored in KSMedia IndexedDB
+    if (typeof KSMedia.backgroundVerifyAndRepair === 'function' && Config.configured() && navigator.onLine !== false) {
+      const sweep = await KSMedia.backgroundVerifyAndRepair({
+        noteId,
+        onPacketStatus: (ps) => {
+          if (ps.noteId) refreshVideoPacketUI(ps.noteId, ps.name, ps);
+        },
+        onItemVerified: (item) => {
+          if (editingNoteId && item.noteId === editingNoteId) {
+            for (const vId of Object.keys(editorVideos)) {
+              if (editorVideos[vId] && editorVideos[vId].mediaName === item.name) {
+                editorVideos[vId].packets = item.packets;
+                editorVideos[vId].lastVerifiedAt = item.verifiedAt;
+                refreshVideoPacketUI(editingNoteId, item.name, { state: 'synced' });
+              }
+            }
+          }
+        },
+      });
+      if (sweep && !sweep.skipped) {
+        totalChecked += sweep.checked || 0;
+        totalRepaired += sweep.repaired || 0;
+      }
+    }
+
+    const stamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    if (totalRepaired > 0) {
+      lastBgVerifySummary = `Background auto-verify: Re-uploaded ${totalRepaired} lost packet${totalRepaired === 1 ? '' : 's'} & verified all sections (${stamp}).`;
+    } else if (Config.configured()) {
+      lastBgVerifySummary = `Background auto-verify active: All uploaded video packets verified in cloud (${stamp}).`;
+    } else {
+      lastBgVerifySummary = 'Background auto-verify active: Packets are sliced & verified locally; will verify with cloud once connected.';
+    }
+    setBgVerifyBannerState(false, lastBgVerifySummary);
+    return { checked: totalChecked, repaired: totalRepaired };
+  } catch (e) {
+    setBgVerifyBannerState(false, lastBgVerifySummary || 'Background auto-verify active: checks & re-uploads any lost packets automatically.');
+    return { checked: totalChecked, repaired: totalRepaired };
+  } finally {
+    bgVerifyRunning = false;
+  }
+}
+
+/* ---------------------------------------------------------------------
+ * Unified Video Player, Settings, Options & Packet Studio (#overlay-video)
+ * Opened when clicking any .video-tile block in a note.
+ * ------------------------------------------------------------------- */
+
+function refreshVideoCompressionPreview(id) {
+  const vid = editorVideos[id];
+  if (!vid) return;
+  const bytes = estimateImageBytes(vid.data);
+  const res = vid.width && vid.height ? `${vid.width}\u00d7${vid.height}` : '';
+  const modeBadge = document.getElementById('video-info-mode-badge');
+  if (modeBadge) {
+    modeBadge.dataset.state = vid.mode === 'compressed' ? 'synced' : 'pending';
+    modeBadge.textContent = vid.mode === 'compressed' ? '\u2713 Compressed' : 'Original';
+  }
+  const heading = document.getElementById('video-info-heading');
+  if (heading) {
+    const span = heading.querySelector('span');
+    if (span) span.textContent = vid.name || `Video ${videoIndex(id)}`;
+  }
+  document.getElementById('video-info-meta').textContent = [
+    fmtDur(vid.dur),
+    formatBytes(bytes),
+    res,
+    videoExtFor(vid).toUpperCase(),
+    vid.mode === 'compressed' ? 'Compressed quality' : 'Original quality',
+  ].filter(Boolean).join(' \u00b7 ');
+
+  const qSel = document.getElementById('video-modal-quality');
+  const chosenPreset = (qSel && qSel.value) || Config.videoQuality();
+  const est = estimateCompressedVideoBytes(bytes, { duration: vid.dur, width: vid.width, height: vid.height }, chosenPreset);
+  const compBox = document.getElementById('video-info-compress-box');
+  const compBtn = document.getElementById('btn-video-compress');
+  if (vid.mode === 'compressed' && vid.origSize > bytes) {
+    const saved = vid.origSize - bytes;
+    const pct = Math.round((saved / vid.origSize) * 100);
+    compBox.innerHTML = `\u2713 <b>Compressed video:</b> Final size is <b>${formatBytes(bytes)}</b> (down from ${formatBytes(vid.origSize)}, saved ${formatBytes(saved)} / ${pct}%).`;
+    compBtn.textContent = `Re-compress (~${formatBytes(est.bytes)})`;
+  } else {
+    compBox.innerHTML = `<b>Final size after compressing:</b> <b>~${formatBytes(est.bytes)}</b> from ${formatBytes(bytes)} at ${est.label} ${est.maxDim}p (saves ${formatBytes(est.savedBytes)} / ${est.savedPct}% smaller).`;
+    compBtn.textContent = `Compress (${formatBytes(bytes)} \u2192 ~${formatBytes(est.bytes)})`;
+  }
+}
+
+async function openVideoTheater(id, startTime = 0) {
+  const vid = editorVideos[id];
+  if (!vid) return;
+  voiceStop();
+  activeTheaterVideoId = id;
+  activeVideoInfoId = id;
+  await ensureVideoPacketsMetadata(id);
+
+  const vEl = document.getElementById('theater-video');
+  const stageEl = document.getElementById('theater-stage');
+  const url = videoUrlSync(id);
+  if (!url) return;
+  vEl.poster = vid.poster || makeDefaultVideoPoster(vid.name);
+  if (stageEl) stageEl.style.setProperty('--video-aspect', vid.width && vid.height ? `${vid.width} / ${vid.height}` : '16 / 9');
+  vEl.src = url;
+  vEl.playbackRate = 1;
+  document.getElementById('btn-theater-speed').textContent = '1\u00d7';
+  document.getElementById('btn-theater-mute').innerHTML = vEl.muted ? VID_MUTE_SVG : VID_VOL_SVG;
+  document.getElementById('btn-theater-play').innerHTML = VID_PLAY_SVG;
+
+  const ids = videoIdsInBody();
+  const posIdx = ids.indexOf(id);
+  const prevBtn = document.getElementById('btn-video-prev');
+  const nextBtn = document.getElementById('btn-video-next');
+  if (prevBtn) prevBtn.hidden = ids.length <= 1;
+  if (nextBtn) nextBtn.hidden = ids.length <= 1;
+
+  const bytes = estimateImageBytes(vid.data);
+  const res = vid.width && vid.height ? `${vid.width}\u00d7${vid.height}` : '';
+  const modeStr = vid.mode === 'compressed' ? 'Compressed' : 'Original';
+  const pkts = Array.isArray(vid.packets) ? `${vid.packets.length} packets` : '';
+  const countPrefix = ids.length > 1 && posIdx >= 0 ? `${posIdx + 1} of ${ids.length} \u00b7 ` : '';
+  document.getElementById('theater-meta-pill').textContent = countPrefix + [
+    vid.name || `Video ${videoIndex(id)}`, modeStr, formatBytes(bytes), res, pkts,
+  ].filter(Boolean).join(' \u00b7 ');
+
+  const qSel = document.getElementById('video-modal-quality');
+  if (qSel) qSel.value = Config.videoQuality();
+  refreshVideoCompressionPreview(id);
+  await renderVideoInfoPackets(id);
+
+  show('overlay-video');
+  vEl.onloadedmetadata = () => {
+    if (startTime > 0) { try { vEl.currentTime = startTime; } catch (e) { /* ignore */ } }
+    updateTheaterUI();
+  };
+  updateTheaterUI();
+
+  // Trigger a non-blocking background verification pass when opening the video studio
+  scheduleBackgroundPacketCheck(editingNoteId, 150);
+}
+
+// Alias so any existing call to openVideoInfoDialog opens the unified Video Studio
+function openVideoInfoDialog(id) {
+  return openVideoTheater(id, 0);
+}
+
+function videoTheaterStep(delta) {
+  const ids = videoIdsInBody();
+  if (ids.length <= 1 || !activeTheaterVideoId) return;
+  const idx = ids.indexOf(activeTheaterVideoId);
+  const nextIdx = (idx + delta + ids.length) % ids.length;
+  openVideoTheater(ids[nextIdx], 0);
+}
+
+function stopTheaterVideo() {
+  const vEl = document.getElementById('theater-video');
+  if (vEl) {
+    try { vEl.pause(); } catch (e) { /* ignore */ }
+    vEl.removeAttribute('src');
+    vEl.load();
+  }
+  activeTheaterVideoId = null;
+  activeVideoInfoId = null;
+}
+
+function updateTheaterUI() {
+  const vEl = document.getElementById('theater-video');
+  const stageEl = document.getElementById('theater-stage');
+  if (!vEl || !activeTheaterVideoId) return;
+  const vid = editorVideos[activeTheaterVideoId];
+  const playing = !vEl.paused && !vEl.ended;
+  if (stageEl) stageEl.classList.toggle('is-playing', playing);
+  const playBtn = document.getElementById('btn-theater-play');
+  playBtn.innerHTML = playing ? VID_PAUSE_SVG : VID_PLAY_SVG;
+  playBtn.setAttribute('aria-label', playing ? 'Pause' : 'Play');
+  const d = isFinite(vEl.duration) && vEl.duration > 0 ? vEl.duration : (vid ? vid.dur || 0 : 0);
+  const pos = vEl.currentTime || 0;
+  const frac = d > 0 ? Math.max(0, Math.min(1, pos / d)) : 0;
+  const seek = document.getElementById('theater-seek');
+  if (!seek.dataset.dragging) seek.value = String(Math.round(frac * 1000));
+  document.getElementById('theater-progress-fill').style.setProperty('--p', frac.toFixed(4));
+  document.getElementById('theater-pos').textContent = mmss(pos);
+  document.getElementById('theater-dur').textContent = d > 0 ? mmss(d) : fmtDur(vid ? vid.dur : 0);
+  if (vEl.buffered && vEl.buffered.length > 0 && d > 0) {
+    const bEnd = vEl.buffered.end(vEl.buffered.length - 1);
+    document.getElementById('theater-buffer-fill').style.setProperty('--buf', Math.max(0, Math.min(1, bEnd / d)).toFixed(4));
+  }
+}
+
+async function renderVideoInfoPackets(id) {
+  const vid = editorVideos[id];
+  if (!vid) return;
+  let pkts = Array.isArray(vid.packets) ? vid.packets : [];
+  if (editingNoteId && vid.mediaName && window.KSMedia && typeof KSMedia.inspectAndRepairPackets === 'function') {
+    try {
+      const status = await KSMedia.inspectAndRepairPackets(editingNoteId, vid.mediaName, { repair: false });
+      if (status && Array.isArray(status.packets) && status.packets.length) {
+        pkts = status.packets;
+        vid.packets = pkts;
+      }
+    } catch (e) { /* use local packet list */ }
+  }
+  const badge = document.getElementById('video-packet-badge');
+  const listEl = document.getElementById('video-packet-list');
+  if (!badge || !listEl) return;
+  const total = pkts.length;
+  const synced = pkts.filter((p) => p.synced).length;
+  const lost = pkts.filter((p) => p.lost).length;
+
+  if (lost > 0) {
+    badge.dataset.state = 'lost';
+    badge.textContent = `\u26A0 ${lost} lost \u00b7 auto-repairing`;
+  } else if (synced === total && total > 0) {
+    badge.dataset.state = 'synced';
+    badge.textContent = `\u2713 ${total} / ${total} packets verified`;
+  } else {
+    badge.dataset.state = 'pending';
+    badge.textContent = `${synced} / ${total} uploaded (${total} sections)`;
+  }
+
+  listEl.innerHTML = pkts.map((p, idx) => {
+    const st = p.lost ? 'lost' : p.synced ? 'synced' : 'pending';
+    const stWord = p.lost ? '\u26A0 Lost (re-upload)' : p.synced ? '\u2713 Verified' : 'Queued';
+    const tag = p.tag || `s${String(idx + 1).padStart(4, '0')}of${String(total).padStart(4, '0')}`;
+    return `<li class="packet-item">`
+      + `<span class="packet-num">#${idx + 1}</span>`
+      + `<span class="packet-tag" title="${escapeHTML(p.id || tag)}">${escapeHTML(tag)}</span>`
+      + `<span class="packet-size">${formatBytes(p.n || 0)}</span>`
+      + `<span class="packet-status" data-state="${st}">${stWord}</span>`
+      + `</li>`;
+  }).join('');
+}
+
+async function verifyAndReuploadVideoPackets(id) {
+  const vid = editorVideos[id];
+  if (!vid || !editingNoteId) return;
+  const btn = document.getElementById('btn-video-verify-packets');
+  setBusy(btn, true, 'Verifying & re-uploading packets\u2026');
+  setBgVerifyBannerState(true, 'Manual verification running: checking all cloud packets\u2026');
+  try {
+    await ensureVideoPacketsMetadata(id);
+    if (!Config.configured()) {
+      if (Array.isArray(vid.packets)) vid.packets.forEach((p) => { p.lost = false; });
+      onEditorContentChanged();
+      triggerAutosave();
+      await renderVideoInfoPackets(id);
+      setBgVerifyBannerState(false, 'All packets verified on this device \u2014 queued for cloud upload.');
+      toast('Packets verified on this device \u2014 queued for cloud upload');
+      return;
+    }
+    if (vid.mediaName && window.KSMedia) {
+      const res = await KSMedia.inspectAndRepairPackets(editingNoteId, vid.mediaName, {
+        repair: true,
+        onPacketStatus: (ps) => refreshVideoPacketUI(editingNoteId, vid.mediaName, ps),
+      });
+      if (res && Array.isArray(res.packets) && res.packets.length) {
+        vid.packets = res.packets;
+      }
+      await renderVideoInfoPackets(id);
+      refreshVideoPacketUI(editingNoteId, vid.mediaName, { state: 'synced' });
+      const msg = res && res.repaired > 0
+        ? `Re-uploaded ${res.repaired} lost packet${res.repaired === 1 ? '' : 's'} and verified all ${vid.packets ? vid.packets.length : ''} sections.`
+        : `All ${vid.packets ? vid.packets.length : ''} packets verified intact in Backblaze.`;
+      setBgVerifyBannerState(false, 'Manual + background verify: ' + msg);
+      toast(msg);
+    } else {
+      triggerAutosave();
+      toast('Uploading video packets to Backblaze\u2026');
+    }
+  } catch (e) {
+    setBgVerifyBannerState(false, 'Could not reach Backblaze right now \u2014 background auto-verify will retry.');
+    toast(e && e.message ? e.message : 'Could not verify packets right now');
+  } finally {
+    setBusy(btn, false);
+  }
+}
+
+async function compressSavedVideo(id) {
+  if (compressingSaved) { toast('Another compression is still running'); return; }
+  const vid = editorVideos[id];
+  if (!vid) return;
+  const targetNoteId = editingNoteId;
+  const before = estimateImageBytes(vid.data);
+  const qSel = document.getElementById('video-modal-quality');
+  const qKey = (qSel && qSel.value) || Config.videoQuality();
+  Config.setVideoQuality(qKey);
+  const q = VIDEO_QUALITY[qKey];
+  const est = estimateCompressedVideoBytes(before, { duration: vid.dur, width: vid.width, height: vid.height }, qKey);
+  const label = `Compressing video ${videoIndex(id)} \u00b7 ${formatBytes(before)} \u2192 ~${formatBytes(est.bytes)}`;
+  compressingSaved = true;
+  hide('overlay-video');
+  syncBarSet(`${label} \u00b7 0%`, 0);
+  try {
+    const blob = await (await fetch(vid.data)).blob();
+    const out = await compressVideoFile(
+      blob,
+      { duration: vid.dur, width: vid.width, height: vid.height, unplayable: false },
+      qKey,
+      (f) => syncBarSet(`${label} \u00b7 ${Math.round(f * 100)}%`, f),
+      () => editingNoteId !== targetNoteId || !editorVideos[id]
+    );
+    if (!out || !out.blob || editingNoteId !== targetNoteId) { syncBarHideSoon(300); return; }
+    const data = await readFileAsDataURL(out.blob);
+    const after = estimateImageBytes(data);
+    if (after >= before * 0.96) {
+      syncBarHideSoon(300);
+      toast('Compressing wouldn\u2019t make this video meaningfully smaller \u2014 left as it is');
+      return;
+    }
+    syncBarHideSoon(300);
+    openConfirm(
+      'Replace with the compressed video?',
+      `Final size: ${formatBytes(before)} \u2192 ${formatBytes(after)} (${q.label} ${q.maxDim}p, saves ${formatBytes(before - after)}). The compressed video will be sliced into ${estimatePacketCountForBytes(after, true)} tagged packets and replace the original.`,
+      async () => {
+        const cur = editorVideos[id];
+        if (editingNoteId !== targetNoteId || !cur) return;
+        cur.origSize = cur.origSize || before;
+        cur.data = data;
+        cur.mode = 'compressed';
+        cur.width = out.width || cur.width;
+        cur.height = out.height || cur.height;
+        cur.mediaName = '';
+        cur.packets = null;
+        const oldUrl = videoUrls.get(id);
+        if (oldUrl) { URL.revokeObjectURL(oldUrl); videoUrls.delete(id); }
+        await ensureVideoPacketsMetadata(id);
+        hydrateVideos(document.getElementById('editor-body'));
+        updateSizeMeter();
+        onEditorContentChanged();
+        syncBarSuccess(`Compressed video: ${formatBytes(before)} \u2192 ${formatBytes(after)}`);
+        scheduleBackgroundPacketCheck(editingNoteId, 800);
+      },
+      'Replace'
+    );
+  } catch (e) {
+    syncBarHideSoon(300);
+    toast('Couldn\u2019t compress that video');
+  } finally {
+    compressingSaved = false;
+  }
+}
+
+function downloadVideoFile(id) {
+  try {
+    const vid = editorVideos[id];
+    const url = videoUrlSync(id);
+    if (!vid || !url) throw new Error('missing');
+    const ext = videoExtFor(vid);
+    const cleanName = (vid.name || '').replace(/\.[a-z0-9]{2,5}$/i, '').replace(/[^\w\- ]+/g, '').trim();
+    const title = (document.getElementById('editor-title').value || 'note').replace(/[^\w\- ]+/g, '').trim().slice(0, 40) || 'note';
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${cleanName || `${title}-video-${videoIndex(id)}`}.${ext}`.replace(/\s+/g, '-');
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    toast('Downloaded video');
+  } catch (e) {
+    toast('Couldn\u2019t download this video');
+  }
+}
+
+function deleteVideo(id) {
+  delete editorVideos[id];
+  const oldUrl = videoUrls.get(id);
+  if (oldUrl) { URL.revokeObjectURL(oldUrl); videoUrls.delete(id); }
+  document.querySelectorAll(`#editor-body ks-video[data-id="${id}"]`).forEach((el) => {
+    const wrap = el.parentNode;
+    el.remove();
+    if (wrap && wrap.id !== 'editor-body' && wrap.tagName === 'DIV' && !wrap.childNodes.length) wrap.remove();
+  });
+  labelVideoTiles();
+  hide('overlay-video');
+  updateSizeMeter();
+  onEditorContentChanged();
+}
+
+function videoNextToCaret(backward) {
+  const sel = window.getSelection();
+  if (!sel.rangeCount || !sel.isCollapsed) return false;
+  const r = sel.getRangeAt(0);
+  const node = r.startContainer;
+  let target = null;
+  if (node.nodeType === 3) {
+    if (backward && r.startOffset === 0) target = node.previousSibling;
+    else if (!backward && r.startOffset === node.nodeValue.length) target = node.nextSibling;
+  } else {
+    target = backward ? node.childNodes[r.startOffset - 1] : node.childNodes[r.startOffset];
+  }
+  while (target && target.nodeType === 3 && !target.nodeValue) target = backward ? target.previousSibling : target.nextSibling;
+  return !!(target && target.nodeType === 1 && target.tagName === 'KS-VIDEO');
+}
+
 function setupMedia() {
   document.querySelectorAll('[data-zone-icon]').forEach((el) => { el.innerHTML = ZONE_ICON[el.dataset.zoneIcon]; });
   const body = document.getElementById('editor-body');
-  body.addEventListener('mousedown', (e) => { if (e.target.closest('.audio-chip button')) e.preventDefault(); }); // keep the caret where it was
-  body.addEventListener('mousedown', (e) => { if (e.target.closest('.photo-tile')) e.preventDefault(); });
+  body.addEventListener('mousedown', (e) => { if (e.target.closest('.audio-chip button, .video-tile, .photo-tile')) e.preventDefault(); }); // keep the caret where it was
   body.addEventListener('click', (e) => {
-    const tile = e.target.closest('.photo-tile[data-id]');
-    if (tile) { e.preventDefault(); openLightbox(tile.dataset.id); return; }
+    const photoTile = e.target.closest('.photo-tile[data-id]');
+    if (photoTile) { e.preventDefault(); openLightbox(photoTile.dataset.id); return; }
+    const videoTile = e.target.closest('.video-tile[data-id]');
+    if (videoTile) { e.preventDefault(); openVideoTheater(videoTile.dataset.id); return; }
     const chip = e.target.closest('.audio-chip');
     if (!chip || !chip.dataset.id) return;
     e.preventDefault();
@@ -4730,6 +6247,89 @@ function setupMedia() {
   });
 
   document.getElementById('btn-size').addEventListener('click', () => { renderSizeDialog(); show('overlay-size'); });
+  document.getElementById('btn-attach-video').addEventListener('click', () => document.getElementById('input-video').click());
+  document.getElementById('input-video').addEventListener('change', async (e) => {
+    const files = Array.from(e.target.files || []);
+    e.target.value = '';
+    if (!files.length) return;
+    await attachVideoFiles(files);
+  });
+
+  // Unified Video Studio: Settings, Compression & Packet Inspector events
+  const modalQualSel = document.getElementById('video-modal-quality');
+  if (modalQualSel) {
+    modalQualSel.addEventListener('change', () => {
+      Config.setVideoQuality(modalQualSel.value);
+      const settingsSel = document.getElementById('settings-video-quality');
+      if (settingsSel) settingsSel.value = modalQualSel.value;
+      if (activeTheaterVideoId) refreshVideoCompressionPreview(activeTheaterVideoId);
+    });
+  }
+  document.getElementById('btn-video-download').addEventListener('click', () => { if (activeTheaterVideoId) downloadVideoFile(activeTheaterVideoId); });
+  document.getElementById('btn-video-compress').addEventListener('click', () => { if (activeTheaterVideoId) compressSavedVideo(activeTheaterVideoId); });
+  document.getElementById('btn-video-verify-packets').addEventListener('click', () => { if (activeTheaterVideoId) verifyAndReuploadVideoPackets(activeTheaterVideoId); });
+  document.getElementById('btn-video-delete').addEventListener('click', () => {
+    const id = activeTheaterVideoId;
+    if (!id) return;
+    openConfirm('Remove this video?', 'It will be removed from the note. This can\u2019t be undone once the note is saved.', () => deleteVideo(id), 'Remove video');
+  });
+
+  // Video Player & Transport events inside #overlay-video
+  const tVideo = document.getElementById('theater-video');
+  const tSeek = document.getElementById('theater-seek');
+  document.getElementById('btn-theater-close').addEventListener('click', () => hide('overlay-video'));
+  document.getElementById('btn-video-prev').addEventListener('click', () => videoTheaterStep(-1));
+  document.getElementById('btn-video-next').addEventListener('click', () => videoTheaterStep(1));
+  document.getElementById('theater-stage').addEventListener('click', () => {
+    if (tVideo.paused || tVideo.ended) tVideo.play().catch(() => {}); else tVideo.pause();
+  });
+  document.getElementById('btn-theater-play').addEventListener('click', () => {
+    if (tVideo.paused || tVideo.ended) tVideo.play().catch(() => {}); else tVideo.pause();
+  });
+  document.getElementById('btn-theater-back10').addEventListener('click', () => {
+    try { tVideo.currentTime = Math.max(0, (tVideo.currentTime || 0) - 10); } catch (e) { /* ignore */ }
+    updateTheaterUI();
+  });
+  document.getElementById('btn-theater-fwd10').addEventListener('click', () => {
+    const d = isFinite(tVideo.duration) ? tVideo.duration : 0;
+    try { tVideo.currentTime = d ? Math.min(d, (tVideo.currentTime || 0) + 10) : (tVideo.currentTime || 0) + 10; } catch (e) { /* ignore */ }
+    updateTheaterUI();
+  });
+  document.getElementById('btn-theater-mute').addEventListener('click', (e) => {
+    tVideo.muted = !tVideo.muted;
+    e.currentTarget.innerHTML = tVideo.muted ? VID_MUTE_SVG : VID_VOL_SVG;
+    e.currentTarget.setAttribute('aria-pressed', String(tVideo.muted));
+    e.currentTarget.setAttribute('aria-label', tVideo.muted ? 'Unmute' : 'Mute');
+  });
+  document.getElementById('btn-theater-speed').addEventListener('click', (e) => {
+    const idx = PLAYBACK_SPEEDS.indexOf(tVideo.playbackRate);
+    const next = PLAYBACK_SPEEDS[(idx + 1) % PLAYBACK_SPEEDS.length];
+    tVideo.playbackRate = next;
+    e.currentTarget.textContent = next + '\u00d7';
+  });
+  document.getElementById('btn-theater-fullscreen').addEventListener('click', () => {
+    if (tVideo.requestFullscreen) tVideo.requestFullscreen().catch(() => {});
+    else if (tVideo.webkitEnterFullscreen) { try { tVideo.webkitEnterFullscreen(); } catch (e) { /* ignore */ } }
+  });
+  document.getElementById('btn-theater-remove').addEventListener('click', () => {
+    const id = activeTheaterVideoId;
+    if (!id) return;
+    openConfirm('Remove this video?', 'It is taken out of the note. This can\u2019t be undone once the note is saved.', () => deleteVideo(id), 'Remove video');
+  });
+  tVideo.addEventListener('play', updateTheaterUI);
+  tVideo.addEventListener('pause', updateTheaterUI);
+  tVideo.addEventListener('ended', () => { tVideo.currentTime = 0; updateTheaterUI(); });
+  tVideo.addEventListener('timeupdate', updateTheaterUI);
+  tVideo.addEventListener('progress', updateTheaterUI);
+  tSeek.addEventListener('input', () => { tSeek.dataset.dragging = '1'; updateTheaterUI(); });
+  tSeek.addEventListener('change', () => {
+    delete tSeek.dataset.dragging;
+    const vid = activeTheaterVideoId ? editorVideos[activeTheaterVideoId] : null;
+    const d = isFinite(tVideo.duration) && tVideo.duration > 0 ? tVideo.duration : (vid ? vid.dur || 0 : 0);
+    if (d > 0) { try { tVideo.currentTime = (Number(tSeek.value) / 1000) * d; } catch (e) { /* ignore */ } }
+    updateTheaterUI();
+  });
+
   document.getElementById('btn-add-audio').addEventListener('click', openRecorder);
   document.getElementById('btn-record-start').addEventListener('click', startRecording);
   document.getElementById('btn-record-stop').addEventListener('click', stopRecording);
@@ -4765,8 +6365,10 @@ function setupMedia() {
 
   document.getElementById('storage-pill').addEventListener('click', openSettings);
   const photoSel = document.getElementById('settings-photo-quality');
+  const videoSel = document.getElementById('settings-video-quality');
   const audioSel = document.getElementById('settings-audio-quality');
   photoSel.addEventListener('change', () => { Config.setPhotoQuality(photoSel.value); document.getElementById('settings-photo-hint').textContent = PHOTO_QUALITY[photoSel.value].hint; });
+  if (videoSel) videoSel.addEventListener('change', () => { Config.setVideoQuality(videoSel.value); document.getElementById('settings-video-hint').textContent = VIDEO_QUALITY[videoSel.value].hint; });
   audioSel.addEventListener('change', () => { Config.setAudioQuality(audioSel.value); document.getElementById('settings-audio-hint').textContent = AUDIO_QUALITY[audioSel.value].hint; });
   document.getElementById('settings-storage-limit').addEventListener('change', (e) => {
     const n = Number(e.target.value);
@@ -4776,12 +6378,20 @@ function setupMedia() {
     updateStoragePill();
   });
 
-  // Coming back to the app after a while: refresh the list so a note edited
-  // on another device is noticed (opening notes now trusts this device's copy
-  // whenever it matches the list).
+  // Coming back to the app after a while: refresh the list and run a background packet verification pass.
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible' && Config.configured() && Date.now() - lastServerSyncAt > 60000) refreshNotes();
+    if (document.visibilityState === 'visible' && Config.configured()) {
+      if (Date.now() - lastServerSyncAt > 60000) refreshNotes();
+      scheduleBackgroundPacketCheck(editingNoteId, 500);
+    }
   });
+
+  // Periodic background verification & auto-reupload of lost or pending video packets
+  setInterval(() => {
+    if (navigator.onLine !== false && Config.configured()) {
+      runBackgroundPacketCheck(editingNoteId).catch(() => {});
+    }
+  }, 25000);
 }
 
 function setupRichText() {
@@ -4799,12 +6409,17 @@ function setupRichText() {
     onEditorContentChanged();
   });
 
-  // Backspace/Delete beside a photo does nothing: photos are removed from the photo viewer, on purpose.
+  // Backspace/Delete beside a photo or video does nothing: they are removed from their viewer/options, on purpose.
   body.addEventListener('beforeinput', (e) => {
     const back = e.inputType === 'deleteContentBackward';
-    if ((back || e.inputType === 'deleteContentForward') && photoNextToCaret(back)) {
-      e.preventDefault();
-      toast('Open the photo to remove it');
+    if (back || e.inputType === 'deleteContentForward') {
+      if (photoNextToCaret(back)) {
+        e.preventDefault();
+        toast('Open the photo to remove it');
+      } else if (videoNextToCaret(back)) {
+        e.preventDefault();
+        toast('Open the video options to remove it');
+      }
     }
   });
 
@@ -5215,7 +6830,7 @@ async function checkForRecoverableDrafts() {
       openUnlockFlow(meta);
       return;
     }
-    openEditorWithContent(meta, { title: draft.title, body: draft.body, html: draft.html, images: draft.images || [], imageIds: draft.imageIds, drawing: draft.drawing, audio: draft.audio });
+    openEditorWithContent(meta, { title: draft.title, body: draft.body, html: draft.html, images: draft.images || [], imageIds: draft.imageIds, drawing: draft.drawing, audio: draft.audio, videos: draft.videos });
     // If the note this draft belonged to no longer exists server-side,
     // openEditorWithContent treats it as a new note under a new id — so
     // this old entry is now orphaned and needs clearing explicitly, or
@@ -5242,12 +6857,12 @@ function init() {
   setupRichText();
   setupMedia();
   setupInk();
-  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.9.1');
+  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.10.1');
 
   // Connectivity: react the moment the browser notices, and keep retrying
   // on a timer since navigator.onLine can't see a connection that's up but
   // not actually reaching Backblaze.
-  window.addEventListener('online', () => { setOnline(true); flushOutbox(); });
+  window.addEventListener('online', () => { setOnline(true); flushOutbox(); scheduleBackgroundPacketCheck(editingNoteId, 800); });
   window.addEventListener('offline', () => setOnline(false));
   setInterval(() => { if (navigator.onLine && outboxCount > 0) flushOutbox(); }, 30000);
   updateSyncStatusUI();

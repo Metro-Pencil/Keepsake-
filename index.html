@@ -21,31 +21,60 @@
     --card-2: #F3EFE6;
     --ink: #23241F;
     --ink-soft: #6B6A60;
-    --ink-faint: #6F6D62; /* was #97958A (2.9:1) — now passes 4.5:1 on cards */
-    --amber: #85591A; /* was #A9762F (3.4:1 on --amber-bg) */
+    --ink-faint: #6F6D62; /* passes 4.5:1 on cards */
+    --amber: #85591A;
     --amber-bg: #F6ECDA;
     --violet: #5B4B8A;
     --violet-bg: #ECE8F5;
     --brick: #A23B3B;
     --line: #DEDACD;
     --line-strong: #8C8A7E; /* form-control edges: 3:1 non-text contrast */
+    --shadow-sm: 0 1px 2px rgba(35,36,31,0.05);
     --shadow: 0 1px 2px rgba(35,36,31,0.06), 0 4px 14px rgba(35,36,31,0.06);
+    --shadow-lg: 0 8px 24px rgba(35,36,31,0.12), 0 2px 6px rgba(35,36,31,0.06);
+    --shadow-video: 0 10px 28px rgba(18,21,18,0.18), 0 2px 6px rgba(18,21,18,0.1);
     --font-display: 'Source Serif 4', Georgia, serif;
     --font-body: 'Inter', system-ui, -apple-system, sans-serif;
-    --radius: 14px;
+    --radius-xs: 6px;
     --radius-sm: 10px;
+    --radius: 14px;
+    --radius-lg: 18px;
+    --radius-full: 999px;
     --space-1: 4px;
     --space-2: 8px;
     --space-3: 16px;
     --space-4: 24px;
+    --space-5: 32px;
     --z-sticky: 20;
     --z-modal: 100;
     --z-toast: 200;
     --z-lightbox: 400;
-    --z-confirm: 500; /* above the photo viewer, so "Remove this photo?" can be answered */
+    --z-confirm: 500; /* above the photo/video viewer, so "Remove?" can be answered */
     --gutter-l: max(20px, env(safe-area-inset-left, 0px));
     --gutter-r: max(20px, env(safe-area-inset-right, 0px));
+    /* Video player semantic tokens (WCAG AA/AAA verified contrast on dark cinema surface) */
+    --video-surface: #121512;
+    --video-surface-2: #1B201C;
+    --video-glass: rgba(18, 21, 18, 0.78);
+    --video-glass-strong: rgba(18, 21, 18, 0.9);
+    --video-border: rgba(255, 255, 255, 0.16);
+    --video-text: #FBF9F4;
+    --video-text-soft: #D5D2C8;
+    --video-accent: #63D2B2;
+    --video-accent-fill: #2F7D67;
+    --video-buffer: rgba(255, 255, 255, 0.28);
+    --video-track: rgba(255, 255, 255, 0.16);
     color-scheme: light;
+  }
+
+  @media (prefers-contrast: more) {
+    :root {
+      --ink-soft: #3D3C35;
+      --ink-faint: #3D3C35;
+      --line: #8C8A7E;
+      --line-strong: #45443C;
+      --video-border: rgba(255, 255, 255, 0.45);
+    }
   }
 
   * { box-sizing: border-box; }
@@ -61,20 +90,20 @@
 
   body { padding-bottom: 64px; }
 
-  a, button, input, textarea { font-family: inherit; }
+  a, button, input, textarea, select { font-family: inherit; }
 
   /* Every tappable control gets an immediate :active response (scale/opacity)
      so a tap *reads* as instant even while the real work is still happening
      in the background — the perceived-speed fix that matters most on touch,
      where :hover never fires at all. -webkit-tap-highlight-color is turned
      off so it doesn't fight with these custom states. */
-  button, a, .card-open, [role="tab"], [role="button"] {
+  button, a, .card-open, [role="tab"], [role="button"], [role="radio"] {
     -webkit-tap-highlight-color: transparent;
-    transition: background-color 0.12s ease, color 0.12s ease,
-      border-color 0.12s ease, opacity 0.12s ease, transform 0.08s ease;
+    transition: background-color 0.12s ease-out, color 0.12s ease-out,
+      border-color 0.12s ease-out, opacity 0.12s ease-out, transform 0.08s ease-out;
   }
 
-  button:active, [role="button"]:active {
+  button:active:not(:disabled), [role="button"]:active:not(:disabled) {
     transform: scale(0.96);
   }
 
@@ -98,18 +127,7 @@
     clip: rect(0,0,0,0);
   }
 
-  /* ---------- Sync bar ----------
-     Lives inside the sticky header (as a second row, below .top-inner)
-     instead of as its own fixed, high-z-index overlay — so it's always in
-     exactly one place on the front page rather than sliding down from
-     off-screen on every autosave tick. Being part of the header also
-     means the full-screen editor (which sits above the header) naturally
-     covers it while you're writing, which is exactly when this shouldn't
-     be competing for attention.
-     grid-template-rows (not height/max-height) is what's animated here —
-     it collapses to nothing without ever measuring/animating an explicit
-     height, and keeps the transition to transform/opacity-adjacent
-     properties. */
+  /* ---------- Sync bar ---------- */
 
   .sync-bar {
     display: grid;
@@ -117,17 +135,17 @@
     opacity: 0;
     background: var(--card-2);
     border-top: 1px solid transparent;
-    transition: grid-template-rows 0.2s ease, opacity 0.15s ease, border-color 0.2s ease;
+    transition: grid-template-rows 0.2s ease-out, opacity 0.15s ease-out, border-color 0.2s ease-out;
   }
 
   .sync-bar.show { grid-template-rows: 1fr; opacity: 1; border-top-color: var(--line); }
   .sync-bar.error { background: var(--amber-bg); }
   .sync-bar.error.show { border-top-color: #e6d3ae; }
 
-  .sync-bar-body { overflow: hidden; min-height: 0; } /* the grid item that collapses to nothing */
+  .sync-bar-body { overflow: hidden; min-height: 0; }
 
   .sync-bar-inner {
-    width: 100%; /* auto margins otherwise shrink-wrap, collapsing the track */
+    width: 100%;
     max-width: 980px;
     margin: 0 auto;
     padding: 8px var(--gutter-r) 8px var(--gutter-l);
@@ -137,6 +155,7 @@
     font-size: 0.7812rem;
     font-weight: 500;
     color: var(--ink-soft);
+    font-variant-numeric: tabular-nums;
   }
 
   .sync-bar.error .sync-bar-inner { color: var(--amber); }
@@ -169,14 +188,17 @@
 
   .sync-bar-fill {
     height: 100%;
-    width: 0%;
+    width: 100%;
     background: var(--pine);
     border-radius: 999px;
-    transition: width 0.2s ease;
+    transform-origin: left;
+    transform: scaleX(var(--sync-frac, 0));
+    transition: transform 0.2s ease-out;
   }
 
   .sync-bar-track.indeterminate .sync-bar-fill {
     width: 35% !important;
+    transform: none !important;
     position: absolute;
     animation: sync-indeterminate 1.1s ease-in-out infinite;
   }
@@ -188,8 +210,9 @@
 
   .sync-bar-retry {
     flex-shrink: 0;
-    margin: -10px -6px; /* grows the tap area to ~44px without making the bar taller */
+    margin: -10px -6px;
     padding: 10px 6px;
+    min-height: 44px;
     font-size: 0.7812rem;
     font-weight: 700;
     color: var(--brick);
@@ -197,10 +220,10 @@
   }
 
   .sync-bar-retry.hidden { display: none; }
-  .sync-bar.has-steps .sync-bar-track { display: none; } /* the per-kind rows below are the bars */
+  .sync-bar.has-steps .sync-bar-track { display: none; }
   .sync-bar.has-steps .sync-bar-label { white-space: normal; }
 
-  /* ---------- Upload progress rows: Photos 3 / 60 \00b7 Audio pending \00b7 Note text pending ---------- */
+  /* ---------- Upload progress rows: Photos · Videos (Packet 2/6) · Audio · Note text ---------- */
 
   .sync-steps {
     width: 100%;
@@ -214,7 +237,7 @@
   .sync-step {
     --f: 0;
     display: grid;
-    grid-template-columns: 5.25rem minmax(0, 1fr) 4.5rem;
+    grid-template-columns: 5.5rem minmax(0, 1fr) auto;
     align-items: center;
     gap: 10px;
     font-size: 0.75rem;
@@ -233,15 +256,15 @@
     background: var(--pine);
     border-radius: 999px;
     transform-origin: left;
-    transform: scaleX(var(--f)); /* transform, not width: no layout work on every progress tick */
+    transform: scaleX(var(--f));
     transition: transform 0.2s ease-out;
   }
 
-  .sync-step-count { text-align: end; white-space: nowrap; font-weight: 600; }
+  .sync-step-count { text-align: end; white-space: nowrap; font-weight: 600; min-width: 4.5rem; }
   .sync-step[data-state="wait"] .sync-step-count { color: var(--ink-faint); font-weight: 500; }
   .sync-step[data-state="wait"] .sync-step-fill { background: var(--line-strong); }
   .sync-step[data-state="done"] .sync-step-count { color: var(--ok); }
-  .sync-step[data-state="done"] .sync-step-count::before { content: "\2713\00a0"; } /* a check mark and the word, not colour alone */
+  .sync-step[data-state="done"] .sync-step-count::before { content: "\2713\00a0"; }
   .sync-bar.error .sync-step-name,
   .sync-bar.error .sync-step-count { color: var(--amber); }
 
@@ -312,11 +335,6 @@
     line-height: 1.6;
   }
 
-  /* Small always-in-the-header indicator for "there's something on this
-     device that hasn't reached the server yet" — offline, or a save that
-     got queued while offline. Separate from .sync-bar: this one is meant
-     to sit here quietly whenever it applies, not just during an active
-     save. */
   .sync-status {
     display: inline-flex;
     align-items: center;
@@ -430,7 +448,8 @@
     display: block;
     width: 100%;
     text-align: left;
-    transition: box-shadow 0.15s ease;
+    contain: layout paint;
+    transition: box-shadow 0.15s ease-out;
   }
 
   .card.type-quick { border-left-color: var(--violet); }
@@ -447,6 +466,7 @@
     margin: 0 0 6px;
     color: var(--ink);
     overflow-wrap: anywhere;
+    text-wrap: balance;
   }
 
   .card-title.is-placeholder { color: var(--ink-soft); font-weight: 500; }
@@ -461,6 +481,7 @@
     line-clamp: 6;
     -webkit-box-orient: vertical;
     overflow: hidden;
+    text-wrap: pretty;
   }
 
   .card-thumbs {
@@ -472,13 +493,12 @@
 
   .card-thumbs img {
     width: 52px; height: 52px;
+    aspect-ratio: 1;
     object-fit: cover;
     border-radius: 8px;
     border: 1px solid var(--line);
   }
 
-  /* Lock + "Not synced" pills share one shape and sit in one wrapping row, so they never touch,
-     never differ in height, and line up the same on every kind of card. */
   .card-badges {
     display: flex;
     flex-wrap: wrap;
@@ -510,12 +530,10 @@
   .card-meta {
     font-size: 0.75rem;
     color: var(--ink-faint);
+    font-variant-numeric: tabular-nums;
     margin: 0;
   }
 
-  /* Download/delete sit inline with the date instead of in their own
-     bordered footer strip below it — inside the same content block
-     rather than tacked on underneath it. */
   .card-footer {
     display: flex;
     flex-wrap: wrap;
@@ -527,8 +545,6 @@
 
   .card-footer .card-meta { flex: 1 1 8rem; min-width: 0; }
 
-  /* Locked cards hold a 44px row for the buttons even while they are tucked away, so the card
-     doesn't jump when they appear; the date sits in the middle of that row. */
   .card.type-quick .card-footer,
   .card.type-time .card-footer { min-height: 44px; }
   .card.type-quick,
@@ -537,23 +553,15 @@
   .card-actions {
     display: flex;
     align-items: center;
-    margin-inline-end: calc(var(--space-2) * -1); /* the 44px buttons' icons line up with the card's text edge */
-    gap: 8px; /* keeps the two touch targets comfortably apart */
+    margin-inline-end: calc(var(--space-2) * -1);
+    gap: 8px;
     opacity: 1;
-    transition: opacity 0.15s ease;
+    transition: opacity 0.15s ease-out;
   }
 
-  /* A little larger than the old 32px footer icons — still compact enough
-     for a card this size, but a better touch target. */
   .card-actions .icon-btn { width: 44px; height: 44px; }
   .card-actions .icon-btn svg { width: 16px; height: 16px; }
 
-  /* Locked notes keep these hidden until the card's been tapped once (see
-     handleOpenCard in app.js) — tapping again then opens the unlock
-     prompt, same as before. Keeps a locked card's face uncluttered, and
-     echoes the "deliberate friction" the locks themselves are meant to
-     have (see README). Tab focus also reveals them, so a keyboard user
-     is never left focused on an invisible button. */
   .card.type-quick .card-actions,
   .card.type-time .card-actions {
     opacity: 0;
@@ -567,7 +575,6 @@
     pointer-events: auto;
   }
 
-  /* A note saved on this device but not yet pushed to the server. */
   .pending-pill {
     color: var(--amber);
     background: var(--amber-bg);
@@ -593,6 +600,7 @@
     color: var(--ink-soft);
     font-size: 1.1875rem;
     margin-bottom: 6px;
+    text-wrap: balance;
   }
 
   /* ---------- Modals ---------- */
@@ -613,17 +621,17 @@
 
   .modal {
     background: var(--card);
-    border-radius: 18px;
+    border-radius: var(--radius-lg);
     width: 100%;
     max-width: 560px;
-    margin: auto; /* centres in the overlay both ways, and never clips the top when taller than the screen */
+    margin: auto;
     box-shadow: 0 20px 60px rgba(35,36,31,0.25);
     max-height: 100%;
     display: flex;
     flex-direction: column;
   }
 
-  .modal.narrow { max-width: 420px; }
+  .modal.narrow { max-width: 440px; }
 
   .modal-head {
     display: flex;
@@ -638,11 +646,13 @@
     font-weight: 600;
     margin: 0;
     flex: 1;
+    text-wrap: balance;
   }
 
   .modal-body {
     padding: 12px 20px 20px;
     overflow-y: auto;
+    overscroll-behavior: contain;
   }
 
   .field { margin-bottom: 14px; }
@@ -666,10 +676,14 @@
     min-height: 44px;
     border: 1px solid var(--line-strong);
     background: var(--card-2);
-    border-radius: 10px;
+    border-radius: var(--radius-sm);
     padding: 10px 12px;
     font-size: 1rem;
     color: var(--ink);
+  }
+
+  .field input:user-invalid {
+    border-color: var(--danger);
   }
 
   .field textarea {
@@ -679,7 +693,6 @@
     font-family: var(--font-display);
   }
 
-  /* Show/hide-password field: the eye sits inside the input's trailing edge. */
   .pw-field { position: relative; }
 
   .field .pw-field > input[data-pw-enhanced] { padding-inline-end: 48px; }
@@ -706,6 +719,7 @@
     color: var(--ink-soft);
     line-height: 1.5;
     margin: 0 0 var(--space-3);
+    text-wrap: pretty;
   }
 
   .field .hint {
@@ -713,6 +727,7 @@
     color: var(--ink-faint);
     margin-top: 5px;
     line-height: 1.5;
+    text-wrap: pretty;
   }
 
   .error,
@@ -724,7 +739,7 @@
     margin-top: 5px;
   }
 
-  .error:not(.visually-hidden)::before { content: "\26A0\FE0E\00a0"; } /* an icon too, so it isn't colour alone */
+  .error:not(.visually-hidden)::before { content: "\26A0\FE0E\00a0"; }
 
   /* ---------- Full-screen note editor ---------- */
 
@@ -770,8 +785,6 @@
     flex-direction: column;
   }
 
-  /* The sheet wraps title + body + photos so the ink canvases can sit on
-     top of exactly that area and scroll with it. */
   .editor-sheet {
     position: relative;
     flex: 1;
@@ -791,7 +804,7 @@
     color: var(--ink);
     overflow-wrap: break-word;
     caret-color: var(--pine);
-    outline: 2px solid transparent; /* stays visible in forced-colors mode */
+    outline: 2px solid transparent;
     outline-offset: 4px;
     -webkit-user-select: text;
     user-select: text;
@@ -803,18 +816,14 @@
     pointer-events: none;
   }
 
-  .rich-body p, .rich-body div { margin: 0; } /* lines are lines, like Keep — spacing comes from blank lines you type */
+  .rich-body p, .rich-body div { margin: 0; }
   .rich-body h1 { font-size: 1.6rem; line-height: 1.25; font-weight: 700; margin: 0.8em 0 0.35em; text-wrap: balance; }
   .rich-body h2 { font-size: 1.25rem; line-height: 1.3; font-weight: 600; margin: 0.8em 0 0.3em; text-wrap: balance; }
-  .rich-body h3 { font-size: 1.1rem; line-height: 1.3; font-weight: 600; margin: 0.8em 0 0.3em; }
+  .rich-body h3 { font-size: 1.1rem; line-height: 1.3; font-weight: 600; margin: 0.8em 0 0.3em; text-wrap: balance; }
   .rich-body ul, .rich-body ol { margin: 0 0 0.6em; padding-inline-start: 1.4em; }
   .rich-body blockquote { margin: 0 0 0.6em; padding-inline-start: 0.9em; border-inline-start: 3px solid var(--line); color: var(--ink-soft); }
 
-  /* ---------- Ink (drawing) layer ----------
-     Two stacked canvases: .ink-layer holds finished strokes, .ink-live
-     only the stroke being drawn right now. Both ignore the pointer
-     unless drawing mode is on with a drawing tool selected. multiply
-     blending lets highlighter strokes tint the text instead of hiding it. */
+  /* ---------- Ink (drawing) layer ---------- */
   .ink-layer {
     position: absolute;
     inset: 0;
@@ -831,7 +840,6 @@
     -webkit-touch-callout: none;
   }
 
-  /* While drawing, taps must not put a caret in the text underneath. */
   .editor-sheet.is-drawing .title-input,
   .editor-sheet.is-drawing .rich-body {
     pointer-events: none;
@@ -847,13 +855,12 @@
   .editor-lock-status:empty { display: none; }
   .editor-lock-status .hint { margin: 6px 0; font-size: 0.8125rem; line-height: 1.4; color: var(--ink-soft); }
 
-  /* The trash button was meant to sit alone at the far edge, away from Download and Lock. */
   .spacer { flex: 1; }
 
   .editor-toolbar {
     display: flex;
     align-items: center;
-    gap: 2px;
+    gap: 4px;
     padding: 8px max(12px, env(safe-area-inset-right, 0px)) 8px max(12px, env(safe-area-inset-left, 0px));
     padding-bottom: max(8px, env(safe-area-inset-bottom));
     border-top: 1px solid var(--line);
@@ -865,7 +872,6 @@
 
   .editor-toolbar .icon-btn[aria-pressed="true"] { background: var(--pine); color: var(--card); }
 
-  /* Format / drawing tool rows that sit above the main editor toolbar. */
   .tool-row {
     display: flex;
     align-items: center;
@@ -923,10 +929,9 @@
     border-radius: 50%;
     background: var(--swatch);
     box-shadow: 0 0 0 1px var(--ink-faint);
-    transition: box-shadow 0.12s ease;
+    transition: box-shadow 0.12s ease-out;
   }
 
-  /* Selected = a ring around the dot (a shape change, not just colour). */
   .swatch[aria-pressed="true"]::before {
     box-shadow: 0 0 0 2px var(--card), 0 0 0 4px var(--pine);
   }
@@ -952,32 +957,21 @@
     text-overflow: ellipsis;
   }
 
-  /* ---------- Photos in the text ----------
-     A photo is an inline element like an audio clip, so it sits between lines of text. Photos that
-     follow each other form a grid that fills the whole width: 3 across on a phone, 2 on a very narrow
-     one, 4 on a wide screen. Each is a button, so the whole tile is a 44px+ target for opening it -
-     and there is nothing on the tile that deletes it (that is in the photo viewer). */
+  /* ---------- Photos in the text ---------- */
   .rich-body { --photo-cols: 3; --photo-gap: 8px; }
   @media (max-width: 359px) { .rich-body { --photo-cols: 2; } }
   @media (min-width: 720px) { .rich-body { --photo-cols: 4; } }
 
-  ks-photo {
-    /* Floated, like a picture in a newspaper: the text that comes after a grid flows into any empty
-       cells at the end of its last row and then spreads out underneath. (A float is the one case where
-       float beats grid - grid cannot let text run around it.) */
+  ks-photo,
+  ks-video {
     display: block;
     float: left;
-    /* n tiles and n gaps per row; the 1px keeps rounding from ever pushing the last tile onto a new row */
     width: calc((100% - var(--photo-cols) * var(--photo-gap) - 1px) / var(--photo-cols));
     margin: 0 var(--photo-gap) var(--photo-gap) 0;
     -webkit-user-select: none; user-select: none;
   }
-  /* Each batch of photos starts a fresh grid below the one before it, never in its gap. */
-  ks-photo:first-child { clear: both; }
-  /* A blank line has no text to make it wait for room, so beside a grid it would squeeze into the 1px
-     sliver at the right of the first row and the cursor would sit there. Giving it a minimum width
-     (which a plain block must have beside a float) puts it where the text will go: in the empty cells
-     of the last row, or under a full grid. It stops matching the moment a letter is typed. */
+  ks-photo:first-child,
+  ks-video:first-child { clear: both; }
   .rich-body > :is(div, p):has(> br:only-child) { display: flow-root; min-width: 5rem; }
 
   .photo-tile {
@@ -1000,11 +994,12 @@
   .photo-size {
     position: absolute;
     left: 4px; bottom: 4px;
-    background: rgba(20,20,16,0.7);
+    background: rgba(20,20,16,0.75);
     color: #fff;
     font-size: 0.6875rem;
     line-height: 1;
     font-weight: 600;
+    font-variant-numeric: tabular-nums;
     padding: 3px 6px;
     border-radius: 5px;
     pointer-events: none;
@@ -1064,7 +1059,6 @@
 
   .lightbox-prev { left: 10px; }
   .lightbox-next { right: 10px; }
-  /* button:active sets its own transform, which wiped translateY(-50%) and made the arrows jump down while pressed. */
   .lightbox-nav:active { transform: translateY(-50%) scale(0.94); }
 
   .lightbox-caption {
@@ -1074,13 +1068,15 @@
     text-align: center;
     color: rgba(255,255,255,0.85);
     font-size: 0.8125rem;
+    font-variant-numeric: tabular-nums;
   }
 
-  .icon-btn:disabled { opacity: 0.4; cursor: default; }
-  .btn-ghost:disabled { opacity: 0.55; cursor: default; }
+  .icon-btn:disabled { opacity: 0.4; cursor: not-allowed; pointer-events: none; }
+  .btn-ghost:disabled { opacity: 0.55; cursor: not-allowed; pointer-events: none; }
 
   .btn-row {
     display: flex;
+    flex-wrap: wrap;
     gap: 10px;
     align-items: center;
   }
@@ -1088,7 +1084,7 @@
   .btn {
     min-height: 44px;
     padding: 10px 16px;
-    border-radius: 10px;
+    border-radius: var(--radius-sm);
     font-size: 0.875rem;
     font-weight: 600;
   }
@@ -1096,7 +1092,7 @@
   .btn-primary { background: var(--pine); color: var(--card); }
   .btn-primary:hover { background: var(--pine-light); }
   .btn-primary:active:not(:disabled) { background: #1A362F; transform: scale(0.97); }
-  .btn-primary:disabled { opacity: 0.55; cursor: default; }
+  .btn-primary:disabled { opacity: 0.55; cursor: not-allowed; pointer-events: none; }
 
   .btn-ghost { background: var(--card-2); color: var(--ink); }
   .btn-ghost:hover { background: var(--line); }
@@ -1122,18 +1118,17 @@
     display: flex;
     flex-direction: column;
     align-items: flex-start;
-    justify-content: flex-start; /* a <button> centres its content vertically by default, which staggered the two titles */
+    justify-content: flex-start;
     border: 1.5px solid var(--line-strong);
     border-radius: 12px;
     padding: 14px;
     text-align: left;
-    transition: border-color 0.12s ease, background-color 0.12s ease, transform 0.08s ease;
+    transition: border-color 0.12s ease-out, background-color 0.12s ease-out, transform 0.08s ease-out;
   }
 
   .lock-choice:hover { border-color: var(--pine-light); }
   .lock-choice:active { transform: scale(0.98); }
   .lock-choice.selected { border-color: var(--pine); background: var(--card-2); }
-  /* A check mark too, so "selected" is not carried by colour alone. */
   .lock-choice.selected::after {
     content: "\2713";
     position: absolute;
@@ -1192,7 +1187,7 @@
     z-index: var(--z-toast);
     opacity: 0;
     pointer-events: none;
-    transition: opacity 0.2s ease, transform 0.2s ease;
+    transition: opacity 0.2s ease-out, transform 0.2s ease-out;
   }
 
   .toast.show {
@@ -1201,8 +1196,6 @@
   }
 
   @media (max-width: 560px) {
-    /* Two tidy rows: brand + settings on top, the tabs full-width below. (They used to wrap
-       with the settings gear stranded alone on its own line.) */
     .top-inner { flex-wrap: wrap; row-gap: 8px; }
     .brand { order: 1; flex: 1 1 0; min-width: 0; }
     #btn-settings { order: 2; }
@@ -1211,28 +1204,19 @@
     .grid { column-width: 100%; }
   }
 
-  @media (forced-colors: active) {
-    .swatch::before { forced-color-adjust: none; } /* otherwise every ink colour collapses to one */
-    .lock-choice.selected, .tool-btn[aria-pressed="true"] { outline: 2px solid Highlight; }
-  }
-
-
   /* =====================================================================
-     v1.5 — size meter, storage, audio clips
+     v1.5+ — size meter, storage, audio clips, videos & packet uploads
      ===================================================================== */
 
-  [hidden] { display: none !important; } /* so a class's display: never wins over the hidden attribute */
+  [hidden] { display: none !important; }
 
-  /* Explanatory text anywhere in a dialog. (.field .hint, further up, is more specific and still wins inside form fields.) */
-  .hint { margin: 4px 0 0; font-size: 0.8125rem; line-height: 1.5; color: var(--ink-soft); }
+  .hint { margin: 4px 0 0; font-size: 0.8125rem; line-height: 1.5; color: var(--ink-soft); text-wrap: pretty; }
 
   :root {
     --ok: #21423A;       --ok-bg: #E4EEE9;
     --danger: #8F2D2D;   --danger-bg: #F7E3E3;
   }
 
-  /* One set of level colours reused by the chip, badges, meters and notices.
-     Each level also has its own icon shape and a word — never colour alone. */
   [data-zone] { --zone-fg: var(--ok);     --zone-bg: var(--ok-bg);     --zone-edge: #9FBBB0; --zone-bar: var(--ok); --zone-track: rgba(35,36,31,0.14); }
   [data-zone="heavy"]  { --zone-fg: var(--amber);  --zone-bg: var(--amber-bg);  --zone-edge: #C9A66B; --zone-bar: var(--amber); }
   [data-zone="danger"] { --zone-fg: var(--danger); --zone-bg: var(--danger-bg); --zone-edge: #D09A9A; --zone-bar: var(--danger); }
@@ -1259,7 +1243,7 @@
   .size-icon, .storage-pill-icon, .size-advice-icon, .size-legend [data-zone-icon] { display: inline-flex; flex: none; width: 18px; height: 18px; }
   .size-icon svg, .storage-pill-icon svg, .size-advice-icon svg, .size-legend [data-zone-icon] svg { width: 100%; height: 100%; }
   .size-track { position: absolute; inset: auto 0 0 0; height: 3px; background: var(--zone-track); }
-  .size-fill { display: block; width: 100%; height: 100%; background: currentColor; transform-origin: left; transform: scaleX(0); transition: transform 0.25s ease; }
+  .size-fill { display: block; width: 100%; height: 100%; background: currentColor; transform-origin: left; transform: scaleX(0); transition: transform 0.25s ease-out; }
 
   .storage-pill {
     position: relative;
@@ -1273,13 +1257,13 @@
     color: var(--zone-fg);
     font-size: 0.75rem;
     font-weight: 600;
+    font-variant-numeric: tabular-nums;
   }
-  .storage-pill::after { content: ""; position: absolute; inset: -11px -4px; } /* a 44px tap area around a small pill */
+  .storage-pill::after { content: ""; position: absolute; inset: -11px -4px; }
   .storage-pill-icon { width: 14px; height: 14px; }
 
-  /* Progress bar with notches at the warning levels */
   .meter { position: relative; height: 12px; margin: 12px 0; border-radius: 999px; background: var(--line); border: 1px solid var(--line-strong); overflow: hidden; }
-  .meter-fill { display: block; width: 100%; height: 100%; background: var(--zone-bar); transform-origin: left; transform: scaleX(0); transition: transform 0.3s ease; }
+  .meter-fill { display: block; width: 100%; height: 100%; background: var(--zone-bar); transform-origin: left; transform: scaleX(0); transition: transform 0.3s ease-out; }
   .meter-tick { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--card); }
 
   .size-badge {
@@ -1311,6 +1295,56 @@
   .size-legend [data-zone-icon] { color: var(--zone-fg); background: none; }
   .size-legend li[data-zone="over"] [data-zone-icon] { color: var(--danger); }
 
+  /* ---------- Quality Selection Modal & Compressed Size Preview ---------- */
+  .quality-size-banner {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 0 0 12px;
+    padding: 12px 14px;
+    border-radius: var(--radius-sm);
+    background: var(--ok-bg);
+    border: 1px solid #9FBBB0;
+    color: var(--ok);
+    font-size: 0.8125rem;
+    line-height: 1.45;
+    font-variant-numeric: tabular-nums;
+  }
+  .quality-size-banner-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 6px 12px;
+  }
+  .quality-size-banner-title {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-weight: 700;
+    font-size: 0.8438rem;
+  }
+  .quality-size-banner-title svg { width: 16px; height: 16px; flex: none; }
+  .quality-size-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 9px;
+    border-radius: var(--radius-full);
+    background: var(--pine);
+    color: var(--card);
+    font-weight: 600;
+    font-size: 0.75rem;
+  }
+  .quality-packet-note {
+    font-size: 0.75rem;
+    color: var(--ink-soft);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .quality-packet-note svg { width: 14px; height: 14px; flex: none; color: var(--pine); }
+
   .quality-options { display: flex; flex-direction: column; gap: 10px; }
   .quality-opt {
     position: relative;
@@ -1320,11 +1354,10 @@
     border: 1.5px solid var(--line-strong); border-radius: 12px;
     background: var(--card); color: var(--ink);
   }
-  .quality-opt .q-title { font-weight: 600; font-size: 0.9375rem; }
-  .quality-opt .q-hint { font-size: 0.8125rem; line-height: 1.45; font-weight: 400; color: var(--ink-soft); }
+  .quality-opt .q-title { font-weight: 600; font-size: 0.9375rem; font-variant-numeric: tabular-nums; }
+  .quality-opt .q-hint { font-size: 0.8125rem; line-height: 1.45; font-weight: 400; color: var(--ink-soft); font-variant-numeric: tabular-nums; }
   .quality-opt:hover { border-color: var(--pine-light); }
   .quality-opt[aria-checked="true"] { border-color: var(--pine); background: var(--card-2); box-shadow: 0 0 0 1px var(--pine) inset; }
-  /* A round radio mark that fills when chosen: a shape change, not just colour. */
   .quality-opt::after {
     content: ""; position: absolute; inset-block-start: 14px; inset-inline-end: 16px;
     width: 22px; height: 22px; border-radius: 50%;
@@ -1335,27 +1368,40 @@
   .quality-actions .btn { flex: 1; }
   .confirm-message { margin: 0; color: var(--ink-soft); font-size: 0.9063rem; line-height: 1.5; }
   .confirm-actions { margin-top: 16px; }
-  .quality-files { list-style: none; margin: 0 0 14px; padding: 8px 10px; max-height: 150px; overflow-y: auto; background: var(--paper); border-radius: 10px; font-size: 0.8125rem; }
-  .quality-files li { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; }
-  .quality-files .qf-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
-  .quality-files .qf-size { flex: none; color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+  .quality-files { list-style: none; margin: 0 0 14px; padding: 8px 10px; max-height: 165px; overflow-y: auto; background: var(--paper); border-radius: 10px; font-size: 0.8125rem; }
+  .quality-files li { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 4px 0; border-bottom: 1px solid rgba(140,138,126,0.2); }
+  .quality-files li:last-child { border-bottom: none; }
+  .quality-files .qf-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; font-weight: 500; }
+  .quality-files .qf-size { flex: none; color: var(--ink-soft); font-variant-numeric: tabular-nums; display: inline-flex; align-items: center; gap: 6px; }
+  .quality-files .qf-comp-tag {
+    display: inline-flex;
+    align-items: center;
+    padding: 1px 7px;
+    border-radius: var(--radius-full);
+    background: var(--ok-bg);
+    border: 1px solid #9FBBB0;
+    color: var(--ok);
+    font-weight: 600;
+    font-size: 0.75rem;
+  }
   .quality-files .qf-more { color: var(--ink-soft); justify-content: center; }
+
   .lightbox-compress {
     position: absolute; left: 50%; transform: translateX(-50%);
     bottom: calc(max(18px, env(safe-area-inset-bottom)) + 30px);
     min-height: 44px; padding: 8px 18px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.45);
-    background: rgba(0,0,0,0.45); color: #fff; font: inherit; font-size: 0.875rem; cursor: pointer;
+    background: rgba(0,0,0,0.55); color: #fff; font: inherit; font-size: 0.875rem; font-weight: 600; cursor: pointer;
   }
+  .lightbox-compress:active { transform: translateX(-50%) scale(0.96); }
   .lightbox :focus-visible { outline-color: #fff; }
-  /* Removing is deliberate: it lives only here, top-left (the far corner from Close), and still asks first. */
   .lightbox-remove {
     position: absolute;
     top: max(14px, env(safe-area-inset-top)); left: 14px;
     display: inline-flex; align-items: center; gap: 8px;
     min-height: 44px; padding: 8px 16px 8px 12px;
     border-radius: 999px; border: 1px solid rgba(255,255,255,0.45);
-    background: rgba(143,45,45,0.85); color: #fff;
-    font: inherit; font-size: 0.875rem; cursor: pointer;
+    background: rgba(143,45,45,0.88); color: #fff;
+    font: inherit; font-size: 0.875rem; font-weight: 600; cursor: pointer;
   }
   .lightbox-remove svg { width: 18px; height: 18px; flex: none; }
   .lightbox-remove:active { background: rgba(143,45,45,1); }
@@ -1368,8 +1414,9 @@
   .storage-card .hint { margin: 0 0 10px; }
   .storage-top-label { margin: 6px 0 4px; font-size: 0.8125rem; color: var(--ink-soft); font-weight: 600; }
   .storage-top { list-style: none; margin: 0; padding: 0; font-size: 0.875rem; }
-  .storage-top li { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
-  .storage-top-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .storage-top li { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 6px 0; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+  .storage-top-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .storage-top-size { flex: none; font-weight: 600; color: var(--ink); }
 
   .field select { appearance: auto; }
 
@@ -1387,7 +1434,7 @@
     border: 1px solid var(--line-strong);
     border-radius: 999px;
     overflow: hidden;
-    background: linear-gradient(90deg, rgba(33,66,58,0.18) calc(var(--p) * 100%), var(--card-2) calc(var(--p) * 100%)); /* fills as it plays */
+    background: linear-gradient(90deg, rgba(33,66,58,0.18) calc(var(--p) * 100%), var(--card-2) calc(var(--p) * 100%));
     color: var(--pine);
     font-family: var(--font-body);
     font-size: 0.8125rem;
@@ -1402,6 +1449,579 @@
   .audio-more { --icon: var(--i-more); }
   .audio-time { padding: 0 2px; }
   .audio-chip.is-missing { padding: 0 16px; color: var(--brick); }
+
+  /* =====================================================================
+     Compact Video Tile in Note (same size as .photo-tile) &
+     Full Video Player + Settings + Packet Studio Modal (css-pro-max)
+     ===================================================================== */
+
+  .video-tile {
+    position: relative;
+    display: block;
+    width: 100%;
+    aspect-ratio: 1;
+    padding: 0;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    background: var(--video-surface);
+    color: var(--video-text);
+    cursor: pointer;
+    contain: layout paint;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  .video-tile img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    -webkit-user-drag: none;
+    transition: transform 0.18s ease-out, opacity 0.15s ease-out;
+  }
+
+  .video-tile:hover img { transform: scale(1.03); }
+  .video-tile:active img { opacity: 0.84; }
+
+  .video-tile.is-missing {
+    display: grid;
+    place-items: center;
+    padding: 8px;
+    background: var(--card-2);
+    color: var(--brick);
+    font-size: 0.75rem;
+    text-align: center;
+    cursor: default;
+  }
+
+  .video-tile-scrim {
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(circle at 50% 50%, rgba(12,15,13,0.12) 0%, rgba(12,15,13,0.52) 100%);
+    pointer-events: none;
+  }
+
+  /* Center play badge so a video tile is immediately distinguishable from a photo tile */
+  .video-tile-play {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 38px;
+    height: 38px;
+    border-radius: 50%;
+    background: rgba(18, 21, 18, 0.78);
+    border: 1.5px solid rgba(255, 255, 255, 0.55);
+    color: #fff;
+    display: grid;
+    place-items: center;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+    pointer-events: none;
+    transition: transform 0.15s ease-out, background-color 0.15s ease-out;
+  }
+  .video-tile:hover .video-tile-play {
+    background: var(--pine);
+    border-color: var(--video-accent);
+    transform: translate(-50%, -50%) scale(1.08);
+  }
+  .video-tile-play svg { width: 18px; height: 18px; margin-inline-start: 2px; }
+
+  /* Top-right duration & quality badge on the tile */
+  .video-tile-dur {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    background: rgba(18, 21, 18, 0.78);
+    color: #fff;
+    font-size: 0.6875rem;
+    line-height: 1;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    padding: 3px 6px;
+    border-radius: 5px;
+    pointer-events: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+  }
+  .video-tile-dur.is-compressed {
+    color: var(--video-accent);
+  }
+
+  /* Bottom-left size & packet badge matching .photo-size */
+  .video-tile-size {
+    position: absolute;
+    left: 4px;
+    bottom: 6px;
+    right: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 4px;
+    pointer-events: none;
+  }
+
+  .video-tile-size-pill,
+  .video-tile-pkt-pill {
+    background: rgba(18, 21, 18, 0.78);
+    color: #fff;
+    font-size: 0.6875rem;
+    line-height: 1;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    padding: 3px 6px;
+    border-radius: 5px;
+    white-space: nowrap;
+  }
+
+  .video-tile-pkt-pill[data-state="synced"] { color: var(--video-accent); }
+  .video-tile-pkt-pill[data-state="uploading"] { color: #F5C469; }
+  .video-tile-pkt-pill[data-state="lost"] { color: #F28B82; }
+
+  /* Thin 3px segmented packet strip along the bottom edge of the tile */
+  .video-tile-strip {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 3px;
+    display: flex;
+    gap: 1px;
+    background: rgba(0, 0, 0, 0.45);
+    pointer-events: none;
+  }
+  .video-tile-seg {
+    flex: 1;
+    height: 100%;
+    background: rgba(255, 255, 255, 0.25);
+  }
+  .video-tile-seg[data-state="synced"] { background: var(--video-accent); }
+  .video-tile-seg[data-state="uploading"] { background: #F5C469; }
+  .video-tile-seg[data-state="lost"] { background: #F28B82; }
+
+  /* ---------- Full Video Studio Modal (#overlay-video) opened when clicking a video tile ---------- */
+  .video-theater {
+    position: fixed;
+    inset: 0;
+    height: 100dvh;
+    z-index: var(--z-lightbox);
+    background: rgba(12, 15, 13, 0.96);
+    color: var(--video-text);
+    display: flex;
+    flex-direction: column;
+    padding: max(12px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+  .video-theater.hidden { display: none; }
+  .video-theater :focus-visible { outline: 2px solid var(--video-accent); outline-offset: 2px; }
+
+  .vt-topbar {
+    width: 100%;
+    max-width: 960px;
+    margin: 0 auto 10px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+    flex-wrap: wrap;
+    flex-shrink: 0;
+  }
+
+  .vt-top-center {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex-wrap: wrap;
+  }
+
+  .vt-nav-btn {
+    min-width: 44px;
+    min-height: 44px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.12);
+    border: 1px solid var(--video-border);
+    color: var(--video-text);
+    display: grid;
+    place-items: center;
+  }
+  .vt-nav-btn:hover { background: rgba(255, 255, 255, 0.2); border-color: var(--video-accent); }
+  .vt-nav-btn svg { width: 18px; height: 18px; }
+
+  .vt-meta-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 14px;
+    border-radius: var(--radius-full);
+    background: var(--video-glass);
+    border: 1px solid var(--video-border);
+    font-size: 0.8125rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--video-text-soft);
+  }
+
+  .vt-studio-body {
+    width: 100%;
+    max-width: 960px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding-bottom: 8px;
+  }
+
+  .vt-player-card {
+    background: var(--video-surface-2);
+    border: 1px solid var(--video-border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    box-shadow: var(--shadow-video);
+  }
+
+  .vt-stage {
+    position: relative;
+    width: 100%;
+    max-height: 35dvh;
+    aspect-ratio: var(--video-aspect, 16 / 9);
+    background: #090B09;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    overflow: hidden;
+  }
+
+  .vt-video {
+    width: 100%;
+    height: 100%;
+    max-height: 35dvh;
+    object-fit: contain;
+    background: transparent;
+  }
+
+  .vt-hero-play {
+    position: absolute;
+    z-index: 2;
+    width: 60px;
+    height: 60px;
+    border-radius: 50%;
+    background: var(--video-glass-strong);
+    border: 1.5px solid rgba(255, 255, 255, 0.4);
+    color: var(--video-text);
+    display: grid;
+    place-items: center;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    transition: transform 0.16s ease-out, opacity 0.16s ease-out;
+  }
+  .vt-hero-play svg { width: 26px; height: 26px; margin-inline-start: 2px; }
+  .vt-hero-play:hover { background: var(--pine); border-color: var(--video-accent); transform: scale(1.06); }
+  .vt-stage.is-playing .vt-hero-play { opacity: 0; pointer-events: none; transform: scale(0.88); }
+
+  .vt-controls {
+    padding: 8px 14px 10px;
+    background: var(--video-surface-2);
+    border-top: 1px solid var(--video-border);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .vc-seek-wrap {
+    position: relative;
+    display: flex;
+    align-items: center;
+    height: 32px;
+    padding-block: 4px;
+  }
+
+  .vc-track-visual {
+    position: absolute;
+    inset-inline: 0;
+    height: 6px;
+    border-radius: var(--radius-full);
+    background: var(--video-track);
+    overflow: hidden;
+    pointer-events: none;
+  }
+
+  .vc-buffer-fill,
+  .vc-progress-fill {
+    position: absolute;
+    inset: 0;
+    transform-origin: left;
+    border-radius: var(--radius-full);
+  }
+
+  .vc-buffer-fill {
+    background: var(--video-buffer);
+    transform: scaleX(var(--buf, 0));
+    transition: transform 0.2s ease-out;
+  }
+
+  .vc-progress-fill {
+    background: var(--video-accent);
+    transform: scaleX(var(--p, 0));
+    transition: transform 0.08s ease-out;
+  }
+
+  .vc-seek-input {
+    position: relative;
+    z-index: 1;
+    width: 100%;
+    height: 36px;
+    margin: 0;
+    background: transparent;
+    cursor: pointer;
+    -webkit-appearance: none;
+    appearance: none;
+  }
+  .vc-seek-input::-webkit-slider-runnable-track { height: 6px; background: transparent; }
+  .vc-seek-input::-moz-range-track { height: 6px; background: transparent; }
+  .vc-seek-input::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 18px;
+    height: 18px;
+    margin-top: -6px;
+    border-radius: 50%;
+    background: var(--video-text);
+    border: 2px solid var(--pine);
+    box-shadow: 0 1px 4px rgba(0,0,0,0.45);
+    transition: transform 0.12s ease-out;
+  }
+  .vc-seek-input:hover::-webkit-slider-thumb,
+  .vc-seek-input:focus-visible::-webkit-slider-thumb {
+    transform: scale(1.2);
+    background: var(--video-accent);
+  }
+  .vc-seek-input::-moz-range-thumb {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--video-text);
+    border: 2px solid var(--pine);
+    box-shadow: 0 1px 4px rgba(0,0,0,0.45);
+  }
+
+  .vc-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+    flex-wrap: wrap;
+  }
+
+  .vc-left,
+  .vc-right {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex-wrap: wrap;
+  }
+
+  .vc-btn {
+    min-width: 44px;
+    min-height: 44px;
+    border-radius: var(--radius-sm);
+    color: var(--video-text);
+    display: inline-grid;
+    place-items: center;
+    padding: 0 10px;
+    font-size: 0.8125rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+  .vc-btn svg { width: 20px; height: 20px; }
+  .vc-btn:hover { background: rgba(255, 255, 255, 0.12); color: var(--video-accent); }
+  .vc-btn:active { background: rgba(255, 255, 255, 0.2); transform: scale(0.94); }
+  .vc-btn[aria-pressed="true"] { color: var(--video-accent); }
+
+  .vc-speed {
+    border: 1px solid var(--video-border);
+    background: rgba(255, 255, 255, 0.08);
+  }
+
+  .vc-time {
+    font-size: 0.8125rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--video-text-soft);
+    white-space: nowrap;
+    padding-inline: 4px;
+  }
+  .vc-time-cur { color: var(--video-text); }
+
+  /* ---------- Integrated Video Settings, Functions & Cloud Packets Grid inside #overlay-video ---------- */
+  .vt-panels-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 14px;
+  }
+  @media (min-width: 720px) {
+    .vt-panels-grid { grid-template-columns: 1fr 1fr; }
+  }
+
+  .vt-panel {
+    background: var(--card);
+    color: var(--ink);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius);
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    box-shadow: var(--shadow-lg);
+  }
+  .vt-panel :focus-visible { outline: 2px solid var(--pine-light); outline-offset: 2px; }
+
+  .vt-panel-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .vt-panel-title {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 1rem;
+    color: var(--ink);
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    margin: 0;
+  }
+  .vt-panel-title svg { width: 18px; height: 18px; color: var(--pine); flex: none; }
+
+  .packet-summary-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 10px;
+    border-radius: var(--radius-full);
+    font-size: 0.75rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    background: var(--ok-bg);
+    color: var(--ok);
+    border: 1px solid #9FBBB0;
+  }
+  .packet-summary-badge[data-state="pending"] {
+    background: var(--amber-bg);
+    color: var(--amber);
+    border-color: #C9A66B;
+  }
+  .packet-summary-badge[data-state="lost"] {
+    background: var(--danger-bg);
+    color: var(--danger);
+    border-color: #D09A9A;
+  }
+
+  .bg-verify-banner {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border-radius: var(--radius-xs);
+    background: var(--card-2);
+    border: 1px solid var(--line);
+    font-size: 0.7812rem;
+    color: var(--ink-soft);
+    line-height: 1.4;
+  }
+  .bg-verify-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--ok);
+    flex: none;
+  }
+  .bg-verify-banner[data-active="true"] .bg-verify-dot {
+    background: var(--amber);
+    animation: rec-pulse 1s ease-in-out infinite;
+  }
+
+  .packet-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    max-height: 108px;
+    overflow-y: auto;
+    display: grid;
+    gap: 5px;
+  }
+
+  .packet-item {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto auto;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 10px;
+    border-radius: var(--radius-xs);
+    background: var(--card-2);
+    border: 1px solid var(--line);
+    font-size: 0.7812rem;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .packet-num { font-weight: 700; color: var(--pine); }
+
+  .packet-tag {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.72rem;
+    color: var(--ink-soft);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .packet-size { color: var(--ink-soft); font-weight: 500; }
+
+  .packet-status {
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+  }
+  .packet-status[data-state="synced"] { color: var(--ok); }
+  .packet-status[data-state="pending"] { color: var(--amber); }
+  .packet-status[data-state="lost"] { color: var(--danger); }
+
+  .video-compress-box {
+    margin: 0;
+    padding: 10px 12px;
+    border-radius: var(--radius-sm);
+    background: var(--ok-bg);
+    border: 1px solid #9FBBB0;
+    color: var(--ok);
+    font-size: 0.8125rem;
+    line-height: 1.45;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .vt-setting-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  .vt-setting-row label {
+    font-size: 0.8125rem;
+    font-weight: 600;
+    color: var(--ink-soft);
+  }
+  .vt-setting-row select {
+    min-height: 44px;
+    padding: 6px 12px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--line-strong);
+    background: var(--card-2);
+    color: var(--ink);
+    font-size: 0.875rem;
+    font-weight: 500;
+  }
 
   /* ---------- Add-audio dialog ---------- */
   .rec-panel { display: flex; flex-direction: column; gap: 12px; }
@@ -1419,8 +2039,6 @@
   .rec-projection:empty { display: none; }
   .rec-projection svg { width: 18px; height: 18px; flex: none; }
   .rec-result { margin: 0; font-weight: 600; font-variant-numeric: tabular-nums; }
-  /* Our own player instead of the browser's: it draws the position from the clip's real length,
-     so it is right even for a recording the browser says has no length. */
   .mini-player {
     --i-play:  url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M8 5v14l11-7z'/%3E%3C/svg%3E");
     --i-pause: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M7 5h4v14H7zM13 5h4v14h-4z'/%3E%3C/svg%3E");
@@ -1451,8 +2069,18 @@
     .editor-toolbar { flex-wrap: wrap; }
   }
 
+  @media (forced-colors: active) {
+    .swatch::before { forced-color-adjust: none; }
+    .lock-choice.selected, .tool-btn[aria-pressed="true"], .vc-btn[aria-pressed="true"], .quality-opt[aria-checked="true"] { outline: 2px solid Highlight; }
+    .video-card, .packet-item, .video-badge, .video-packet-pill { border: 1px solid CanvasText; }
+  }
+
   @media (prefers-reduced-motion: reduce) {
-    * { transition: none !important; animation: none !important; }
+    *, *::before, *::after {
+      transition-duration: 0.01ms !important;
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+    }
   }
 </style>
 </head>
@@ -1462,7 +2090,7 @@
   <div class="top-inner">
     <div class="brand">
       <span class="brand-mark">Keepsake</span>
-      <span class="version-badge" id="version-badge">v1.9.1</span>
+      <span class="version-badge" id="version-badge">v1.10.1</span>
       <span class="sync-status hidden" id="sync-status" role="status" aria-live="polite"></span>
       <button class="storage-pill" id="storage-pill" type="button" data-zone="heavy" hidden>
         <span class="storage-pill-icon" id="storage-pill-icon" aria-hidden="true"></span>
@@ -1478,11 +2106,6 @@
     </button>
   </div>
 
-  <!-- Status strip for background save / autosave / photo-processing
-       progress — fixed in this one spot on the front page (see the
-       .sync-bar rule) instead of sliding down over everything on every
-       tick. Being part of the header means the full-screen editor
-       automatically covers it while you're writing. -->
   <div class="sync-bar" id="sync-bar" role="status" aria-live="polite">
     <div class="sync-bar-body">
       <div class="sync-bar-inner">
@@ -1491,7 +2114,7 @@
         <div class="sync-bar-track" id="sync-bar-track"><div class="sync-bar-fill" id="sync-bar-fill"></div></div>
         <button class="sync-bar-retry hidden" id="sync-bar-retry">Retry</button>
       </div>
-      <!-- One row per kind of thing being sent (photos, audio, note text), each with its own bar. -->
+      <!-- One row per kind of thing being sent (photos, videos & packets, audio, note text), each with its own bar. -->
       <div class="sync-steps" id="sync-steps" hidden></div>
     </div>
   </div>
@@ -1593,6 +2216,10 @@
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8.5" cy="10" r="1.5"/><path d="M21 15l-5-5-4 4-3-3-6 6"/></svg>
     </button>
     <input type="file" id="input-image" accept="image/*" multiple class="visually-hidden">
+    <button class="icon-btn" id="btn-attach-video" title="Add video" aria-label="Add video" aria-haspopup="dialog">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="5" width="14" height="14" rx="2.5"/><path d="M16.5 10.2 21.5 7v10l-5-3.2v-3.6z"/></svg>
+    </button>
+    <input type="file" id="input-video" accept="video/*,.mp4,.mov,.webm,.m4v,.mkv,.ogv,.3gp" multiple class="visually-hidden" tabindex="-1">
     <button class="icon-btn" id="btn-add-audio" title="Add audio" aria-label="Add audio" aria-haspopup="dialog">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
     </button>
@@ -1636,6 +2263,109 @@
   <div class="lightbox-caption" id="lightbox-caption"></div>
 </div>
 
+<!-- Unified Video Player, Settings, Compression & Cloud Packet Studio: opened when clicking a video tile -->
+<div class="video-theater hidden" id="overlay-video" role="dialog" aria-modal="true" aria-label="Video player and settings">
+  <div class="vt-topbar">
+    <button class="lightbox-remove" id="btn-theater-remove" type="button" style="position:static;">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M4 7h16M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2m1 0-.8 12.2a2 2 0 0 1-2 1.8H8.8a2 2 0 0 1-2-1.8L6 7"/></svg>
+      Remove video
+    </button>
+    <div class="vt-top-center">
+      <button class="vt-nav-btn" id="btn-video-prev" type="button" aria-label="Previous video" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 6l-6 6 6 6"/></svg>
+      </button>
+      <div class="vt-meta-pill" id="theater-meta-pill">Video</div>
+      <button class="vt-nav-btn" id="btn-video-next" type="button" aria-label="Next video" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 6l6 6-6 6"/></svg>
+      </button>
+    </div>
+    <button class="lightbox-close" id="btn-theater-close" type="button" aria-label="Close video player" style="position:static;">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6l12 12M18 6L6 18"/></svg>
+    </button>
+  </div>
+
+  <div class="vt-studio-body">
+    <!-- Video Player & Custom Transport Bar -->
+    <div class="vt-player-card">
+      <div class="vt-stage" id="theater-stage">
+        <video class="vt-video" id="theater-video" playsinline preload="metadata"></video>
+        <button type="button" class="vt-hero-play" id="btn-theater-hero-play" aria-label="Play video">
+          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.5v13l11-6.5z"/></svg>
+        </button>
+      </div>
+      <div class="vt-controls">
+        <div class="vc-seek-wrap">
+          <div class="vc-track-visual" aria-hidden="true">
+            <div class="vc-buffer-fill" id="theater-buffer-fill"></div>
+            <div class="vc-progress-fill" id="theater-progress-fill"></div>
+          </div>
+          <input type="range" class="vc-seek-input" id="theater-seek" min="0" max="1000" step="1" value="0" aria-label="Video playback position">
+        </div>
+        <div class="vc-bar">
+          <div class="vc-left">
+            <button type="button" class="vc-btn" id="btn-theater-play" aria-label="Play"></button>
+            <button type="button" class="vc-btn" id="btn-theater-back10" aria-label="Rewind 10 seconds" title="Rewind 10s">-10s</button>
+            <button type="button" class="vc-btn" id="btn-theater-fwd10" aria-label="Forward 10 seconds" title="Forward 10s">+10s</button>
+            <span class="vc-time"><span class="vc-time-cur" id="theater-pos">0:00</span> / <span id="theater-dur">0:00</span></span>
+          </div>
+          <div class="vc-right">
+            <button type="button" class="vc-btn" id="btn-theater-mute" aria-label="Mute" aria-pressed="false"></button>
+            <button type="button" class="vc-btn vc-speed" id="btn-theater-speed" aria-label="Playback speed">1×</button>
+            <button type="button" class="vc-btn" id="btn-theater-fullscreen" aria-label="Fullscreen" title="Fullscreen">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- All Video Functions, Quality/Compression Settings, and Cloud Packet Options -->
+    <div class="vt-panels-grid">
+      <!-- Panel 1: Quality, Compression Settings & File Options -->
+      <section class="vt-panel" aria-labelledby="video-info-heading">
+        <div class="vt-panel-head">
+          <h3 class="vt-panel-title" id="video-info-heading">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="5" width="14" height="14" rx="2.5"/><path d="M16.5 10.2 21.5 7v10l-5-3.2v-3.6z"/></svg>
+            <span>Quality &amp; options</span>
+          </h3>
+          <span class="packet-summary-badge" id="video-info-mode-badge" data-state="synced">Original</span>
+        </div>
+        <p class="hint clip-meta" id="video-info-meta"></p>
+        <div class="video-compress-box" id="video-info-compress-box"></div>
+        <div class="vt-setting-row">
+          <label for="video-modal-quality">Compression preset</label>
+          <select id="video-modal-quality">
+            <option value="standard">Standard (720p · 1.2 Mbps)</option>
+            <option value="high">High (1080p · 2.5 Mbps)</option>
+          </select>
+        </div>
+        <div class="btn-row" style="margin-top: auto; padding-top: 4px;">
+          <button class="btn btn-primary" id="btn-video-download" type="button">Download</button>
+          <button class="btn btn-ghost" id="btn-video-compress" type="button">Compress</button>
+          <button class="btn btn-danger" id="btn-video-delete" type="button">Delete</button>
+        </div>
+      </section>
+
+      <!-- Panel 2: Sliced Cloud Packets (Automatic Background Verify + Manual Option) -->
+      <section class="vt-panel" id="video-packet-inspector" aria-labelledby="video-packets-heading">
+        <div class="vt-panel-head">
+          <h3 class="vt-panel-title" id="video-packets-heading">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
+            <span>Sliced cloud packets</span>
+          </h3>
+          <span class="packet-summary-badge" id="video-packet-badge" data-state="synced"></span>
+        </div>
+        <div class="bg-verify-banner" id="video-bg-verify-banner" data-active="false">
+          <span class="bg-verify-dot" aria-hidden="true"></span>
+          <span id="video-bg-verify-text">Background auto-verify active: checks &amp; re-uploads any lost packets automatically.</span>
+        </div>
+        <ul class="packet-list" id="video-packet-list" aria-label="Video upload packets"></ul>
+        <button class="btn btn-ghost btn-block" id="btn-video-verify-packets" type="button" style="margin-top: auto;">Verify &amp; re-upload lost packets now</button>
+      </section>
+    </div>
+  </div>
+</div>
+
 <!-- Lock chooser modal -->
 <div class="overlay hidden" id="overlay-lock-chooser">
   <div class="modal narrow" role="dialog" aria-modal="true" aria-labelledby="lock-chooser-heading">
@@ -1657,7 +2387,7 @@
         </button>
       </div>
 
-      <p class="modal-note">The note's title stays visible on its card so you can tell locked notes apart. Everything inside — text, photos and drawing — is encrypted.</p>
+      <p class="modal-note">The note's title stays visible on its card so you can tell locked notes apart. Everything inside — text, photos, videos and drawing — is encrypted.</p>
 
       <div id="quick-lock-fields" style="display:none;">
         <div class="field">
@@ -1808,7 +2538,7 @@
         <li data-zone="danger"><span data-zone-icon="danger" aria-hidden="true"></span><span><b>100–150 MB</b> — close to the limit.</span></li>
         <li data-zone="over"><span data-zone-icon="over" aria-hidden="true"></span><span><b>Over 150 MB</b> — can’t be saved.</span></li>
       </ul>
-      <p class="hint">The size is the whole note: its text and drawing plus its photos and audio. One photo or clip can be up to 90 MB, and the written part alone up to 25 MB.</p>
+      <p class="hint">The size is the whole note: its text and drawing plus its photos, videos and audio. One photo, video or clip can be up to 90 MB, and the written part alone up to 25 MB.</p>
     </div>
   </div>
 </div>
@@ -1873,6 +2603,14 @@
           <p class="hint" id="settings-photo-hint"></p>
         </div>
         <div class="field">
+          <label for="settings-video-quality">Videos</label>
+          <select id="settings-video-quality">
+            <option value="standard">Standard (720p)</option>
+            <option value="high">High (1080p)</option>
+          </select>
+          <p class="hint" id="settings-video-hint"></p>
+        </div>
+        <div class="field">
           <label for="settings-audio-quality">Audio</label>
           <select id="settings-audio-quality">
             <option value="standard">Standard</option>
@@ -1880,7 +2618,7 @@
           </select>
           <p class="hint" id="settings-audio-hint"></p>
         </div>
-        <p class="hint">Every time you add photos or audio, Keepsake asks whether to keep the Original or make a Compressed copy. These settings only decide how strong Compressed is.</p>
+        <p class="hint">Every time you add photos, videos or audio, Keepsake asks whether to keep the Original or make a Compressed copy and shows the final compressed size. Videos are sliced into tagged packets for sleep-safe cloud upload.</p>
       </section>
 
       <section class="settings-section" aria-labelledby="storage-heading">
@@ -1922,12 +2660,19 @@
   </div>
 </div>
 
-<!-- Original or Compressed: asked before every photo / audio is added -->
+<!-- Original or Compressed: asked before every photo / video / audio is added -->
 <div class="overlay hidden" id="overlay-quality">
   <div class="modal narrow" role="dialog" aria-modal="true" aria-labelledby="quality-title">
     <div class="modal-head"><h2 id="quality-title">Add media</h2></div>
     <div class="modal-body">
       <p class="hint" id="quality-summary" style="margin-bottom: 8px;"></p>
+      <div class="quality-size-banner" id="quality-size-banner" hidden>
+        <div class="quality-size-banner-row">
+          <span class="quality-size-banner-title" id="quality-banner-title"></span>
+          <span class="quality-size-pill" id="quality-banner-pill"></span>
+        </div>
+        <div class="quality-packet-note" id="quality-packet-note"></div>
+      </div>
       <ul class="quality-files" id="quality-files" hidden></ul>
       <div class="quality-options" role="radiogroup" aria-labelledby="quality-title">
         <button class="quality-opt" id="btn-quality-original" type="button" role="radio" aria-checked="true"><span class="q-title"></span><span class="q-hint"></span></button>
@@ -1946,7 +2691,7 @@
 <script>
 // Bump this on EVERY change to the app, no matter how small — a typo fix,
 // a copy tweak, whatever. See CHANGELOG.md for the policy and history.
-window.KEEPSAKE_VERSION = "1.9.1";
+window.KEEPSAKE_VERSION = "1.10.1";
 </script>
 <script src="b2.js"></script>
 <script src="media.js"></script>
