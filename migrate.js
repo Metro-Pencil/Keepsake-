@@ -89,9 +89,11 @@
     if (await B.sha256Hex(back) !== contentSha) throw new Error('did not read back identically');
 
     // Meta last, so a note never appears in the list without its content.
+    // A migrated note's photos and audio live in the bucket too: record their total, or Settings -> Storage would
+    // count the note as having no media (the same blind spot the "biggest notes" list had).
     let migMediaSize = meta.mediaSize;
-    if (!migMediaSize && manifest && typeof manifest === "object") {
-      migMediaSize = Object.values(manifest).reduce((s, e) => s + (e && typeof e.n === "number" ? e.n : 0), 0) || undefined;
+    if (!migMediaSize && manifest && typeof manifest === 'object') {
+      migMediaSize = Object.values(manifest).reduce((sum, e) => sum + (e && typeof e.n === 'number' ? e.n : 0), 0) || undefined;
     }
     const newMeta = { ...meta, size: contentJSON.length, ...(migMediaSize ? { mediaSize: migMediaSize } : {}) };
     await B.putText('meta/' + id + '.json', JSON.stringify(newMeta));

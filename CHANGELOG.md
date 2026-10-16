@@ -6,17 +6,59 @@ All notable changes to this project are recorded here, following
 small — gets a version bump. If the version number hasn't moved,
 nothing changed; that's the whole point of keeping one.
 
-## v1.10.1 — 2026-10-14
+## v1.11.0 — 2026-10-16
 
-- **Photo-sized video tiles in notes, with full Video Studio on click.** `<ks-video>` in the note body now uses the exact same compact square tile area and multi-column float grid as `<ks-photo>` (`.video-tile` matching `.photo-tile`), displaying the poster thumbnail, play badge, duration, size, and packet status pill without taking up the whole note. Clicking any video tile opens the unified **Video Studio** (`#overlay-video`) with full playback controls, quality/compression preset selector, file actions (Download, Compress/Re-compress, Delete), and the Sliced Cloud Packets inspector.
-- **Automatic background verification & re-upload of video packets (plus manual button).** Added `KSMedia.backgroundVerifyAndRepair()` and `runBackgroundPacketCheck()`, which automatically verify uploaded and pending video packets in the background (after saves, when opening a note, on reconnect/foreground, and on a periodic timer) and re-upload any missing or corrupted packets automatically while keeping the manual **Verify & re-upload lost packets now** button in the Video Studio. Service worker cache bumped to v20.
+Merges two builds of the video feature (1.10.0 and a separately-made 1.10.1), keeping the stronger design of
+each.
 
-## v1.10.0 — 2026-10-14
+- **Kept from 1.10.0:** a video is cut into 4 MB parts as it is added and kept on disk, never held in memory,
+  so big videos work (up to 2 GB; 1.10.1 held the whole video in memory as text and refused anything near 90 MB).
+  Parts upload one at a time, are confirmed against the bucket, resume after an interruption and are re-sent if
+  lost. Locked notes encrypt every part.
+- **Added from 1.10.1:** videos are now **photo-sized tiles in the photo grid** (instead of full-width cards);
+  **Compress…** for a video already in the note; and a per-part **Upload details** view (new here: it checks the
+  bucket live and has a "Send missing parts" button). Also its fix for notes whose metadata lacks a media size
+  (migrated or older notes): Storage now works their size out from the note's own list of media, and
+  `migrate.js` records it.
+- **Left out on purpose:** 1.10.1's background packet checker (a clean save sent most packets twice in testing;
+  every save already re-checks the bucket), tiny 2 MB packets, the in-memory fallbacks for IndexedDB and
+  localStorage (a notes app should fail loudly rather than quietly keep data only until the tab closes), the
+  hand-written SHA-256/HMAC fallback for non-HTTPS pages (encryption needs a secure page anyway), and its
+  shortened README (all sections kept).
+- The "Compress" confirmation uses the normal button, not the red delete one. Service worker cache v21.
 
-- **Fixed "Biggest notes" in Settings → Storage ignoring attached photos and media.** `storageUsage()` previously ranked notes by `m._bytes` (the JSON text size alone, which is only a few hundred bytes once photos live in Backblaze) instead of `m._bytes + m._media`. Each note in **Biggest notes** now counts its written text, photos, videos and audio together, and updates immediately when media is added.
-- **Video uploads with Original or Compressed quality and final compressed size preview.** Added the **Add video** button in the editor toolbar and **Settings → Compressed quality → Videos** (Standard 720p and High 1080p). Before adding any video, Keepsake probes its resolution and duration and shows both the original size and the **final size after compressing** (per file and total, with MB and percentage saved) right in the Original / Compressed dialog, and reports the final compressed size once compression finishes. Already-saved videos can also be compressed later from the video options or theater viewer.
-- **Sliced packet cloud uploads with section tagging and automatic lost-data re-upload.** Instead of uploading a large video as one fragile request that fails if the phone sleeps, videos are sliced into multiple tagged sections (`<mediaId>_s0001of0004_<sha8>`) with per-section SHA-256 hashes and byte offsets, and uploaded packet by packet. If an upload is interrupted, already-verified packets in Backblaze B2 are kept and skipped on resume; any missing, truncated, or corrupted packet is detected and re-uploaded automatically.
-- **Custom video playback UI, Cinema Theater viewer, and Cloud Packet Inspector (`css-pro-max`).** Built an inline `<ks-video>` player card and full-screen theater lightbox with reserved `aspect-ratio` (`contain: layout paint`), poster frame extraction, 44×44px touch targets with 8px spacing, `transform: scaleX()` progress and buffer bars, `tabular-nums` timers and size badges, playback speed cycling (`0.75×`–`2×`), keyboard `:focus-visible` rings, `prefers-reduced-motion` and `forced-colors` support, and a live **Sliced Cloud Packets** inspector with on-demand packet verification and re-upload. Service worker cache bumped to v19.
+## v1.10.0 — 2026-10-15
+
+- **Fixed: "Biggest notes" ignored photos and audio.** The list in Settings → Storage ranked notes by their
+  written part only and showed that number, so a note with 200 photos looked tiny and could never appear at
+  the top, even though the usage total above it was right. It now ranks and shows each note's full size
+  (text + photos + audio + video), lists five instead of three, and under each title says what is in it
+  ("200 photos · 4 KB text"). Notes saved from now on remember their photo/clip/video counts (older notes
+  just show their size until they are next saved).
+- **Videos in notes.** New video button in the editor. Like photos and audio, it first asks **Original or
+  Compressed** - and for video the dialog shows, per file, its length and resolution and what it would
+  come to if compressed, with a "Final size" line that follows your choice. Compressing (Settings →
+  Compressed quality → Video: Standard or High) is real-time, keeps the screen awake, can be cancelled, and
+  ends by showing the actual size ("8.0 MB → 1.8 MB") before the video is added; if it wouldn't be smaller,
+  the original is kept. WebM recordings get their length written in so they can be seeked.
+- **Big videos upload in tagged parts, not one file.** A video is cut into 4 MB parts, each checksummed and
+  stored on the device as it is cut, named `<video id>.<part number>` in the bucket. Parts upload one at a
+  time and are only counted once a listing of the bucket confirms them. A dropped connection or a sleeping
+  phone loses at most the part in flight; the next attempt sends only what is missing. On every save the
+  parts are checked against the bucket and any that were lost are sent again from the device (or the save
+  stops with a clear message if a part is gone from both). The screen is asked to stay awake during uploads
+  and compression. Videos are never held in memory, never inlined in the note, and not downloaded just
+  because a note is opened. Parts of locked notes are encrypted one by one; locking a note whose video was
+  already saved re-encrypts it. Orphaned parts from notes never saved are swept after a day.
+- **A better video player and card.** In the note a video is a poster card with its length, whether it
+  is Original or Compressed, its size, and a badge showing upload state (waiting / N of M parts / saved /
+  in the cloud - icon and words, not just colour). The full-screen player has a big play button, a seek bar
+  with buffered range and drag preview, double-tap to jump 10 s, speed, mute, full screen, picture-in-picture,
+  download and remove, auto-hiding controls, keyboard shortcuts (Space/K, arrows, J/L, M, F, Esc), screen
+  reader labels, a "Getting video ready - 12 / 125 parts" state with Cancel, and respects reduced motion,
+  high contrast and phone notches.
+- New files `video.js` and `player.js`; `media.js`/`b2.js` learned the part names. Service worker cache
+  bumped to v19.
 
 ## v1.9.1 — 2026-10-11
 

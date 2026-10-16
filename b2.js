@@ -5,9 +5,9 @@
  * Bucket layout
  *   meta/{id}.json         { id, createdAt, updatedAt, lockType, unlockAt, title, preview, size, mediaSize }
  *                          (title is plain text even for locked notes; preview is null for them)
- *   content/{id}.json      plain {title, body, html?, images, videos?, drawing?, ...}  OR  encrypted {salt, iv, ciphertext}
+ *   content/{id}.json      plain {title, body, html?, images, drawing?, ...}  OR  encrypted {salt, iv, ciphertext}
  *   vault/{id}.txt         the second password of a time-locked note
- *   media/{id}/{name}      a note's photos, audio, and sliced video packets (see media.js)
+ *   media/{id}/{name}      a note's photos and audio (see media.js)
  *
  * The four settings (endpoint, bucket, key ID, application key) live in this browser's local
  * storage only. Anyone who has the application key can read and delete the bucket.
@@ -31,19 +31,19 @@
   const dec = new TextDecoder();
   const EMPTY_SHA = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
   const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  const NAME_RE = /^[a-f0-9]{32}$/;
-  // Matches either a whole media file (<32hex>) or a tagged video packet (<32hex>_s0001of0004_<8hex>)
-  const MEDIA_KEY_RE = /^[a-f0-9]{32}(?:_s\d{4}of\d{4}_[a-f0-9]{8})?$/;
+  // A media file is 32 hex characters. A video is stored as many small parts, each named
+  // <video's 32 hex>.<part number, 5 digits> - the name itself tags which video a part belongs to and where
+  // it goes, so the bucket stays self-describing even without the note that lists them.
+  const NAME_RE = /^[a-f0-9]{32}(?:\.\d{5})?$/;
   const ORPHAN_GRACE_MS = 60 * 60 * 1000; // an unreferenced upload is only swept after an hour
   const META_CACHE_KEY = 'ks_b2_metacache';
   const CLOCK_KEY = 'ks_b2_clockoffset';
 
   /* ------------------------------------------------------------------ settings */
 
-  const memLS = new Map();
-  function lsGet(k) { try { return root.localStorage.getItem(k) || memLS.get(k) || ''; } catch (e) { return memLS.get(k) || ''; } }
-  function lsSet(k, v) { memLS.set(k, String(v)); try { root.localStorage.setItem(k, v); } catch (e) { /* private mode */ } }
-  function lsDel(k) { memLS.delete(k); try { root.localStorage.removeItem(k); } catch (e) { /* private mode */ } }
+  function lsGet(k) { try { return root.localStorage.getItem(k) || ''; } catch (e) { return ''; } }
+  function lsSet(k, v) { try { root.localStorage.setItem(k, v); } catch (e) { /* private mode */ } }
+  function lsDel(k) { try { root.localStorage.removeItem(k); } catch (e) { /* private mode */ } }
 
   // Tolerates "https://s3.us-west-004.backblazeb2.com/" pasted with the scheme or a trailing slash.
   function cleanHost(s) { return String(s || '').trim().replace(/^https?:\/\//i, '').replace(/\/+$/, ''); }
@@ -73,95 +73,14 @@
     return Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, '0')).join('');
   }
 
-  function hexToBytes(h) {
-    const out = new Uint8Array(h.length / 2);
-    for (let i = 0; i < out.length; i++) out[i] = parseInt(h.slice(i * 2, i * 2 + 2), 16);
-    return out;
-  }
   async function hmacSha256(keyBytes, data) {
-    if (root.crypto && root.crypto.subtle) {
-      const key = await root.crypto.subtle.importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-      return new Uint8Array(await root.crypto.subtle.sign('HMAC', key, enc.encode(data)));
-    }
-    const msg = enc.encode(data);
-    let k = keyBytes instanceof Uint8Array ? keyBytes : new Uint8Array(keyBytes);
-    if (k.length > 64) k = hexToBytes(jsSha256Hex(k));
-    const ipad = new Uint8Array(64), opad = new Uint8Array(64);
-    for (let i = 0; i < 64; i++) {
-      const b = i < k.length ? k[i] : 0;
-      ipad[i] = b ^ 0x36;
-      opad[i] = b ^ 0x5c;
-    }
-    const inner = new Uint8Array(64 + msg.length);
-    inner.set(ipad, 0); inner.set(msg, 64);
-    const innerHash = hexToBytes(jsSha256Hex(inner));
-    const outer = new Uint8Array(64 + 32);
-    outer.set(opad, 0); outer.set(innerHash, 64);
-    return hexToBytes(jsSha256Hex(outer));
-  }
-
-  // Polyfill crypto.randomUUID for non-HTTPS / local contexts
-  if (root.crypto && typeof root.crypto.randomUUID !== "function") {
-    root.crypto.randomUUID = function () {
-      const b = root.crypto.getRandomValues(new Uint8Array(16));
-      b[6] = (b[6] & 0x0f) | 0x40;
-      b[8] = (b[8] & 0x3f) | 0x80;
-      const h = Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
-      return h.slice(0, 8) + "-" + h.slice(8, 12) + "-" + h.slice(12, 16) + "-" + h.slice(16, 20) + "-" + h.slice(20);
-    };
-  }
-  // Pure-JS SHA-256 fallback when crypto.subtle is unavailable in non-HTTPS contexts
-  function jsSha256Hex(bytes) {
-    const K = [
-      0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
-      0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
-      0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
-      0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
-      0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
-      0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
-      0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
-      0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
-    ];
-    const r = (n, b) => (n >>> b) | (n << (32 - b));
-    const l = bytes.length;
-    const bitLen = l * 8;
-    const padLen = ((l + 9 + 63) & ~63);
-    const buf = new Uint8Array(padLen);
-    buf.set(bytes);
-    buf[l] = 0x80;
-    const dv = new DataView(buf.buffer);
-    dv.setUint32(padLen - 8, Math.floor(bitLen / 0x100000000), false);
-    dv.setUint32(padLen - 4, bitLen >>> 0, false);
-    let h0 = 0x6a09e667, h1 = 0xbb67ae85, h2 = 0x3c6ef372, h3 = 0xa54ff53a;
-    let h4 = 0x510e527f, h5 = 0x9b05688c, h6 = 0x1f83d9ab, h7 = 0x5be0cd19;
-    const w = new Int32Array(64);
-    for (let i = 0; i < padLen; i += 64) {
-      for (let j = 0; j < 16; j++) w[j] = dv.getInt32(i + j * 4, false);
-      for (let j = 16; j < 64; j++) {
-        const s0 = r(w[j-15], 7) ^ r(w[j-15], 18) ^ (w[j-15] >>> 3);
-        const s1 = r(w[j-2], 17) ^ r(w[j-2], 19) ^ (w[j-2] >>> 10);
-        w[j] = (w[j-16] + s0 + w[j-7] + s1) | 0;
-      }
-      let a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, h = h7;
-      for (let j = 0; j < 64; j++) {
-        const S1 = r(e, 6) ^ r(e, 11) ^ r(e, 25);
-        const ch = (e & f) ^ (~e & g);
-        const t1 = (h + S1 + ch + K[j] + w[j]) | 0;
-        const S0 = r(a, 2) ^ r(a, 13) ^ r(a, 22);
-        const maj = (a & b) ^ (a & c) ^ (b & c);
-        const t2 = (S0 + maj) | 0;
-        h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
-      }
-      h0 = (h0 + a) | 0; h1 = (h1 + b) | 0; h2 = (h2 + c) | 0; h3 = (h3 + d) | 0;
-      h4 = (h4 + e) | 0; h5 = (h5 + f) | 0; h6 = (h6 + g) | 0; h7 = (h7 + h) | 0;
-    }
-    return [h0,h1,h2,h3,h4,h5,h6,h7].map((x) => (x >>> 0).toString(16).padStart(8, "0")).join("");
+    const key = await root.crypto.subtle.importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    return new Uint8Array(await root.crypto.subtle.sign('HMAC', key, enc.encode(data)));
   }
 
   async function sha256Hex(data) {
     const bytes = typeof data === 'string' ? enc.encode(data) : data;
-    if (root.crypto && root.crypto.subtle) return toHex(await root.crypto.subtle.digest('SHA-256', bytes));
-    return jsSha256Hex(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+    return toHex(await root.crypto.subtle.digest('SHA-256', bytes));
   }
 
   // RFC 3986 percent-encoding, which is what SigV4 wants (encodeURIComponent leaves ! ' ( ) * alone).
@@ -367,7 +286,7 @@
         const online = !root.navigator || root.navigator.onLine !== false;
         const transient = (e.status && RETRY_STATUS.has(e.status)) || (e.isNetworkError && online && attempt === 0);
         if (!transient || attempt === RETRY_DELAYS_MS.length) throw e;
-        if (onProgress) onProgress(0, bytes.length); // the file/packet starts over: so does its progress
+        if (onProgress) onProgress(0, bytes.length); // the file starts over: so does its progress
         await sleep(RETRY_DELAYS_MS[attempt]);
       }
     }
@@ -470,8 +389,8 @@
     const got = await objectSize(key);
     if (got === expectedBytes) return;
     const err = new Error(got === null
-      ? 'Backblaze didn\u2019t keep a file or packet that was just sent \u2014 it will be sent again.'
-      : 'Backblaze stored a file or packet at the wrong size (' + got + ' of ' + expectedBytes + ' bytes) \u2014 it will be sent again.');
+      ? 'Backblaze didn\u2019t keep a file that was just sent \u2014 it will be sent again.'
+      : 'Backblaze stored a file at the wrong size (' + got + ' of ' + expectedBytes + ' bytes) \u2014 it will be sent again.');
     err.verifyFailed = true;
     throw err;
   }
@@ -520,6 +439,13 @@
     return err;
   }
 
+  function cleanCounts(c) {
+    if (!c || typeof c !== 'object') return undefined;
+    const n = (v) => (Number.isFinite(v) && v > 0 ? Math.min(Math.floor(v), 1e6) : 0);
+    const out = { photos: n(c.photos), clips: n(c.clips), videos: n(c.videos) };
+    return out.photos + out.clips + out.videos ? out : undefined;
+  }
+
   function metaFromBody(existing, body, now, size) {
     const lockType = body.lockType === 'quick' || body.lockType === 'time' ? body.lockType : 'none';
     return {
@@ -530,14 +456,16 @@
       unlockAt: lockType === 'time' ? (body.unlockAt || null) : null,
       // The title is stored in plain text for every note, locked or not, so a locked note can be
       // recognised on its card on any device. Only the preview (a slice of the body) stays plain
-      // for unlocked notes alone - a locked note's text, photos, videos and drawing are encrypted client-side.
+      // for unlocked notes alone - a locked note's text, photos and drawing are encrypted client-side.
       title: String(body.title || '').slice(0, 200),
       preview: lockType === 'none' ? String(body.preview || '') : null,
       // How big the stored content is (characters of its JSON). The app adds these up for its storage meter.
       size: Number.isFinite(size) ? size : undefined,
-      // Bytes of photos/audio/videos kept in the bucket for this note (as stored there, so encrypted
-      // size for a locked note). The app adds these up for its storage meter and biggest-notes list.
+      // Bytes of photos/audio kept in the bucket for this note (as stored there, so encrypted
+      // size for a locked note). The app adds these up for its second storage meter.
       mediaSize: Number.isFinite(body.mediaBytes) && body.mediaBytes > 0 ? Math.floor(body.mediaBytes) : undefined,
+      // How many photos, clips and videos make up that size (shown in Settings -> Storage).
+      counts: cleanCounts(body.mediaCounts),
     };
   }
 
@@ -628,10 +556,10 @@
     if (meta.lockType === 'time' && body.password2) await putText(vaultKey(id), String(body.password2));
     else if (meta.lockType !== 'time') await deleteObject(vaultKey(id)).catch(() => {});
 
-    // The save lists every media file (or parent media id) it refers to. Anything else stored for
-    // this note is an orphan and is swept (after a grace period, see pruneMedia).
+    // The save lists every media file it refers to. Anything else stored for this note is an
+    // orphan and is swept (after a grace period, see pruneMedia).
     if (Array.isArray(body.mediaKeep)) {
-      const keep = body.mediaKeep.filter((n) => typeof n === 'string' && MEDIA_KEY_RE.test(n));
+      const keep = body.mediaKeep.filter((n) => typeof n === 'string' && NAME_RE.test(n));
       pruneMedia(id, keep).catch(() => {}); // cleanup must never fail the save
     }
     return { note: meta };
@@ -687,7 +615,7 @@
     const items = [];
     for (const o of await listAll(prefix)) {
       const name = o.key.slice(prefix.length);
-      if (MEDIA_KEY_RE.test(name)) items.push({ name, size: o.size, modified: o.modified });
+      if (NAME_RE.test(name)) items.push({ name, size: o.size, modified: o.modified });
     }
     return items;
   }
@@ -696,15 +624,13 @@
     for (const name of names) await deleteObject(mediaKey(noteId, name));
   }
 
-  // Deletes uploads no saved version of the note refers to any more (a photo/video removed from the
+  // Deletes uploads no saved version of the note refers to any more (a photo removed from the
   // note, a re-encrypted copy, an abandoned upload). Anything younger than an hour is left alone
-  // so a save still in flight can't lose the files or packets it is about to reference.
-  // A packet key (<32hex>_s0001of0004_<8hex>) is kept whenever either the packet key itself OR its
-  // 32-character parent media id is in `keepNames`.
+  // so a save still in flight can't lose the files it is about to reference.
   async function pruneMedia(noteId, keepNames) {
     const keep = new Set(keepNames);
     const cutoff = Date.now() - ORPHAN_GRACE_MS;
-    const stale = (await listMedia(noteId)).filter((i) => !keep.has(i.name) && !keep.has(i.name.slice(0, 32)) && i.modified < cutoff);
+    const stale = (await listMedia(noteId)).filter((i) => !keep.has(i.name) && i.modified < cutoff);
     await deleteMedia(noteId, stale.map((i) => i.name));
   }
 
@@ -723,6 +649,6 @@
     // media
     listMedia, deleteMedia, mediaKey,
     // handy for the tests
-    _test: { signV4, uriEncode, metaFromBody, metaKey, contentKey, vaultKey, MEDIA_KEY_RE },
+    _test: { signV4, uriEncode, metaFromBody, metaKey, contentKey, vaultKey },
   };
 })(typeof window !== 'undefined' ? window : globalThis);
