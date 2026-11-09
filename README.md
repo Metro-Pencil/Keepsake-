@@ -139,38 +139,36 @@ time zone, network type, app version. Failed attempts on a device (wrong key, CO
 on the device and logged with its next successful login. The IP address is not recorded: with no server in
 between, the app cannot see it.
 
-**The master account and master key.** When the app opens, it checks whether a master account exists in
-`devices/_master.json`. If there is no record of a master account yet, it shows the option to **Create master
-account** with a password stored in the bucket; once a master account exists, new ones cannot be created. Any
-device can tap **Log in as master** and enter that password to open master settings, do master actions, **Change
-password**, or **Log out of master** when done. **Settings -> Devices & logins** on a master shows every device
-with its status, system and last login, the recent logins of all devices, and one device's full history (two
-months at a time). From there a master can:
+**The master account.** The first time the app opens against a bucket that has none, it offers to create one: you
+choose a password (at least 8 characters). After that, **any device can log in as master with that password alone**
+(Settings -> Devices & logins -> *Log in as master*) and **log out of master** when it is done. If a master account
+already exists, no one is offered the chance to create another, and creating a second is refused. The password is
+stored in the bucket as the master key encrypted with it (PBKDF2 then AES-GCM): it is not hidden from someone who holds
+the Backblaze key, only slowed down. While logged in, a device sees every device with its status, system and last
+login, the recent logins of all devices, and one device's full history (two months at a time). From there it can:
 
 - **Sign out** a device: its Backblaze key is removed the next time it opens the app or checks in (about every
-  two minutes while open). It can sign in again by typing the key. The dialog also has a **Sign out & erase notes**
-  button to erase that device's saved copies of notes.
+  two minutes while open). It can sign in again by typing the key.
 - **Block** a device: the same, and it is refused every time it signs in until you **Allow** it again. Refused
-  attempts show in its history. The dialog also has a **Block & erase notes** button to erase that device's saved
-  copies of notes.
-- **Replace master key**: creates a new master key and retires the old one (while keeping existing blocks in place).
-  Every other master device (such as a stolen phone) immediately stops being a master, so you can sign it out or
-  block it. You can also set a new master password at the same time.
-- **Promote** a device to master: the master key is encrypted to that device's own key and left for it in the
-  bucket; only that device can open it, and it becomes a master within a couple of minutes. A master can't be
-  blocked or signed out by another master until you replace the master key. **Show master key** displays the key
-  for a backup; **Enter master key** on another device makes it a master too.
+  attempts show in its history.
+- **Erase saved notes** (a checkbox in both the Sign out and Block dialogs): also removes the offline copies of notes,
+  photos, audio, video and unsent edits kept in that device's browser. Your notes in the bucket are not touched.
 - **Forget** a device: removes its record and history (not allowed while it is blocked).
+- **Change password**: needs the current password; nothing else changes.
+- **Replace master key**: makes a new key, which logs out every device that was logged in as master, including this
+  one (log in again with the password). Use it when a device that was logged in as master is lost or stolen: a device
+  logged in as master can't be signed out or blocked by another (it could undo it), so replace the key first, then block
+  it. Blocks already given stay in force; a new password can be set at the same time.
 
 Every command is signed with the master key and checked by the device that receives it, so an ordinary device
-can't block anyone or make itself a master; an unsigned command shows up in the list as ignored.
+can't block anyone; an unsigned command shows up in the list as ignored. A master account made by 1.12 has no password
+yet: on a device that is already master, Settings offers *Set a master password*.
 
 **What this can and can't do.** There is no server, so every device still holds the Backblaze application key and
 the check is made by Keepsake itself on that device. Sign out and Block stop the app on a device that is running
 Keepsake. They can't stop someone who has copied the Backblaze key out and uses it with other software, or a
 device that is never opened or never online again. If a device is lost or a key may have leaked, also create a
-new application key in Backblaze and delete the old one: that is the only real cut-off. If every master device
-and the master key are lost, delete the `devices/` folder in Backblaze; the next device to connect becomes the master.
+new application key in Backblaze and delete the old one: that is the only real cut-off. If the master password is forgotten, delete `devices/_master.json` in Backblaze (or the whole `devices/` folder); the app then offers to create a new master account.
 
 ## The time lock and clocks
 

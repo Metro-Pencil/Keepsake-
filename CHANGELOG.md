@@ -6,19 +6,32 @@ All notable changes to this project are recorded here, following
 small — gets a version bump. If the version number hasn't moved,
 nothing changed; that's the whole point of keeping one.
 
-## v1.13.0 — 2026-11-09
+## v1.13.0 — 2026-11-10
 
-- **Master account password stored in the bucket.** When the app opens and connects, it searches for a master
-  account in `devices/_master.json`. If none exists yet, it shows the option to **Create master account** with a
-  password; once a master account exists, no new ones can be created. Any device can **Log in as master** using
-  that password alone, manage devices, **Change password**, and **Log out of master** when done.
-- **Wipe button in Sign-out and Block dialogs.** Signing out or blocking a device now includes **Sign out & erase
-  notes** and **Block & erase notes** buttons to also erase that device's locally saved note copies (`keepsake-drafts`
-  and `keepsake-media`).
-- **Replace master key.** Added **Replace master key** (in Settings, Devices & logins, the Master key dialog, and
-  on another master device's detail screen). Replacing the master key generates a new signing key pair, re-signs
-  existing device blocks so blocked devices stay blocked, and immediately strips master status from any other
-  master device (such as a lost or stolen phone) so it can be signed out or blocked. Service worker cache v23.
+- **The master account is now a password kept in the bucket.** Any device can log in as master with that
+  password alone, do what a master does, and **log out of master** again. Nothing is tied to one phone any more.
+  Behind the password is the same signed-command design as before: the master key is stored in
+  `devices/_master.json` encrypted with the password (PBKDF2-SHA256, 600,000 rounds, then AES-256-GCM), and a wrong
+  password simply fails to open it. As agreed, the password is not hidden from someone who holds the Backblaze key;
+  it is guarded by the slow hash.
+- **The app looks for a master account when it opens.** If the bucket has none, it offers to create one (and after
+  "Not now" stays quiet for a week; Settings always has the button). If one exists, no way to create another is shown,
+  and creating a second is refused. Two devices creating at the same moment end with exactly one.
+- **Change password** (Settings → Devices & logins). Needs the current password; every device keeps working.
+- **Replace master key** — for a lost or stolen phone that was logged in as master. Makes a new key pair, so every
+  device that was logged in loses its master login (and can then be blocked), and re-signs any block or sign-out
+  already waiting so none of them lapses. Optionally sets a new password at the same time.
+- **Erase saved notes on Sign out and Block.** Both confirmations now have an "Also erase the notes saved on that
+  device" checkbox. It clears that device's offline copies (notes, photos, audio, video, unsent edits, the note list)
+  the next time it checks in; the notes in the bucket are untouched. The blocked/signed-out notice says it happened and
+  the device's detail view shows whether it is confirmed.
+- **Removed:** Promote to master, Show master key and the promotion grants. The password replaces them.
+- **Accounts made by 1.12** have a key but no password. A device that is already a master sees "Set a master
+  password" (the key itself does not change, so existing blocks stay valid); a device holding the old `KSM1.` key can
+  paste it under "Enter old master key" and then set one. If neither exists, delete the `devices/` folder in Backblaze
+  and create a new master account.
+- A master login ends by itself, and is logged, when the master key is replaced or the device is signed out or blocked.
+- Service worker cache v23.
 
 ## v1.12.0 — 2026-10-16
 
