@@ -1,0 +1,44 @@
+name: Apply Backblaze B2 CORS
+
+on:
+  workflow_dispatch:
+    inputs:
+      bucket_name:
+        description: 'Backblaze Bucket Name'
+        required: true
+      key_id:
+        description: 'B2 Key ID (Master or Bucket Admin)'
+        required: true
+      app_key:
+        description: 'B2 Application Key'
+        required: true
+
+jobs:
+  set-cors:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install B2 CLI and apply CORS
+        env:
+          B2_APPLICATION_KEY_ID: ${{ github.event.inputs.key_id }}
+          B2_APPLICATION_KEY: ${{ github.event.inputs.app_key }}
+          BUCKET: ${{ github.event.inputs.bucket_name }}
+        run: |
+          pip install --quiet b2
+          cat << 'EOF' > rules.json
+          [
+            {
+              "corsRuleName": "metro-pencil-cors",
+              "allowedOrigins": ["https://metro-pencil.github.io"],
+              "allowedOperations": [
+                "s3_head", "s3_get", "s3_put", "s3_post", "s3_delete",
+                "b2_download_file_by_id", "b2_download_file_by_name",
+                "b2_upload_file", "b2_upload_part"
+              ],
+              "allowedHeaders": ["*"],
+              "exposeHeaders": ["ETag", "x-bz-file-id", "x-bz-file-name", "x-bz-content-sha1"],
+              "maxAgeSeconds": 86400
+            }
+          ]
+          EOF
+          b2 bucket update --cors-rules "$(cat rules.json)" "$BUCKET" allPrivate
+          
