@@ -3559,7 +3559,7 @@ function openSettings() {
   document.getElementById('settings-b2-appkey').value = c.appKey();
   setB2Status('', '');
   fillClockLine();
-  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.12.0';
+  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.13.0';
   fillQualitySettings();
   show('overlay-settings');
   renderStorageSection();
@@ -5955,7 +5955,7 @@ function init() {
   setupRichText();
   setupMedia();
   setupInk();
-  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.12.0');
+  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.13.0');
 
   // Connectivity: react the moment the browser notices, and keep retrying
   // on a timer since navigator.onLine can't see a connection that's up but

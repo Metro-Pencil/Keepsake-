@@ -6,11 +6,12 @@
  * Every time the app opens or connects, the device writes a login entry (time, browser, system, screen,
  * language, time zone, network, installed-or-tab, app version...) into the bucket under devices/.
  *
- * The first device to connect creates the MASTER key (an ECDSA P-256 pair). A device that holds the master
- * key is a master: it sees every device and every login, and can Terminate (sign out once), Block (until
- * allowed again), Allow, Forget, and Promote another device. Promoting wraps the master key with the
- * other device's public key, so only that device can open it. Every command is signed with the master
- * key; devices check the signature, so an ordinary device cannot block anyone or make itself a master.
+ * When the app opens, it checks whether a master account record exists in devices/_master.json. If none
+ * exists yet, it offers to create one with a password stored in the server (bucket); once a master account
+ * exists, new ones cannot be created. Any device can log in as master using that password, manage devices
+ * (Sign out or Block with optional local note wipe, Allow, Forget, Promote, Change password, Replace master
+ * key), and log out of master when done. Every command is signed with the master key (an ECDSA P-256 pair);
+ * devices check the signature, so an ordinary device cannot block anyone or make itself a master.
  *
  * Honest limit: there is no server. Every device already holds the Backblaze application key, and this is
  * checked by the app itself. It stops this app on a device that obeys it. It cannot stop someone who copies
@@ -239,21 +240,26 @@
     return me;
   }
 
-  // The master key this device holds, only if it still matches the bucket's master.
+  // The master key this device holds, only if it still matches the bucket's master (and password, if set).
   async function myMasterKey(master) {
     if (!master) return null;
     const saved = await store().get('master');
-    if (saved && saved.privateKey && await keyMatches(saved.privateKey, master.pub)) return saved.privateKey;
+    if (!saved || !saved.privateKey) return null;
+    if (master.password && saved.password !== undefined && saved.password !== master.password) return null;
+    if (await keyMatches(saved.privateKey, master.pub)) return saved.privateKey;
     return null;
   }
 
-  async function becomeMaster(me) {
+  async function becomeMaster(me, password) {
     const pair = await makeMasterPair();
-    await writeJson(K.master, { v: 1, pub: pair.pub, createdBy: me.id, createdAt: now() });
+    const keyText = await exportMasterText(pair.privateKey);
+    const pw = password !== undefined && password !== null ? String(password) : '';
+    const rec = { v: 1, pub: pair.pub, keyText, password: pw, createdBy: me.id, createdAt: now() };
+    await writeJson(K.master, rec);
     await sleep(500);                                  // two devices starting together: last write wins, then both look again
     const check = await readMaster();
     if (check && check.createdBy === me.id) {
-      await store().set('master', { privateKey: pair.privateKey, savedAt: now() });
+      await store().set('master', { privateKey: pair.privateKey, password: pw, savedAt: now() });
       return { master: check, won: true };
     }
     return { master: check, won: false };
@@ -264,7 +270,7 @@
       const raw = await subtle().decrypt({ name: 'RSA-OAEP' }, me.privateKey, unb64(inbox.grant.wrapped));
       const key = await subtle().importKey('pkcs8', raw, EC, true, ['sign']);
       if (!(await keyMatches(key, master.pub))) return null;
-      await store().set('master', { privateKey: key, savedAt: now() });
+      await store().set('master', { privateKey: key, password: master.password, savedAt: now() });
       const rest = { ...inbox }; delete rest.grant;
       await saveInbox(me.id, rest);
       return key;
@@ -308,6 +314,8 @@
   let onStatus = null;
 
   // One login. reason: 'open' (the app was opened) or 'connect' (details were just saved).
+  // Searches for an existing master account in the bucket; if none exists, noMaster is true so the
+  // app shows the option to create one. If a master account already exists, new ones are never created.
   async function checkIn(reason) {
     if (busy) return busy;
     busy = (async () => {
@@ -315,8 +323,8 @@
         const me = await getIdentity(true);
         const env = await collectEnv();
         let master = await readMaster();
+        const hasMaster = !!master || (await masterExists());
         let created = false;
-        if (!master && !(await masterExists())) { const r = await becomeMaster(me); master = r.master; created = r.won; }
         let myKey = await myMasterKey(master);
         const inbox = await readInbox(me.id);
         if (!myKey && inbox && inbox.grant) myKey = await redeemGrant(me, master, inbox);
@@ -333,7 +341,7 @@
 
         const rec = await writeRecord(me, env, master, myKey, { countLogin: !skip, ack: verdict.status !== 'active' ? { kind: verdict.status, cmdAt: verdict.cmd.at, t: now() } : null });
         if (entries.length) { await appendLog(me.id, entries); lsSet(LS.failed, '[]'); lsSet(LS.lastlog, String(now())); }
-        const out = { ...verdict, me, rec, master, isMaster: !!myKey, created };
+        const out = { ...verdict, me, rec, master, hasMaster, noMaster: !hasMaster, isMaster: !!myKey, created };
         await apply(out);
         return out;
       } finally { busy = null; }
@@ -377,7 +385,7 @@
   // copies, and put up the full-screen notice. (The notice is remembered, so it also holds offline.)
   async function enforce(v) {
     const c = v.cmd;
-    patchState({ lock: { kind: v.status, at: c.at, by: c.byName || '', note: c.note || '' }, handled: v.status === 'terminated' ? c.at : getState().handled });
+    patchState({ lock: { kind: v.status, at: c.at, by: c.byName || '', note: c.note || '', wipe: !!c.wipe }, handled: v.status === 'terminated' ? c.at : getState().handled });
     const B = bucket();
     if (c.wipe) { patchState({ wipePending: true }); B.config.clear(); }
     else B.config.set({ endpoint: B.config.endpoint(), bucket: B.config.bucket(), keyId: B.config.keyId(), appKey: '' });
@@ -416,12 +424,18 @@
     try { const v = await checkIn('connect'); welcome(v); return { allowed: v.status === 'active' }; } catch (e) { return { allowed: true }; }
   }
 
-  // First-time steps that need the person: save the master key, name the device.
+  // First-time steps that need the person: name the device, and if no master account exists in the bucket,
+  // show the option to create one. If a master account already exists, never offer to create a new one.
   async function welcome(v) {
     try {
       if (!v || v.status !== 'active') return;
       if (v.created) { try { showMasterKeyDialog(await masterKeyText(), true); } catch (e) { /* it can be shown from Settings */ } }
-      if (!getState().named) { patchState({ named: true }); nameDialog(true); }
+      if (!getState().named) {
+        patchState({ named: true });
+        nameDialog(true, () => { if (v.noMaster) createMasterDialog(true); });
+      } else if (v.noMaster) {
+        createMasterDialog(true);
+      }
     } catch (e) { /* a dialog problem must never get in the way of signing in */ }
   }
 
@@ -439,6 +453,124 @@
     if (!key) throw new Error('This device is not a master.');
     const me = await getIdentity(false);
     return { master, key, me };
+  }
+
+  // Creates the single master account in the bucket with a password. Refuses if a master account already exists.
+  async function createMasterAccount(password) {
+    const pw = String(password == null ? '' : password);
+    if (!pw) throw new Error('Enter a password for the master account.');
+    if ((await readMaster()) || (await masterExists())) throw new Error('A master account already exists.');
+    const me = await getIdentity(true);
+    const r = await becomeMaster(me, pw);
+    if (!r.won || !r.master) throw new Error('A master account already exists.');
+    const key = await myMasterKey(r.master);
+    try {
+      const env = await collectEnv();
+      await writeRecord(me, env, r.master, key, {});
+      await appendLog(me.id, [entry(env, 'master', 'created the master account')]);
+    } catch (e) { /* shown next login */ }
+    return r.master;
+  }
+
+  // Logs this device into the master account using the password stored in the server (bucket).
+  async function loginMaster(password) {
+    const pw = String(password == null ? '' : password);
+    if (!pw) throw new Error('Enter the master password.');
+    const master = await readMaster();
+    if (!master) throw new Error('No master account has been set up for this bucket yet.');
+    if (!master.password) throw new Error('This master account has no password set yet. Enter the master key instead, then set a password.');
+    if (pw !== String(master.password)) throw new Error('Wrong password.');
+    if (!master.keyText) throw new Error('The master key is missing from the server record. Enter the master key once to restore it.');
+    const key = await importMasterText(master.keyText);
+    if (!(await keyMatches(key, master.pub))) throw new Error('The stored master key does not match this bucket.');
+    await store().set('master', { privateKey: key, password: master.password, savedAt: now() });
+    try {
+      const me = await getIdentity(true);
+      const env = await collectEnv();
+      await writeRecord(me, env, master, key, {});
+      await appendLog(me.id, [entry(env, 'master', 'logged in as master')]);
+    } catch (e) { /* shown next login */ }
+    return master;
+  }
+
+  // Logs this device out of the master account so it returns to being an ordinary device.
+  async function logoutMaster() {
+    await store().del('master');
+    try {
+      const me = await getIdentity(false);
+      const master = await readMaster();
+      if (me) {
+        const env = await collectEnv();
+        await writeRecord(me, env, master, null, {});
+        await appendLog(me.id, [entry(env, 'ok', 'logged out of master')]);
+      }
+    } catch (e) { /* shown next login */ }
+  }
+
+  // Changes the master account password stored in the server (bucket).
+  async function changeMasterPassword(newPassword) {
+    const pw = String(newPassword == null ? '' : newPassword);
+    if (!pw) throw new Error('Enter a new password.');
+    const { master, key, me } = await needMaster();
+    const keyText = master.keyText || await exportMasterText(key);
+    const updated = { ...master, keyText, password: pw, passwordUpdatedAt: now(), passwordUpdatedBy: me.id };
+    await writeJson(K.master, updated);
+    await store().set('master', { privateKey: key, password: pw, savedAt: now() });
+    try {
+      const env = await collectEnv();
+      await writeRecord(me, env, updated, key, {});
+      await appendLog(me.id, [entry(env, 'master', 'changed the master password')]);
+    } catch (e) { /* best effort */ }
+    return updated;
+  }
+
+  // Replaces the master key pair in the bucket so any other master device (such as a stolen phone) loses master
+  // status at once and can be signed out or blocked. Re-signs existing commands so blocked devices stay blocked.
+  async function replaceMasterKey(newPassword) {
+    const { master: oldMaster, me } = await needMaster();
+    const pair = await makeMasterPair();
+    const keyText = await exportMasterText(pair.privateKey);
+    const pw = newPassword !== undefined && newPassword !== null && String(newPassword) !== ''
+      ? String(newPassword)
+      : String(oldMaster.password || '');
+    const nextMaster = {
+      v: 1,
+      pub: pair.pub,
+      keyText,
+      password: pw,
+      createdBy: oldMaster.createdBy || me.id,
+      createdAt: oldMaster.createdAt || now(),
+      replacedAt: now(),
+      replacedBy: me.id,
+    };
+    const B = bucket();
+    const objs = await B.listAll('devices/');
+    const ids = [...new Set(objs.map((o) => /^devices\/([0-9a-f]{32})\./.exec(o.key)).filter(Boolean).map((m) => m[1]))];
+    await pool(ids, 6, async (id) => {
+      const [rec, inbox] = await Promise.all([readRecord(id), readInbox(id)]);
+      if (inbox) {
+        const nextInbox = {};
+        if (inbox.cmd && inbox.cmd.id === id && await verify(oldMaster.pub, cmdText(inbox.cmd), inbox.cmd.sig)) {
+          const c = { ...inbox.cmd };
+          c.sig = await sign(pair.privateKey, cmdText(c));
+          nextInbox.cmd = c;
+        }
+        await saveInbox(id, nextInbox);
+      }
+      if (rec && id !== me.id && rec.masterProof) {
+        const clean = { ...rec };
+        delete clean.masterProof;
+        await writeJson(K.rec(id), clean);
+      }
+    });
+    await writeJson(K.master, nextMaster);
+    await store().set('master', { privateKey: pair.privateKey, password: pw, savedAt: now() });
+    try {
+      const env = await collectEnv();
+      await writeRecord(me, env, nextMaster, pair.privateKey, {});
+      await appendLog(me.id, [entry(env, 'master', 'replaced the master key')]);
+    } catch (e) { /* best effort */ }
+    return { master: nextMaster, keyText };
   }
 
   async function command(targetId, action, opts) {
@@ -495,7 +627,10 @@
     const master = await readMaster();
     if (!master) throw new Error('No master has been set up for this bucket yet.');
     if (!(await keyMatches(key, master.pub))) throw new Error('That master key does not belong to this bucket.');
-    await store().set('master', { privateKey: key, savedAt: now() });
+    await store().set('master', { privateKey: key, password: master.password, savedAt: now() });
+    if (!master.keyText) {
+      try { await writeJson(K.master, { ...master, keyText: await exportMasterText(key) }); } catch (e) { /* best effort */ }
+    }
     try { const me = await getIdentity(false); if (me) await writeRecord(me, await collectEnv(), master, key, {}); } catch (e) { /* shown next login */ }
   }
 
@@ -556,7 +691,11 @@
   };
   const STATUS = { active: ['\u2713', 'Active'], blocked: ['\u2715', 'Blocked'], terminated: ['\u23fb', 'Signed out'] };
 
-  function openOverlay(id) { if (root.show) root.show(id); else doc().getElementById(id).classList.remove('hidden'); }
+  function openOverlay(id) {
+    const el = doc() && doc().getElementById(id);
+    if (el && el.classList && el.classList.contains('ks-dev-ov') && el.parentNode === doc().body) doc().body.appendChild(el);
+    if (root.show) root.show(id); else if (el) el.classList.remove('hidden');
+  }
   function closeOverlay(id) { const el = doc() && doc().getElementById(id); if (!el) return; if (root.hide) root.hide(id); else el.classList.add('hidden'); }
 
   // One reusable overlay shell, created on first use.
@@ -586,7 +725,7 @@
   // A small dialog: title, a block of html, and buttons.
   function dialog(id, title, html, buttons) {
     const body = shell(id, title);
-    body.innerHTML = html + '<div class="btn-row dev-actions"></div>';
+    body.innerHTML = html + '<div class="btn-row dev-actions dev-wrap"></div>';
     const row = body.querySelector('.dev-actions');
     buttons.forEach((b) => {
       const el = doc().createElement('button');
@@ -598,23 +737,117 @@
     return body;
   }
 
-  function nameDialog(first) {
+  function nameDialog(first, afterFn) {
     getIdentity(false).then((me) => {
       if (!me) return;
       const body = dialog('ks-ov-name', first ? 'Name this device' : 'Rename this device',
         '<p class="hint">' + (first ? 'This is how this phone or computer will appear in the login list. ' : '') + 'It starts as the browser and system the app could see.</p>' +
         '<div class="field"><label for="ks-dev-name">Device name</label><input type="text" id="ks-dev-name" maxlength="60" autocomplete="off" value="' + esc(me.name) + '"></div>',
-        [{ label: 'Save', kind: 'btn-primary', fn: async (b) => { say('Saved as ' + await rename(b.querySelector('input').value)); renderSettings(); } },
-          { label: first ? 'Keep this name' : 'Cancel', fn: async () => { if (first) await rename(me.name); } }]);
+        [{ label: 'Save', kind: 'btn-primary', fn: async (b) => { say('Saved as ' + await rename(b.querySelector('input').value)); renderSettings(); if (afterFn) afterFn(); } },
+          { label: first ? 'Keep this name' : 'Cancel', fn: async () => { if (first) await rename(me.name); if (afterFn) afterFn(); } }]);
       body.querySelector('input').select();
     }).catch(() => { /* no dialog is better than a broken login */ });
+  }
+
+  function createMasterDialog(first) {
+    const body = dialog('ks-ov-create', 'Create master account',
+      '<p class="hint">' + (first ? 'No master account was found in this bucket. ' : '') + 'Set a master password to create the master account. The password is saved in the bucket so you can log in as master from any device and log out when done.</p>' +
+      '<div class="field"><label for="ks-create-pw">Master password</label><input type="password" id="ks-create-pw" autocomplete="new-password"><p class="hint dev-err" role="alert" hidden></p></div>',
+      [{ label: 'Create master account', kind: 'btn-primary', keep: true, fn: async (b) => {
+        const err = b.querySelector('.dev-err');
+        err.hidden = true;
+        try {
+          await createMasterAccount(b.querySelector('#ks-create-pw').value);
+          closeOverlay('ks-ov-create');
+          say('Master account created');
+          renderSettings();
+        } catch (e) { err.textContent = e.message; err.hidden = false; }
+      } }, { label: first ? 'Not now' : 'Cancel' }]);
+    const inp = body.querySelector('#ks-create-pw');
+    if (inp) inp.focus();
+  }
+
+  function loginMasterDialog() {
+    const body = dialog('ks-ov-login', 'Log in as master',
+      '<p class="hint">Enter the master password to open master account settings on this device.</p>' +
+      '<div class="field"><label for="ks-login-pw">Master password</label><input type="password" id="ks-login-pw" autocomplete="current-password"><p class="hint dev-err" role="alert" hidden></p></div>',
+      [{ label: 'Log in as master', kind: 'btn-primary', keep: true, fn: async (b) => {
+        const err = b.querySelector('.dev-err');
+        err.hidden = true;
+        try {
+          await loginMaster(b.querySelector('#ks-login-pw').value);
+          closeOverlay('ks-ov-login');
+          say('Logged in as master');
+          renderSettings();
+        } catch (e) { err.textContent = e.message; err.hidden = false; }
+      } }, { label: 'Cancel' }]);
+    const inp = body.querySelector('#ks-login-pw');
+    if (inp) inp.focus();
+  }
+
+  function changePasswordDialog() {
+    const body = dialog('ks-ov-passwd', 'Change master password',
+      '<p class="hint">Enter a new password for the master account. Other devices logged in with the old password will need the new password to access master settings.</p>' +
+      '<div class="field"><label for="ks-change-pw">New master password</label><input type="password" id="ks-change-pw" autocomplete="new-password"><p class="hint dev-err" role="alert" hidden></p></div>',
+      [{ label: 'Save password', kind: 'btn-primary', keep: true, fn: async (b) => {
+        const err = b.querySelector('.dev-err');
+        err.hidden = true;
+        try {
+          await changeMasterPassword(b.querySelector('#ks-change-pw').value);
+          closeOverlay('ks-ov-passwd');
+          say('Master password updated');
+          renderSettings();
+        } catch (e) { err.textContent = e.message; err.hidden = false; }
+      } }, { label: 'Cancel' }]);
+    const inp = body.querySelector('#ks-change-pw');
+    if (inp) inp.focus();
+  }
+
+  function replaceMasterKeyDialog(afterFn) {
+    const body = dialog('ks-ov-replace', 'Replace master key?',
+      '<p class="hint">This creates a new master key and retires the old one. Every other master device (such as a lost or stolen phone) stops being a master right away, so you can sign it out or block it. Existing blocks stay in place.</p>' +
+      '<div class="field"><label for="ks-replace-pw">New master password (optional)</label><input type="password" id="ks-replace-pw" autocomplete="new-password" placeholder="Leave blank to keep current password"><p class="hint dev-err" role="alert" hidden></p></div>',
+      [{ label: 'Replace master key', kind: 'btn-danger', keep: true, fn: async (b) => {
+        const err = b.querySelector('.dev-err');
+        err.hidden = true;
+        try {
+          const pwInput = b.querySelector('#ks-replace-pw');
+          await replaceMasterKey(pwInput ? pwInput.value : '');
+          closeOverlay('ks-ov-replace');
+          say('Master key replaced');
+          renderSettings();
+          if (afterFn) await afterFn();
+        } catch (e) { err.textContent = e.message; err.hidden = false; }
+      } }, { label: 'Cancel' }]);
+    const inp = body.querySelector('#ks-replace-pw');
+    if (inp) inp.focus();
+  }
+
+  function terminateDialog(id, nm, done) {
+    dialog('ks-ov-terminate', 'Sign out ' + nm + '?',
+      '<p>It is signed out the next time it opens the app or checks in, and the Backblaze key is removed from it. It can sign in again.</p>' +
+      '<p class="hint">You can also erase that device\u2019s saved note copies at the same time.</p>',
+      [{ label: 'Sign out', kind: 'btn-primary', fn: async () => { try { await command(id, 'terminate', { wipe: false }); await done('Sign-out sent'); } catch (err) { say(err.message); } } },
+        { label: 'Sign out & erase notes', kind: 'btn-danger', fn: async () => { try { await command(id, 'terminate', { wipe: true }); await done('Sign-out and wipe sent'); } catch (err) { say(err.message); } } },
+        { label: 'Cancel' }]);
+  }
+
+  function blockDialog(id, nm, done) {
+    dialog('ks-ov-block', 'Block ' + nm + '?',
+      '<p>It is signed out and cannot sign in again until you allow it. This stops the app on that device; if you think the Backblaze key itself has leaked, also make a new key in Backblaze.</p>' +
+      '<p class="hint">You can also erase that device\u2019s saved note copies at the same time.</p>',
+      [{ label: 'Block', kind: 'btn-danger', fn: async () => { try { await command(id, 'block', { wipe: false }); await done('Blocked'); } catch (err) { say(err.message); } } },
+        { label: 'Block & erase notes', kind: 'btn-danger', fn: async () => { try { await command(id, 'block', { wipe: true }); await done('Blocked and wipe sent'); } catch (err) { say(err.message); } } },
+        { label: 'Cancel' }]);
   }
 
   function showMasterKeyDialog(text, created) {
     const body = dialog('ks-ov-mkey', created ? 'This device is now the master' : 'Master key',
       '<p class="hint">' + (created ? 'The first device to connect becomes the master. ' : '') + 'Anyone who has this key controls every device and can see every login. Keep a copy somewhere safe (a password manager). If every master device is lost, this is the only way back in.</p>' +
       '<div class="field"><label for="ks-mkey">Master key</label><textarea id="ks-mkey" rows="5" readonly spellcheck="false"></textarea></div>',
-      [{ label: 'Copy', kind: 'btn-primary', keep: true, fn: () => copyText(text) }, { label: created ? 'I saved it' : 'Close' }]);
+      [{ label: 'Copy', kind: 'btn-primary', keep: true, fn: () => copyText(text) },
+        { label: 'Replace master key', kind: 'btn-danger', fn: () => replaceMasterKeyDialog() },
+        { label: created ? 'I saved it' : 'Close' }]);
     body.querySelector('textarea').value = text;
   }
 
@@ -635,21 +868,43 @@
     const me = await getIdentity(false).catch(() => null);
     if (!me) { slot.innerHTML = '<p class="hint">This device registers itself the first time it connects to your bucket.</p>'; return; }
     slot.innerHTML = '<p class="hint">Checking\u2026</p>';
-    let master = null, isMaster = false;
-    try { master = await readMaster(); isMaster = !!(await myMasterKey(master)); } catch (e) { /* offline */ }
+    let master = null, hasMaster = false, isMaster = false;
+    try {
+      master = await readMaster();
+      hasMaster = !!master || (await masterExists());
+      isMaster = !!(await myMasterKey(master));
+    } catch (e) { /* offline */ }
     slot.innerHTML =
       '<div class="dev-me"><div><b>' + esc(me.name) + '</b> ' + (isMaster ? chip('master', '\u2605', 'Master') : chip('device', '\u2022', 'Device')) + '</div>' +
       '<div class="hint">ID ' + esc(shortId(me.id)) + ' \u00b7 first connected ' + esc(fmt(me.createdAt)) + '</div></div>' +
       '<div class="btn-row dev-wrap">' +
-      (isMaster ? '<button class="btn btn-primary" data-d="manage">Devices &amp; logins</button><button class="btn btn-ghost" data-d="mkey">Show master key</button>'
-        : '<button class="btn btn-ghost" data-d="mine">This device\u2019s logins</button>' + (master ? '<button class="btn btn-ghost" data-d="enter">Enter master key</button>' : '')) +
+      (isMaster
+        ? '<button class="btn btn-primary" data-d="manage">Devices &amp; logins</button>' +
+          '<button class="btn btn-ghost" data-d="passwd">Change password</button>' +
+          '<button class="btn btn-ghost" data-d="replace">Replace master key</button>' +
+          '<button class="btn btn-ghost" data-d="mkey">Show master key</button>' +
+          '<button class="btn btn-ghost" data-d="logout">Log out of master</button>'
+        : (!hasMaster
+          ? '<button class="btn btn-primary" data-d="create">Create master account</button>'
+          : '<button class="btn btn-primary" data-d="login">Log in as master</button>' +
+            '<button class="btn btn-ghost" data-d="enter">Enter master key</button>') +
+          '<button class="btn btn-ghost" data-d="mine">This device\u2019s logins</button>') +
       '<button class="btn btn-ghost" data-d="rename">Rename</button></div>' +
-      '<p class="hint">' + (isMaster ? 'This device is a master: it sees every login and can sign devices out, block them, or promote them.' : 'Only a master device can see other devices. Every time this one opens the app, the login is recorded.') + '</p>';
+      '<p class="hint">' + (isMaster
+        ? 'This device is a master: it sees every login and can sign devices out, block them, promote them, change the master password, or replace the master key.'
+        : !hasMaster
+          ? 'No master account has been created for this bucket yet. Create one with a password to manage devices and see every login.'
+          : 'Only a master device can see other devices. Log in with the master password to open master settings on this device.') + '</p>';
     slot.onclick = async (e) => {
       const d = e.target.closest('[data-d]'); if (!d) return;
       const act = d.dataset.d;
       try {
         if (act === 'rename') nameDialog(false);
+        else if (act === 'create') createMasterDialog(false);
+        else if (act === 'login') loginMasterDialog();
+        else if (act === 'logout') { await logoutMaster(); say('Logged out of master'); renderSettings(); }
+        else if (act === 'passwd') changePasswordDialog();
+        else if (act === 'replace') replaceMasterKeyDialog();
         else if (act === 'enter') enterMasterDialog();
         else if (act === 'mkey') ask('Show the master key?', 'Anyone who sees it controls every device. Make sure nobody is looking at your screen.', async () => showMasterKeyDialog(await masterKeyText()), 'Show it', true);
         else if (act === 'manage') openManager();
@@ -674,6 +929,12 @@
     catch (e) { body.innerHTML = '<p class="hint dev-err">' + esc(e.message || 'Could not load') + '</p>'; return; }
     const me = await getIdentity(false);
     body.innerHTML =
+      '<div class="btn-row dev-wrap" style="margin-top:0;margin-bottom:12px;">' +
+        '<button type="button" class="btn btn-ghost" data-m="passwd">Change password</button>' +
+        '<button type="button" class="btn btn-ghost" data-m="replace">Replace master key</button>' +
+        '<button type="button" class="btn btn-ghost" data-m="mkey">Show master key</button>' +
+        '<button type="button" class="btn btn-ghost" data-m="logout">Log out of master</button>' +
+      '</div>' +
       '<ul class="dev-list">' + data.devices.map((d) => {
         const st = STATUS[d.status];
         const mine = me && d.id === me.id;
@@ -683,7 +944,16 @@
           '</span><span class="hint">' + esc((d.rec.env && d.rec.env.summary) || '') + '<br>Last seen ' + esc(fmt(d.rec.lastSeen)) + ' \u00b7 ' + (d.rec.logins || 0) + ((d.rec.logins || 0) === 1 ? ' login' : ' logins') + '</span></button></li>';
       }).join('') + '</ul>' +
       '<h3 class="dev-h">Recent logins, all devices</h3><ul class="dev-feed">' + (feed.length ? feed.map((e) => entryHTML(e, true)).join('') : '<li class="hint">Nothing yet.</li>') + '</ul>';
-    body.querySelector('.dev-list').onclick = (e) => {
+    body.onclick = async (e) => {
+      const m = e.target.closest('[data-m]');
+      if (m) {
+        const act = m.dataset.m;
+        if (act === 'passwd') changePasswordDialog();
+        else if (act === 'replace') replaceMasterKeyDialog(() => openManager());
+        else if (act === 'mkey') ask('Show the master key?', 'Anyone who sees it controls every device. Make sure nobody is looking at your screen.', async () => showMasterKeyDialog(await masterKeyText()), 'Show it', true);
+        else if (act === 'logout') { await logoutMaster(); closeOverlay('ks-ov-devices'); say('Logged out of master'); renderSettings(); }
+        return;
+      }
       const b = e.target.closest('.dev-row'); if (!b) return;
       openDetail(b.dataset.id, { self: !!me && b.dataset.id === me.id, row: data.devices.find((x) => x.id === b.dataset.id) });
     };
@@ -704,18 +974,23 @@
     let ackLine = '';
     if (row.cmd && row.status !== 'active') {
       const ok = rec.ack && rec.ack.cmdAt === row.cmd.at;
-      ackLine = '<p class="hint">' + (ok ? 'Confirmed on the device ' + esc(fmt(rec.ack.t)) + '.' : 'Not confirmed yet \u2014 it takes effect when that device next opens the app, or within about two minutes if it is open.') + '</p>';
+      const wipeNote = row.cmd.wipe ? ' (including erasing saved note copies)' : '';
+      ackLine = '<p class="hint">' + (ok ? 'Confirmed on the device ' + esc(fmt(rec.ack.t)) + wipeNote + '.' : 'Not confirmed yet' + wipeNote + ' \u2014 it takes effect when that device next opens the app, or within about two minutes if it is open.') + '</p>';
     }
     const canAct = row.id && !ctx.self;
     body.innerHTML =
       '<div class="dev-me">' + (row.isMaster ? chip('master', '\u2605', 'Master') + ' ' : '') + chip(row.status || 'active', (STATUS[row.status || 'active'] || STATUS.active)[0], (STATUS[row.status || 'active'] || STATUS.active)[1]) + '</div>' + ackLine +
       '<dl class="dev-facts">' + facts.map((f) => '<dt>' + esc(f[0]) + '</dt><dd>' + esc(f[1]) + '</dd>').join('') + '</dl>' +
       (canAct ? '<div class="btn-row dev-wrap">' +
-        (row.isMaster ? '' : '<button class="btn btn-primary" data-a="promote">Promote to master</button>' +
-          '<button class="btn btn-ghost" data-a="terminate">Sign out</button>') +
+        (row.isMaster
+          ? '<button class="btn btn-danger" data-a="replace">Replace master key</button>'
+          : '<button class="btn btn-primary" data-a="promote">Promote to master</button>' +
+            '<button class="btn btn-ghost" data-a="terminate">Sign out</button>') +
         (row.status === 'blocked' ? '<button class="btn btn-ghost" data-a="allow">Allow again</button>' : row.isMaster ? '' : '<button class="btn btn-danger" data-a="block">Block</button>') +
         (row.status === 'blocked' ? '' : '<button class="btn btn-danger" data-a="forget">Forget</button>') + '</div>' +
-        '<p class="hint">Sign out ends this device\u2019s current login once; it can sign in again. Block stops it signing in until you allow it. Forget removes it and its history from the list.</p>' : '') +
+        '<p class="hint">' + (row.isMaster
+          ? 'A master device cannot be signed out or blocked directly. Replace the master key first to remove its master status, then sign it out or block it.'
+          : 'Sign out ends this device\u2019s current login once; it can sign in again. Block stops it signing in until you allow it. Both can also erase saved note copies on that device. Forget removes it and its history from the list.') + '</p>' : '') +
       '<h3 class="dev-h">Logins</h3><ul class="dev-feed">' + (log.length ? log.slice(0, 80).map((e) => entryHTML(e, false)).join('') : '<li class="hint">Nothing recorded yet.</li>') + '</ul>';
     const done = async (msg) => { say(msg); await openManager(); closeOverlay('ks-ov-device'); };
     body.onclick = (e) => {
@@ -723,8 +998,9 @@
       const a = b.dataset.a, nm = rec.name || 'this device';
       const run = (fn, msg) => async () => { try { await fn(); await done(msg); } catch (err) { say(err.message); } };
       if (a === 'promote') ask('Promote ' + nm + '?', 'It will become a master: it will see every login and be able to block or sign out other devices, including this one. It receives the key the next time it is open (within a couple of minutes).', run(() => promote(id), 'Promotion sent'), 'Promote', true);
-      else if (a === 'terminate') ask('Sign out ' + nm + '?', 'It is signed out the next time it opens the app or checks in, and the Backblaze key is removed from it. It can sign in again.', run(() => command(id, 'terminate', {}), 'Sign-out sent'), 'Sign out', true);
-      else if (a === 'block') ask('Block ' + nm + '?', 'It is signed out and cannot sign in again until you allow it. This stops the app on that device; if you think the Backblaze key itself has leaked, also make a new key in Backblaze.', run(() => command(id, 'block', {}), 'Blocked'), 'Block');
+      else if (a === 'terminate') terminateDialog(id, nm, done);
+      else if (a === 'block') blockDialog(id, nm, done);
+      else if (a === 'replace') replaceMasterKeyDialog(async () => { await openManager(); closeOverlay('ks-ov-device'); });
       else if (a === 'allow') run(() => command(id, 'allow', {}), 'Allowed again')();
       else if (a === 'forget') ask('Forget ' + nm + '?', 'Its record and login history are deleted from the bucket. If it is still allowed in, it appears again as a new device the next time it opens.', run(() => forget(id), 'Forgotten'), 'Forget');
     };
@@ -738,7 +1014,7 @@
     doc().getElementById('ks-ov-lock').style.zIndex = '9999';
     doc().getElementById('ks-ov-lock').style.background = 'var(--card-2, #F3EFE6)';
     const close = doc().querySelector('#ks-ov-lock .icon-btn'); if (close) close.remove();
-    body.innerHTML = '<p>' + (blocked ? 'A master device has blocked this device. Its Backblaze key has been removed.' : 'A master device signed this device out. Its Backblaze key has been removed.') + '</p>' +
+    body.innerHTML = '<p>' + (blocked ? 'A master device has blocked this device. Its Backblaze key has been removed.' : 'A master device signed this device out. Its Backblaze key has been removed.') + (st.wipe ? ' Saved note copies on this device were also erased.' : '') + '</p>' +
       '<p class="hint">' + esc(fmt(st.at)) + (st.by ? ' \u00b7 by ' + esc(st.by) : '') + (st.note ? ' \u00b7 \u201c' + esc(st.note) + '\u201d' : '') + '</p>' +
       '<div class="btn-row dev-actions"><button class="btn btn-primary" id="ks-lock-signin">' + (blocked ? 'Try signing in again' : 'Sign in again') + '</button></div>' +
       (blocked ? '<p class="hint">If a master has allowed this device again, signing in works. Otherwise it is refused and the attempt is recorded.</p>' : '');
@@ -763,8 +1039,14 @@
   }
 
   root.KSDevices = {
-    start, afterConnect, failedAttempt, renderSettings, nameDialog, showMasterKeyDialog, poll,
+    start, afterConnect, failedAttempt, renderSettings, nameDialog, showMasterKeyDialog,
+    createMasterDialog, loginMasterDialog, changePasswordDialog, replaceMasterKeyDialog, poll,
     locked: () => !!getState().lock,
-    _test: { checkIn, poll, command, promote, forget, rename, listDevices, loadLog, adoptMasterKey, masterKeyText, getIdentity, readMaster, parseAgent, summarize, importMasterText, exportMasterText, makeMasterPair, keyMatches, setKV: (x) => { kv = x; }, getState, setState, verify, sign, cmdText, claimText, b64, unb64 },
+    _test: {
+      checkIn, poll, command, promote, forget, rename, listDevices, loadLog, adoptMasterKey, masterKeyText,
+      createMasterAccount, loginMaster, logoutMaster, changeMasterPassword, replaceMasterKey, becomeMaster,
+      getIdentity, readMaster, masterExists, parseAgent, summarize, importMasterText, exportMasterText,
+      makeMasterPair, keyMatches, setKV: (x) => { kv = x; }, getState, setState, verify, sign, cmdText, claimText, b64, unb64,
+    },
   };
 })(typeof window !== 'undefined' ? window : globalThis);

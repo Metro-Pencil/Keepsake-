@@ -6,6 +6,20 @@ All notable changes to this project are recorded here, following
 small — gets a version bump. If the version number hasn't moved,
 nothing changed; that's the whole point of keeping one.
 
+## v1.13.0 — 2026-11-09
+
+- **Master account password stored in the bucket.** When the app opens and connects, it searches for a master
+  account in `devices/_master.json`. If none exists yet, it shows the option to **Create master account** with a
+  password; once a master account exists, no new ones can be created. Any device can **Log in as master** using
+  that password alone, manage devices, **Change password**, and **Log out of master** when done.
+- **Wipe button in Sign-out and Block dialogs.** Signing out or blocking a device now includes **Sign out & erase
+  notes** and **Block & erase notes** buttons to also erase that device's locally saved note copies (`keepsake-drafts`
+  and `keepsake-media`).
+- **Replace master key.** Added **Replace master key** (in Settings, Devices & logins, the Master key dialog, and
+  on another master device's detail screen). Replacing the master key generates a new signing key pair, re-signs
+  existing device blocks so blocked devices stay blocked, and immediately strips master status from any other
+  master device (such as a lost or stolen phone) so it can be signed out or blocked. Service worker cache v23.
+
 ## v1.12.0 — 2026-10-16
 
 - **The application key is visible again.** Settings fills in the saved key (masked, with the eye icon to

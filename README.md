@@ -139,19 +139,27 @@ time zone, network type, app version. Failed attempts on a device (wrong key, CO
 on the device and logged with its next successful login. The IP address is not recorded: with no server in
 between, the app cannot see it.
 
-**The master key.** The first device to connect creates it and shows it once, with a Copy button. A device that
-holds it is a *master*. **Settings -> Devices & logins** on a master shows every device with its status, system
-and last login, the recent logins of all devices, and one device's full history (two months at a time). From
-there a master can:
+**The master account and master key.** When the app opens, it checks whether a master account exists in
+`devices/_master.json`. If there is no record of a master account yet, it shows the option to **Create master
+account** with a password stored in the bucket; once a master account exists, new ones cannot be created. Any
+device can tap **Log in as master** and enter that password to open master settings, do master actions, **Change
+password**, or **Log out of master** when done. **Settings -> Devices & logins** on a master shows every device
+with its status, system and last login, the recent logins of all devices, and one device's full history (two
+months at a time). From there a master can:
 
 - **Sign out** a device: its Backblaze key is removed the next time it opens the app or checks in (about every
-  two minutes while open). It can sign in again by typing the key.
+  two minutes while open). It can sign in again by typing the key. The dialog also has a **Sign out & erase notes**
+  button to erase that device's saved copies of notes.
 - **Block** a device: the same, and it is refused every time it signs in until you **Allow** it again. Refused
-  attempts show in its history. Block and Sign out can also erase that device's saved copies of notes.
+  attempts show in its history. The dialog also has a **Block & erase notes** button to erase that device's saved
+  copies of notes.
+- **Replace master key**: creates a new master key and retires the old one (while keeping existing blocks in place).
+  Every other master device (such as a stolen phone) immediately stops being a master, so you can sign it out or
+  block it. You can also set a new master password at the same time.
 - **Promote** a device to master: the master key is encrypted to that device's own key and left for it in the
   bucket; only that device can open it, and it becomes a master within a couple of minutes. A master can't be
-  blocked or signed out by another master (it could undo it). **Show master key** displays the key for a backup;
-  **Enter master key** on another device makes it a master too.
+  blocked or signed out by another master until you replace the master key. **Show master key** displays the key
+  for a backup; **Enter master key** on another device makes it a master too.
 - **Forget** a device: removes its record and history (not allowed while it is blocked).
 
 Every command is signed with the master key and checked by the device that receives it, so an ordinary device
