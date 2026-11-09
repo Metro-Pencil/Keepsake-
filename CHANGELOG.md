@@ -6,6 +6,30 @@ All notable changes to this project are recorded here, following
 small — gets a version bump. If the version number hasn't moved,
 nothing changed; that's the whole point of keeping one.
 
+## v1.12.0 — 2026-10-16
+
+- **The application key is visible again.** Settings fills in the saved key (masked, with the eye icon to
+  reveal it) and it can be copied. Undoes the hiding done in 1.8.0. The old Cloudflare access token field
+  keeps its no-copy rule.
+- **Every login is recorded.** Each time the app opens, or Save and test succeeds, a login entry is written to
+  the bucket (`devices/`): time, browser and version, system and version, model, installed app or browser tab,
+  screen, language, time zone, network, app version. Failed attempts (wrong key, CORS, offline) are kept on
+  the device and logged with its next successful login. A reload within two minutes is not logged twice.
+- **Each device has its own key, made by the app.** The first connection makes an RSA key pair (private half
+  non-extractable, in IndexedDB), a device id, and a name you can change (it starts as "Chrome on Android").
+- **A master key and a master view.** The first device to connect becomes master and is shown the master key once.
+  Settings -> Devices & logins (master only) lists every device, its status and its logins, and can **Sign out**,
+  **Block**, **Allow** and **Forget** a device, and **Promote** one to master (the master key is encrypted to the
+  other device's key, so only it can open it). Commands are signed with the master key and verified by the
+  device; a master can't be blocked by another master. Show master key / Enter master key give a backup and a
+  second way to make a device master.
+- **Enforcement.** A signed-out or blocked device has its Backblaze key removed, shows a full-screen notice
+  (which survives a reload and works offline), and optionally has its saved note copies erased. Open apps ask
+  every two minutes. A blocked device that tries to sign in again is refused and the attempt is logged.
+- **Limits, stated plainly:** with no server this is enforced by the app on each device, so it can't stop a
+  copied Backblaze key used elsewhere (make a new key in Backblaze for that), and IP addresses are not visible.
+  New file `devices.js`; service worker cache v22; `devices/` added to the bucket layout in the README.
+
 ## v1.11.0 — 2026-10-16
 
 Merges two builds of the video feature (1.10.0 and a separately-made 1.10.1), keeping the stronger design of

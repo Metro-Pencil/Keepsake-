@@ -18,7 +18,7 @@ point — it's meant to slow down impulse, not defend against an attacker.
 ## What's in this repo
 
 ```
-index.html, app.js, b2.js, media.js, video.js, player.js, migrate.js, manifest.json, sw.js,
+index.html, app.js, b2.js, media.js, video.js, player.js, migrate.js, devices.js, manifest.json, sw.js,
 icon-192.png, icon-512.png, cors.json
 ```
 
@@ -62,7 +62,8 @@ static host.
 Open the site, tap the gear icon and fill in **Endpoint**, **Bucket name**, **Key ID** and
 **Application key**, then **Save and test**. The test tells you apart the usual problems: a
 wrong key, a wrong bucket, a bucket that isn't allowing this site (CORS), or no connection.
-The four values are stored only in that browser. **Anyone who has the application key can
+The four values are stored only in that browser, and the key is shown again in Settings (tap the eye).
+**Anyone who has the application key can
 read and delete everything in the bucket**, so keep it private and use a key limited to this
 one bucket.
 
@@ -76,6 +77,7 @@ media/{id}/{file}  that note's photos, audio and video (encrypted first if the n
 ```
 
 - Don't put other files under those four prefixes.
+- `devices/` holds the device registry (see **Devices and logins**). It is small: one record and a few log files per device.
 - A video is stored as many small files, not one: see **Videos** below.
 - Photos and audio are separate files (up to about 90 MB each, about 150 MB per note including
   the written part).
@@ -126,6 +128,41 @@ deleted from the bucket the next time that note is saved after an hour. Progress
 of the screen with the file size and a percentage. Audio takes as long as the clip plays and needs
 the note to stay open; leaving the note stops it. The app has no video support, so there is nothing
 to compress there.
+
+## Devices and logins
+
+Every browser or installed copy of Keepsake is a *device*. The first time one connects it makes its own key
+pair (stored on that device, the private half not readable) and registers itself under `devices/` in the
+bucket. Each time the app opens, or **Save and test** succeeds, a login entry is written: time, browser and
+version, system and version, model (where the browser says), installed-app or browser tab, screen, language,
+time zone, network type, app version. Failed attempts on a device (wrong key, CORS, no connection) are kept
+on the device and logged with its next successful login. The IP address is not recorded: with no server in
+between, the app cannot see it.
+
+**The master key.** The first device to connect creates it and shows it once, with a Copy button. A device that
+holds it is a *master*. **Settings -> Devices & logins** on a master shows every device with its status, system
+and last login, the recent logins of all devices, and one device's full history (two months at a time). From
+there a master can:
+
+- **Sign out** a device: its Backblaze key is removed the next time it opens the app or checks in (about every
+  two minutes while open). It can sign in again by typing the key.
+- **Block** a device: the same, and it is refused every time it signs in until you **Allow** it again. Refused
+  attempts show in its history. Block and Sign out can also erase that device's saved copies of notes.
+- **Promote** a device to master: the master key is encrypted to that device's own key and left for it in the
+  bucket; only that device can open it, and it becomes a master within a couple of minutes. A master can't be
+  blocked or signed out by another master (it could undo it). **Show master key** displays the key for a backup;
+  **Enter master key** on another device makes it a master too.
+- **Forget** a device: removes its record and history (not allowed while it is blocked).
+
+Every command is signed with the master key and checked by the device that receives it, so an ordinary device
+can't block anyone or make itself a master; an unsigned command shows up in the list as ignored.
+
+**What this can and can't do.** There is no server, so every device still holds the Backblaze application key and
+the check is made by Keepsake itself on that device. Sign out and Block stop the app on a device that is running
+Keepsake. They can't stop someone who has copied the Backblaze key out and uses it with other software, or a
+device that is never opened or never online again. If a device is lost or a key may have leaked, also create a
+new application key in Backblaze and delete the old one: that is the only real cut-off. If every master device
+and the master key are lost, delete the `devices/` folder in Backblaze; the next device to connect becomes the master.
 
 ## The time lock and clocks
 

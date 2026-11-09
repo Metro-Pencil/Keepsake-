@@ -595,6 +595,32 @@
     margin-bottom: 6px;
   }
 
+
+  /* ---------- Devices & logins ---------- */
+  .dev-me { margin: 0 0 10px; }
+  .dev-actions { margin-top: 16px; }
+  .dev-wrap { flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+  .dev-chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 999px; font-size: 0.75rem; font-weight: 600; line-height: 1.5; background: var(--card-2); color: var(--ink); border: 1px solid var(--line-strong, var(--line)); white-space: nowrap; }
+  .dev-chip[data-kind="master"], .dev-chip[data-kind="active"], .dev-chip[data-kind="ok"] { background: #E4EDE9; color: var(--pine); border-color: var(--pine); }
+  .dev-chip[data-kind="blocked"], .dev-chip[data-kind="failed"] { background: #F5E7E7; color: var(--brick); border-color: var(--brick); }
+  .dev-chip[data-kind="terminated"], .dev-chip[data-kind="signed-out"], .dev-chip[data-kind="wait"] { background: var(--amber-bg); color: var(--amber); border-color: var(--amber); }
+  .dev-list, .dev-feed { list-style: none; margin: 0; padding: 0; }
+  .dev-list li + li { margin-top: 8px; }
+  .dev-row { display: flex; flex-direction: column; gap: 4px; width: 100%; min-height: 44px; padding: 10px 12px; text-align: left; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--card); color: var(--ink); cursor: pointer; }
+  .dev-row:hover { background: var(--card-2); }
+  .dev-row-main { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
+  .dev-h { margin: 18px 0 8px; font-family: var(--font-display); font-size: 1rem; }
+  .dev-ev { padding: 8px 0; border-top: 1px solid var(--line); }
+  .dev-ev-top { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 4px 8px; }
+  .dev-ev time { font-size: 0.8125rem; color: var(--ink-soft); }
+  .dev-ev .hint { margin-top: 2px; overflow-wrap: anywhere; }
+  .dev-facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; margin: 10px 0; font-size: 0.8125rem; }
+  .dev-facts dt { color: var(--ink-soft); }
+  .dev-facts dd { margin: 0; overflow-wrap: anywhere; }
+  .dev-err { color: var(--brick); }
+  .ks-dev-ov textarea { width: 100%; box-sizing: border-box; font: 0.75rem/1.4 ui-monospace, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+  .dev-chip, .dev-row { -webkit-tap-highlight-color: transparent; }
+
   /* ---------- Modals ---------- */
 
   .overlay {
@@ -2198,8 +2224,8 @@
       </div>
       <div class="field">
         <label for="settings-b2-appkey">Application key</label>
-        <input type="password" id="settings-b2-appkey" autocomplete="off" autocapitalize="off" spellcheck="false" data-secret="1">
-        <p class="hint">Stored only in this browser. Anyone who has this key can read and delete everything in the bucket. Once saved it is never shown or copyable again; leave this blank to keep it.</p>
+        <input type="password" id="settings-b2-appkey" autocomplete="off" autocapitalize="off" spellcheck="false">
+        <p class="hint">Stored only in this browser. Tap the eye to see it. Anyone who has this key can read and delete everything in the bucket.</p>
       </div>
       <p class="hint" id="settings-clock"></p>
       <p class="hint">In Backblaze, set the bucket’s <b>Lifecycle</b> to “Keep only the last version of the file”. Otherwise every save keeps the old copy too, and deleted notes and photos stay in your storage.</p>
@@ -2207,6 +2233,11 @@
       <button class="btn btn-primary" id="btn-save-settings">Save and test</button>
 
       <div id="migrate-slot"></div>
+
+      <section class="settings-section" aria-labelledby="devices-heading">
+        <h3 id="devices-heading">Devices &amp; logins</h3>
+        <div id="devices-slot"></div>
+      </section>
 
       <section class="settings-section" aria-labelledby="media-heading">
         <h3 id="media-heading">Compressed quality</h3>
@@ -2399,13 +2430,14 @@
 <script>
 // Bump this on EVERY change to the app, no matter how small — a typo fix,
 // a copy tweak, whatever. See CHANGELOG.md for the policy and history.
-window.KEEPSAKE_VERSION = "1.11.0";
+window.KEEPSAKE_VERSION = "1.12.0";
 </script>
 <script src="b2.js"></script>
 <script src="media.js"></script>
 <script src="video.js"></script>
 <script src="player.js"></script>
 <script src="migrate.js"></script>
+<script src="devices.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

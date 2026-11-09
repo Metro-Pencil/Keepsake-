@@ -953,9 +953,8 @@ function applyViewportFix() {
   });
 }
 
-// Fields marked data-secret (the application key, the old access token) are for typing a secret in,
-// never for getting it back out: no copy, no cut, no drag, no context menu. (They are also never filled
-// with the saved value - see openSettings.)
+// Fields marked data-secret (now only the old Cloudflare access token) are for typing a secret in,
+// never for getting it back out: no copy, no cut, no drag, no context menu.
 function setupSecretFields() {
   const isSecret = (t) => !!(t && t.closest && t.closest('[data-secret]'));
   const block = (e) => {
@@ -3545,6 +3544,7 @@ const FORCE_REFRESH_SHELL_FILES = [
   './video.js',
   './player.js',
   './migrate.js',
+  './devices.js',
   './manifest.json',
   './icon-192.png',
   './icon-512.png',
@@ -3555,17 +3555,15 @@ function openSettings() {
   document.getElementById('settings-b2-endpoint').value = c.endpoint();
   document.getElementById('settings-b2-bucket').value = c.bucket();
   document.getElementById('settings-b2-keyid').value = c.keyId();
-  // The saved key is never written back into the field: nothing to reveal, select or copy. Leaving
-  // the field blank keeps the key that is already saved.
-  const keyField = document.getElementById('settings-b2-appkey');
-  keyField.value = '';
-  keyField.placeholder = c.appKey() ? 'Saved on this device \u2014 type a new key to replace it' : '';
+  // The saved key is shown again (masked, with the eye icon to reveal it).
+  document.getElementById('settings-b2-appkey').value = c.appKey();
   setB2Status('', '');
   fillClockLine();
-  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.11.0';
+  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.12.0';
   fillQualitySettings();
   show('overlay-settings');
   renderStorageSection();
+  if (window.KSDevices) KSDevices.renderSettings();
 }
 
 // How far this phone's clock is from Backblaze's (used for time-locked notes).
@@ -3646,12 +3644,15 @@ async function saveSettings() {
   try { result = await KSB2.testConnection(); } finally { setBusy(btn, false); }
   if (!result.ok) {
     // Saved, but not closed: the message below says what to fix.
+    if (window.KSDevices) KSDevices.failedAttempt(result.kind); // logged with the next login that gets through
     setB2Status(result.message, 'bad');
     return;
   }
-  document.getElementById('settings-b2-appkey').value = '';
   setB2Status('Connected to your bucket.', 'ok');
+  // Register this login (devices.js). A blocked device is refused here and sees its own notice.
+  const dev = window.KSDevices ? await KSDevices.afterConnect() : { allowed: true };
   hide('overlay-settings');
+  if (!dev.allowed) return;
   refreshNotes();
 }
 
@@ -5954,7 +5955,7 @@ function init() {
   setupRichText();
   setupMedia();
   setupInk();
-  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.11.0');
+  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.12.0');
 
   // Connectivity: react the moment the browser notices, and keep retrying
   // on a timer since navigator.onLine can't see a connection that's up but
@@ -5971,13 +5972,21 @@ function init() {
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden' && editorOpen()) triggerAutosave(); });
   window.addEventListener('pagehide', () => { if (editorOpen()) triggerAutosave(); });
 
-  if (!Config.configured()) {
+  if (window.KSDevices && KSDevices.locked()) {
+    // This device was blocked or signed out by a master: devices.js shows the notice. Nothing is loaded.
+  } else if (!Config.configured()) {
     openSettings();
     toast('Add your Backblaze bucket details to get started');
   } else {
-    // Data left waiting by an earlier session? Say so straight away, with the counts.
-    showUnsyncedSummary().catch(() => {});
-    refreshNotes().then(checkForRecoverableDrafts).then(sweepVideoOrphans);
+    // Who is this device, and is it still allowed in? (devices.js) A slow or missing connection never
+    // keeps the notes from opening; a remembered block does.
+    const openNotes = () => {
+      // Data left waiting by an earlier session? Say so straight away, with the counts.
+      showUnsyncedSummary().catch(() => {});
+      refreshNotes().then(checkForRecoverableDrafts).then(sweepVideoOrphans);
+    };
+    if (window.KSDevices) KSDevices.start().then((r) => { if (r.allowed) openNotes(); });
+    else openNotes();
   }
 
   if ('serviceWorker' in navigator) {

@@ -3,7 +3,7 @@
 // changed and re-fetches the shell — otherwise installed PWAs can get
 // stuck on an old cached version forever. See the "Force refresh" button
 // in Settings for a manual way out of that if a deploy forgets to.
-const CACHE_NAME = 'keepsake-shell-v21';
+const CACHE_NAME = 'keepsake-shell-v22';
 const SHELL_FILES = [
   './',
   './index.html',
@@ -13,6 +13,7 @@ const SHELL_FILES = [
   './video.js',
   './player.js',
   './migrate.js',
+  './devices.js',
   './manifest.json',
   './icon-192.png',
   './icon-512.png',
