@@ -252,7 +252,7 @@
     const o = opts || {};
     const payloadHash = o.payloadHash || (o.body ? await sha256Hex(o.body) : EMPTY_SHA);
     const req = await prepare(method, key, o.query, payloadHash);
-    const init = { method, headers: req.headers };
+    const init = { method, headers: o.headers ? { ...req.headers, ...o.headers } : req.headers };
     if (o.body !== undefined) init.body = o.body;
     let res;
     try { res = await root.fetch(req.url, init); } catch (e) { throw networkError(); }
@@ -323,6 +323,16 @@
   async function getBytes(key) {
     const res = await s3ok('GET', key);
     try { return new Uint8Array(await res.arrayBuffer()); } catch (e) { throw networkError(); }
+  }
+
+  // One slice of an object: bytes start..end (inclusive). { bytes, partial } - partial is false if the server
+  // ignored the range and sent the whole object. null if the object does not exist. (A single byte range is a
+  // CORS-safelisted header, so it needs no change to the bucket's CORS rule.)
+  async function getRange(key, start, end) {
+    const res = await s3('GET', key, { headers: { Range: 'bytes=' + start + '-' + end } });
+    if (res.status === 404) return null;
+    if (!res.ok) throw await errorFromResponse(res);
+    try { return { bytes: new Uint8Array(await res.arrayBuffer()), partial: res.status === 206 }; } catch (e) { throw networkError(); }
   }
 
   async function getText(key) { return dec.decode(await getBytes(key)); }
@@ -643,7 +653,7 @@
     clock,
     testConnection,
     // storage primitives (also used by media.js)
-    getBytes, getBytesOrNull, getText, putBytes, putText, deleteObject, listAll, sha256Hex, objectSize, verifyStored,
+    getBytes, getBytesOrNull, getRange, getText, putBytes, putText, deleteObject, listAll, sha256Hex, objectSize, verifyStored,
     // notes
     listNotes, getNote, saveNote, deleteNote, getVault, exportNote,
     // media

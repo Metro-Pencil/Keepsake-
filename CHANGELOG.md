@@ -6,6 +6,27 @@ All notable changes to this project are recorded here, following
 small — gets a version bump. If the version number hasn't moved,
 nothing changed; that's the whole point of keeping one.
 
+## v1.14.0 — 2026-11-10
+
+- **Sync all data offline** (Settings -> Offline copy, shown while this device is logged in as master). Downloads every
+  note's text and every photo, audio clip and video part to the device, one file at a time. Files over 8 MB come in
+  4 MB slices, each saved as it arrives, so if the app closes mid-sync it carries on from the last saved slice when it
+  opens again (also when the connection returns or the app comes back to the screen). Finished notes are remembered, so
+  a restart skips them and only fetches what changed. The synced files are "pinned": the usual size caps never drop
+  them. It pauses by itself if the master login ends, and the browser is asked to keep the data. A confirmation shows
+  the size and free space first. If the bucket's CORS rule refuses range requests it falls back to whole files.
+- **Delete offline data** (same place): removes everything saved on the device for offline use - the full copy, the
+  ordinary cached photos, audio and video, and the saved text of every note - and stops the sync. The note list stays,
+  your notes in the bucket are untouched, and edits or uploads still waiting to be sent are kept. Nothing is quietly
+  refilled until the app is next opened.
+- **Two-step confirmation on the buttons that can't be taken back:** Block, Sign out with "erase saved notes" ticked,
+  Forget, Replace master key and Delete offline data now ask a second time, naming what is about to happen; cancelling
+  either card does nothing.
+- While a full sync is on, the app's ordinary background download of photos and audio steps aside so the sync can
+  bring them in resumable pieces.
+- Wiping a device (Sign out / Block with erase) also removes its offline copy and sync settings.
+- Service worker cache v24. New file: offline.js.
+
 ## v1.13.0 — 2026-11-10
 
 - **The master account is now a password kept in the bucket.** Any device can log in as master with that

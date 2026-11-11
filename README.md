@@ -18,7 +18,7 @@ point — it's meant to slow down impulse, not defend against an attacker.
 ## What's in this repo
 
 ```
-index.html, app.js, b2.js, media.js, video.js, player.js, migrate.js, devices.js, manifest.json, sw.js,
+index.html, app.js, b2.js, media.js, video.js, player.js, migrate.js, devices.js, offline.js, manifest.json, sw.js,
 icon-192.png, icon-512.png, cors.json
 ```
 
@@ -163,6 +163,15 @@ login, the recent logins of all devices, and one device's full history (two mont
 Every command is signed with the master key and checked by the device that receives it, so an ordinary device
 can't block anyone; an unsigned command shows up in the list as ignored. A master account made by 1.12 has no password
 yet: on a device that is already master, Settings offers *Set a master password*.
+
+**A full offline copy.** Normally the app keeps note text and some recent photos and audio on the device. A device
+logged in as master can also choose *Sync all data offline* (Settings -> Offline copy) to keep **everything**: all
+note text, photos, audio and videos. It downloads one file at a time (big files in 4 MB slices that are saved as they
+arrive), so closing the app mid-way costs at most one slice: it carries on where it stopped the next time the app
+opens. Synced files are never dropped by the usual size limits. It needs free space (the confirmation shows the total)
+and uses mobile data off Wi-Fi. *Delete offline data* removes everything saved for offline use on that device, and
+asks twice; your notes in the bucket and any edits not yet uploaded are not touched. The same double check guards
+Block, Sign out with erase, Forget and Replace master key.
 
 **What this can and can't do.** There is no server, so every device still holds the Backblaze application key and
 the check is made by Keepsake itself on that device. Sign out and Block stop the app on a device that is running

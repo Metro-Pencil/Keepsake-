@@ -33,7 +33,7 @@
   // doesn't list them yet, so a save of an older version must not clean them up as strays.
   const heldBases = new Set();
   const DB_NAME = 'keepsake-media';
-  const INFO = 'info';   // light: { id, noteId, name, size, used, pending, kind, sha }
+  const INFO = 'info';   // light: { id, noteId, name, size, used, pending, kind, sha, pinned }  (pinned = part of the master's full offline copy: never evicted)
   const BLOB = 'blob';   // heavy: { id, bytes }
 
   /* ------------------------------------------------------------------ helpers */
@@ -193,7 +193,9 @@
     const size = blobIn ? bytes.size : bytes.length;
     let sha = x.sha || '';
     if (!sha && pending) sha = await sha256Hex(blobIn ? new Uint8Array(await blobBytes(bytes)) : bytes);
+    const prev = await req(INFO, 'get', id).catch(() => null);
     const info = { id, noteId, name, size, used: Date.now(), pending: !!pending, kind: x.kind || '', sha };
+    if (x.pinned || (prev && prev.pinned)) info.pinned = true;
     const write = (value) => run([INFO, BLOB], 'readwrite', (tx) => {
       tx.objectStore(BLOB).put({ id, bytes: value });
       tx.objectStore(INFO).put(info);
@@ -254,7 +256,7 @@
   // Keeps this device's copies under the cap by dropping the ones used longest ago.
   // Files still waiting to upload are never dropped.
   async function evict() {
-    const all = (await req(INFO, 'getAll')) || [];
+    const all = ((await req(INFO, 'getAll')) || []).filter((i) => !i.pinned);   // the full offline copy is outside the caps
     // Photos/audio and video parts have a cap each, so a few big videos never push the photos out.
     const trim = (items, cap) => {
       let total = items.reduce((n, i) => n + i.size, 0);
@@ -273,7 +275,20 @@
 
   async function cacheBytesUsed() {
     const all = (await req(INFO, 'getAll')) || [];
-    return all.filter((i) => i.kind !== 'video').reduce((n, i) => n + i.size, 0);
+    return all.filter((i) => i.kind !== 'video' && !i.pinned).reduce((n, i) => n + i.size, 0);
+  }
+
+  // The master's full offline copy: pinned files are never dropped to make room.
+  async function pin(noteId, name) {
+    const info = await infoGet(noteId, name);
+    if (info && !info.pinned) await run(INFO, 'readwrite', (tx) => { tx.objectStore(INFO).put({ ...info, pinned: true }); });
+  }
+  async function allInfo() { return (await req(INFO, 'getAll')) || []; }
+  // Everything saved here for offline use, pinned or not, except files still waiting to upload.
+  async function deleteSynced() {
+    const gone = (await allInfo()).filter((i) => !i.pending);
+    for (let i = 0; i < gone.length; i += 200) await cacheDelete(gone.slice(i, i + 200));
+    return gone.length;
   }
 
   /* ------------------------------------------------------------ talking to the bucket */
@@ -776,7 +791,7 @@
     hold(base) { heldBases.add(base); }, release(base) { heldBases.delete(base); },
     // What video.js builds on: the local store of parts and the plumbing around it.
     store: {
-      cachePut, cacheGet, cacheGetBlob, infoGet, infoForNote, markSynced, cacheDelete, blobBytes,
+      cachePut, cacheGet, cacheGetBlob, infoGet, infoForNote, markSynced, cacheDelete, blobBytes, pin, allInfo, deleteSynced,
       sha256Hex, randomName, genKeyB64, importKey, encryptBytes, decryptBytes, downloadBytes, list, b64ToBytes,
     },
     _test: { setCap(n) { cacheCap = n; }, resetMemory() { indexes.clear(); noteKeys.clear(); }, parseDataURL, bytesToDataUrl, cachePut, cacheGet, infoGet, infoForNote, evict, indexes, noteKeys },

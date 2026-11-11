@@ -52,6 +52,8 @@
   function lsSet(k, v) { try { root.localStorage.setItem(k, v); } catch (e) { /* private mode */ } }
   function lsJson(k, d) { try { return JSON.parse(lsGet(k)) || d; } catch (e) { return d; } }
   const getState = () => lsJson(LS.state, {});
+  // Tells the rest of the app (the offline sync) that this device became, or stopped being, a master.
+  const masterChanged = () => { try { root.dispatchEvent(new root.CustomEvent('ks-master-changed')); } catch (e) { /* UI only */ } };
   const setState = (s) => lsSet(LS.state, JSON.stringify(s));
   const patchState = (p) => { const s = { ...getState(), ...p }; setState(s); return s; };
 
@@ -295,6 +297,7 @@
   async function startSession(me, master, key, detail) {
     await store().set('master', { privateKey: key, savedAt: now() });
     patchState({ masterSession: true });
+    masterChanged();
     try {
       const env = await collectEnv();
       await writeRecord(me, env, master, key, {});
@@ -334,6 +337,7 @@
     const me = await getIdentity(false);
     await store().del('master');
     patchState({ masterSession: false });
+    masterChanged();
     if (!me) return;
     try {
       const env = await collectEnv();
@@ -440,7 +444,7 @@
         const hasMaster = !!master || await masterExists();       // the app never makes a master by itself: it only looks
         const myKey = await myMasterKey(master);
         const lost = !myKey && !!getState().masterSession;        // was logged in as master, and the key no longer matches
-        if (lost) patchState({ masterSession: false });
+        if (lost) { patchState({ masterSession: false }); masterChanged(); }
         const inbox = await readInbox(me.id);
         const verdict = await judge(me, master, inbox);
 
@@ -474,7 +478,7 @@
       const lost = !myKey && !!getState().masterSession;
       const verdict = await judge(me, master, inbox);
       if (verdict.status !== 'active' || lost) {
-        if (lost) patchState({ masterSession: false });
+        if (lost) { patchState({ masterSession: false }); masterChanged(); }
         const env = await collectEnv();
         const rec = await writeRecord(me, env, master, myKey, { ack: verdict.status !== 'active' ? { kind: verdict.status, cmdAt: verdict.cmd.at, t: now() } : null });
         const logs = [];
@@ -504,6 +508,7 @@
     const c = v.cmd;
     patchState({ lock: { kind: v.status, at: c.at, by: c.byName || '', note: c.note || '', wiped: !!c.wipe }, handled: v.status === 'terminated' ? c.at : getState().handled, masterSession: false });
     try { await store().del('master'); } catch (e) { /* the key is useless without the Backblaze key anyway */ }
+    masterChanged();
     const B = bucket();
     if (c.wipe) { patchState({ wipePending: true }); B.config.clear(); }
     else B.config.set({ endpoint: B.config.endpoint(), bucket: B.config.bucket(), keyId: B.config.keyId(), appKey: '' });
@@ -514,7 +519,8 @@
   // Local copies are wiped before the app opens its databases, so nothing holds them open.
   function runPendingWipe() {
     if (!getState().wipePending) return;
-    try { root.indexedDB.deleteDatabase('keepsake-drafts'); root.indexedDB.deleteDatabase('keepsake-media'); } catch (e) { /* best effort */ }
+    try { root.indexedDB.deleteDatabase('keepsake-drafts'); root.indexedDB.deleteDatabase('keepsake-media'); root.indexedDB.deleteDatabase('keepsake-offline'); } catch (e) { /* best effort */ }
+    try { root.localStorage.removeItem('ks_offline'); } catch (e) { /* private mode */ }
     patchState({ wipePending: false });
   }
 
@@ -617,6 +623,7 @@
     if (!(await keyMatches(key, master.pub))) throw new Error('That master key does not belong to this bucket.');
     await store().set('master', { privateKey: key, savedAt: now() });
     patchState({ masterSession: true });
+    masterChanged();
     try { const me = await getIdentity(false); if (me) await writeRecord(me, await collectEnv(), master, key, {}); } catch (e) { /* shown next login */ }
   }
 
@@ -696,6 +703,8 @@
   function chip(kind, icon, label) { return '<span class="dev-chip" data-kind="' + kind + '"><span aria-hidden="true">' + icon + '</span> ' + esc(label) + '</span>'; }
   const say = (m) => { if (root.toast) root.toast(m); };
   const ask = (t, m, fn, label, calm) => (root.openConfirm ? root.openConfirm(t, m, fn, label, calm) : fn());
+  // The buttons that cut a device off, erase things or end every master login ask twice.
+  const askTwice = (t, m, t2, m2, fn, label, label2, calm) => (root.openConfirmTwice ? root.openConfirmTwice(t, m, t2, m2, fn, label, label2, calm) : fn());
 
   async function copyText(text) {
     try { await root.navigator.clipboard.writeText(text); say('Copied'); } catch (e) { say('Could not copy - select the text and copy it by hand'); }
@@ -838,7 +847,7 @@
         else if (act === 'create') createMasterDialog();
         else if (act === 'login') loginMasterDialog();
         else if (act === 'change') changePasswordDialog();
-        else if (act === 'replace') replaceKeyDialog();
+        else if (act === 'replace') askTwice('Replace the master key?', 'Every device logged in as master, including this one, is logged out. You log in again with the password.', 'Really replace it?', 'Last check: use this for a lost or stolen device. Nothing is deleted, but every master login on every device ends right now.', replaceKeyDialog, 'Continue', 'Yes, replace it');
         else if (act === 'legacy') legacyPasswordDialog();
         else if (act === 'enter') enterMasterDialog();
         else if (act === 'logout') ask('Log out of master?', 'This device goes back to being an ordinary device. Log in again any time with the master password.', async () => { await logoutMaster(); say('Logged out of master'); renderSettings(); }, 'Log out', true);
@@ -920,10 +929,15 @@
       const b = e.target.closest('[data-a]'); if (!b) return;
       const a = b.dataset.a, nm = rec.name || 'this device';
       const run = (fn, msg) => async () => { try { await fn(); await done(msg); } catch (err) { say(err.message); } };
-      if (a === 'terminate') wipeDialog('Sign out ' + nm + '?', 'It is signed out the next time it opens the app or checks in, and the Backblaze key is removed from it. It can sign in again.', 'Sign out', false, (wipe) => run(() => command(id, 'terminate', { wipe }), wipe ? 'Sign-out sent; saved notes will be erased' : 'Sign-out sent')());
-      else if (a === 'block') wipeDialog('Block ' + nm + '?', 'It is signed out and cannot sign in again until you allow it. This stops the app on that device; if you think the Backblaze key itself has leaked, also make a new key in Backblaze.', 'Block', true, (wipe) => run(() => command(id, 'block', { wipe }), wipe ? 'Blocked; saved notes will be erased' : 'Blocked')());
+      if (a === 'terminate') wipeDialog('Sign out ' + nm + '?', 'It is signed out the next time it opens the app or checks in, and the Backblaze key is removed from it. It can sign in again.', 'Sign out', false, (wipe) => {
+        const go = run(() => command(id, 'terminate', { wipe }), wipe ? 'Sign-out sent; saved notes will be erased' : 'Sign-out sent');
+        if (wipe) ask('Erase ' + nm + '\u2019s saved notes?', 'Last check: the notes, photos, audio, video and unsent edits saved on that device will be deleted when it next checks in. This can\u2019t be undone. Your notes in the bucket stay.', go, 'Yes, sign out and erase');
+        else go();
+      });
+      else if (a === 'block') wipeDialog('Block ' + nm + '?', 'It is signed out and cannot sign in again until you allow it. This stops the app on that device; if you think the Backblaze key itself has leaked, also make a new key in Backblaze.', 'Block', true, (wipe) =>
+        ask('Block ' + nm + ' for real?', 'Last check: ' + nm + ' will be refused every time it tries to sign in until you allow it again.' + (wipe ? ' Its saved notes, photos, audio, video and unsent edits will also be erased, which can\u2019t be undone.' : ''), run(() => command(id, 'block', { wipe }), wipe ? 'Blocked; saved notes will be erased' : 'Blocked'), wipe ? 'Yes, block and erase' : 'Yes, block it'));
       else if (a === 'allow') run(() => command(id, 'allow', {}), 'Allowed again')();
-      else if (a === 'forget') ask('Forget ' + nm + '?', 'Its record and login history are deleted from the bucket. If it is still allowed in, it appears again as a new device the next time it opens.', run(() => forget(id), 'Forgotten'), 'Forget');
+      else if (a === 'forget') askTwice('Forget ' + nm + '?', 'Its record and login history are deleted from the bucket. If it is still allowed in, it appears again as a new device the next time it opens.', 'Delete ' + nm + '\u2019s history?', 'Last check: its record and every login ever logged for it are deleted from the bucket. This can\u2019t be undone.', run(() => forget(id), 'Forgotten'), 'Forget', 'Yes, forget it');
     };
   }
 
@@ -962,6 +976,7 @@
   root.KSDevices = {
     start, afterConnect, failedAttempt, renderSettings, nameDialog, poll,
     locked: () => !!getState().lock,
+    isMaster: () => !!getState().masterSession,
     _test: { checkIn, poll, command, forget, rename, listDevices, loadLog, adoptMasterKey, getIdentity, readMaster, parseAgent, summarize, importMasterText, exportMasterText, makeMasterPair, keyMatches, createMaster, loginMaster, logoutMaster, changePassword, replaceMasterKey, setLegacyPassword, setKV: (x) => { kv = x; }, setRaceMs: (n) => { raceMs = n; }, getState, setState, verify, sign, cmdText, claimText, b64, unb64 },
   };
 })(typeof window !== 'undefined' ? window : globalThis);

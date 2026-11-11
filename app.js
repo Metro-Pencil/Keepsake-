@@ -1720,6 +1720,7 @@ async function syncFromServer() {
 // password cached; before that date the server withholds it, so a note
 // whose date passes while you're offline has to wait for a connection.
 async function prefetchOfflineData(metas) {
+  if (window.KSOffline && KSOffline.prefetchHeld()) return; // offline data was just deleted: don't quietly refill it this session
   for (const meta of metas) {
     if (!navigator.onLine) return;
     try {
@@ -1739,7 +1740,8 @@ async function prefetchOfflineData(metas) {
       }
       // Photos and audio kept in Backblaze: bring them along too (while there's room on this
       // device), so the note opens offline like every other.
-      if (meta.mediaSize > 0 && window.KSMedia) await KSMedia.prefetchNote(meta.id, meta.mediaSize);
+      // (While a full offline sync is on, that sync brings the media in small resumable pieces instead.)
+      if (meta.mediaSize > 0 && window.KSMedia && !(window.KSOffline && KSOffline.active())) await KSMedia.prefetchNote(meta.id, meta.mediaSize);
     } catch (e) {
       if (e.isNetworkError) { setOnline(false); return; }
       // Anything else (e.g. one note's content missing server-side) —
@@ -3529,6 +3531,30 @@ function openConfirm(title, message, onYes, yesLabel = 'Delete', calm = false) {
   show('overlay-confirm');
 }
 
+// For the buttons that can't be taken back (or that cut someone off): the first card asks, and a second card
+// asks again, naming what is about to happen, before anything is done. Cancelling either one stops it.
+function openConfirmTwice(title, message, title2, message2, onYes, yesLabel = 'Delete', yesLabel2 = 'Yes, do it', calm = false) {
+  openConfirm(title, message, () => {
+    openConfirm(title2, message2, onYes, yesLabel2, calm);
+  }, yesLabel, calm);
+}
+
+// Offline data on this device: forget the saved text of every note (the list stays), except notes with
+// an edit still waiting to upload. Used by "Delete offline data" (offline.js).
+async function clearCachedNoteContents() {
+  const db = await openKeepsakeDB();
+  const keep = new Set(await getOutboxIds());
+  const puts = [];
+  const dels = [];
+  for (const c of await idbGetAll(db, NOTE_CACHE_STORE)) {
+    if (keep.has(c.id)) continue;
+    dels.push([NOTE_CONTENT_STORE, c.id]);
+    puts.push([NOTE_CACHE_STORE, { ...c, hasContent: false, contentUpdatedAt: undefined, bytes: undefined, vault: undefined, vaultUpdatedAt: undefined }]);
+  }
+  if (puts.length) await idbPutMany(db, puts);
+  if (dels.length) await idbDeleteMany(db, dels);
+}
+
 /* ---------------------------------------------------------------------
  * Settings
  * ------------------------------------------------------------------- */
@@ -3545,6 +3571,7 @@ const FORCE_REFRESH_SHELL_FILES = [
   './player.js',
   './migrate.js',
   './devices.js',
+  './offline.js',
   './manifest.json',
   './icon-192.png',
   './icon-512.png',
@@ -3559,11 +3586,12 @@ function openSettings() {
   document.getElementById('settings-b2-appkey').value = c.appKey();
   setB2Status('', '');
   fillClockLine();
-  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.13.0';
+  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.14.0';
   fillQualitySettings();
   show('overlay-settings');
   renderStorageSection();
   if (window.KSDevices) KSDevices.renderSettings();
+  if (window.KSOffline) KSOffline.renderSettings();
 }
 
 // How far this phone's clock is from Backblaze's (used for time-locked notes).
@@ -5955,7 +5983,7 @@ function init() {
   setupRichText();
   setupMedia();
   setupInk();
-  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.13.0');
+  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.14.0');
 
   // Connectivity: react the moment the browser notices, and keep retrying
   // on a timer since navigator.onLine can't see a connection that's up but
@@ -5984,6 +6012,7 @@ function init() {
       // Data left waiting by an earlier session? Say so straight away, with the counts.
       showUnsyncedSummary().catch(() => {});
       refreshNotes().then(checkForRecoverableDrafts).then(sweepVideoOrphans);
+      if (window.KSOffline) setTimeout(() => KSOffline.resume(), 1500); // a full offline sync that was running carries on
     };
     if (window.KSDevices) KSDevices.start().then((r) => { if (r.allowed) openNotes(); });
     else openNotes();
