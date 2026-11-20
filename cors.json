@@ -3,7 +3,7 @@
     {
       "AllowedOrigins": ["https://YOUR-NAME.github.io"],
       "AllowedMethods": ["GET", "PUT", "DELETE"],
-      "AllowedHeaders": ["*"],
+      "AllowedHeaders": ["authorization", "content-type", "range", "x-amz-content-sha256", "x-amz-date"],
       "ExposeHeaders": ["ETag", "Date"],
       "MaxAgeSeconds": 3600
     }

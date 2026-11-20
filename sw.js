@@ -3,63 +3,73 @@
 // changed and re-fetches the shell — otherwise installed PWAs can get
 // stuck on an old cached version forever. See the "Force refresh" button
 // in Settings for a manual way out of that if a deploy forgets to.
-const CACHE_NAME = 'keepsake-shell-v24';
-const SHELL_FILES = [
+const CACHE_PREFIX = 'keepsake-shell-';
+const CACHE_NAME = CACHE_PREFIX + 'v29';
+const CRITICAL_FILES = [
   './',
   './index.html',
+  './version.js',
   './app.js',
   './b2.js',
   './media.js',
   './video.js',
   './player.js',
-  './migrate.js',
   './devices.js',
   './offline.js',
+];
+const OPTIONAL_FILES = [
   './manifest.json',
   './icon-192.png',
   './icon-512.png',
+  './icon-512-maskable.png',
+  './font-inter-400.woff2',
+  './font-inter-500.woff2',
+  './font-inter-600.woff2',
+  './font-inter-700.woff2',
+  './font-serif-400.woff2',
+  './font-serif-700.woff2',
 ];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) =>
-      Promise.all(SHELL_FILES.map((url) =>
-        // `cache: 'reload'` is the important part here — it bypasses the
-        // browser's own HTTP disk cache, not just this Cache Storage
-        // bucket. A plain fetch() (what cache.addAll() uses internally)
-        // can silently hand back an old, still-"fresh" cached response
-        // with no network request at all, which means a brand new SW
-        // version — even one installed by the "Force refresh" button —
-        // could precache the exact same stale files it was meant to
-        // replace. This forces every shell file to actually come from
-        // the network on every install.
+    caches.open(CACHE_NAME).then(async (cache) => {
+      await Promise.all(CRITICAL_FILES.map(async (url) => {
+        const response = await fetch(url, { cache: 'reload' });
+        if (!response.ok) throw new Error('Failed to cache critical shell file: ' + url);
+        await cache.put(url, response);
+      }));
+      await Promise.all(OPTIONAL_FILES.map((url) =>
         fetch(url, { cache: 'reload' })
           .then((response) => { if (response.ok) return cache.put(url, response); })
-          .catch(() => { /* best-effort — one missing file shouldn't fail install */ })
-      ))
-    )
+          .catch(() => {})
+      ));
+      await self.skipWaiting();
+    })
   );
-  self.skipWaiting();
 });
 
 self.addEventListener('activate', (event) => {
   event.waitUntil(
-    caches.keys().then((keys) =>
-      Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k)))
-    )
+    caches.keys()
+      // Only delete Keepsake's own old caches so sibling apps on the same GitHub Pages origin stay intact.
+      .then((keys) => Promise.all(keys.filter((k) => k.startsWith(CACHE_PREFIX) && k !== CACHE_NAME).map((k) => caches.delete(k))))
+      .then(() => self.clients.claim())
   );
-  self.clients.claim();
 });
 
 self.addEventListener('fetch', (event) => {
+  if (event.request.method !== 'GET') return;
   const url = new URL(event.request.url);
-  // Only ever serve the app shell from cache. Anything cross-origin —
-  // i.e. every call to your Backblaze bucket — always goes straight to the network.
-  // Offline access to *notes* isn't handled here: app.js keeps its own
-  // copy of every note in IndexedDB and reads from that when a request
-  // can't get through.
   if (url.origin !== self.location.origin) return;
   event.respondWith(
-    caches.match(event.request).then((cached) => cached || fetch(event.request))
+    caches.match(event.request, { cacheName: CACHE_NAME }).then((cached) => {
+      if (cached) return cached;
+      if (event.request.mode === 'navigate') {
+        return caches.match(event.request, { cacheName: CACHE_NAME, ignoreSearch: true })
+          .then((navMatch) => navMatch || caches.match('./index.html', { cacheName: CACHE_NAME }))
+          .then((shell) => shell || fetch(event.request));
+      }
+      return fetch(event.request);
+    })
   );
 });

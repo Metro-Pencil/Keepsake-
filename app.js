@@ -8,7 +8,8 @@
  * ------------------------------------------------------------------- */
 
 const SEP = '\u241F'; // unit separator — combines password1 + password2 for time-locked notes
-const PBKDF2_ITERATIONS = 250000;
+const PBKDF2_ITERATIONS = 600000;
+const LEGACY_PBKDF2_ITERATIONS = 250000;
 
 function bytesToB64(bytes) {
   if (bytes.toBase64) return bytes.toBase64(); // native, where the browser has it
@@ -35,7 +36,7 @@ function randomBytes(len) {
 }
 
 // Password 2: a random secret Keepsake generates for time-locked notes.
-// Never shown in the UI — it only travels inside a downloaded note file.
+// Not shown in the normal lock UI; stored in vault/{id}.txt in your bucket and included in exported note files.
 function generateSecondPassword() {
   return bytesToB64(randomBytes(24));
 }
@@ -44,13 +45,13 @@ function combine(password1, password2) {
   return password2 ? password1 + SEP + password2 : password1;
 }
 
-async function deriveKey(passphrase, saltBytes) {
+async function deriveKey(passphrase, saltBytes, iterations = PBKDF2_ITERATIONS) {
   const enc = new TextEncoder();
   const baseKey = await crypto.subtle.importKey(
     'raw', enc.encode(passphrase), 'PBKDF2', false, ['deriveKey']
   );
   return crypto.subtle.deriveKey(
-    { name: 'PBKDF2', salt: saltBytes, iterations: PBKDF2_ITERATIONS, hash: 'SHA-256' },
+    { name: 'PBKDF2', salt: saltBytes, iterations, hash: 'SHA-256' },
     baseKey,
     { name: 'AES-GCM', length: 256 },
     false,
@@ -61,19 +62,27 @@ async function deriveKey(passphrase, saltBytes) {
 async function encryptNote(passphrase, noteObj) {
   const salt = randomBytes(16);
   const iv = randomBytes(12);
-  const key = await deriveKey(passphrase, salt);
+  const key = await deriveKey(passphrase, salt, PBKDF2_ITERATIONS);
   const enc = new TextEncoder();
   const plaintext = enc.encode(JSON.stringify(noteObj));
   const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plaintext);
-  return { salt: bytesToB64(salt), iv: bytesToB64(iv), ciphertext: bytesToB64(new Uint8Array(ciphertext)) };
+  return { v: 2, iter: PBKDF2_ITERATIONS, salt: bytesToB64(salt), iv: bytesToB64(iv), ciphertext: bytesToB64(new Uint8Array(ciphertext)) };
 }
 
 async function decryptNote(passphrase, record) {
+  const iter = Number.isFinite(record.iter) && record.iter > 0 ? record.iter : LEGACY_PBKDF2_ITERATIONS;
   const salt = b64ToBytes(record.salt);
   const iv = b64ToBytes(record.iv);
-  const key = await deriveKey(passphrase, salt);
+  const key = await deriveKey(passphrase, salt, iter);
   const ciphertext = b64ToBytes(record.ciphertext);
-  const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
+  let plaintext;
+  try {
+    plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
+  } catch (e) {
+    const err = new Error('Wrong password.');
+    err.isDecryptError = true;
+    throw err;
+  }
   return JSON.parse(new TextDecoder().decode(plaintext));
 }
 
@@ -94,36 +103,41 @@ const AUDIO_QUALITY = {
   max:      { label: 'Original', bps: 256000, hint: 'Recorded with no mic processing at the highest quality the browser offers. About 2 MB per minute.' },
 };
 
+function safeLsGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+function safeLsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* private mode */ } }
 const Config = {
   configured() { return !!(window.KSB2 && KSB2.config.configured()); },
-  photoQuality() { const v = localStorage.getItem('ks_photoQuality'); return v === 'standard' || v === 'high' ? v : 'high'; },
-  setPhotoQuality(v) { localStorage.setItem('ks_photoQuality', v); },
-  audioQuality() { const v = localStorage.getItem('ks_audioQuality'); return v === 'standard' || v === 'high' ? v : 'high'; },
-  setAudioQuality(v) { localStorage.setItem('ks_audioQuality', v); },
-  videoQuality() { const v = localStorage.getItem('ks_videoQuality'); return v === 'standard' || v === 'high' ? v : 'standard'; },
-  setVideoQuality(v) { localStorage.setItem('ks_videoQuality', v); },
+  photoQuality() { const v = safeLsGet('ks_photoQuality'); return v === 'standard' || v === 'high' ? v : 'high'; },
+  setPhotoQuality(v) { safeLsSet('ks_photoQuality', v); },
+  audioQuality() { const v = safeLsGet('ks_audioQuality'); return v === 'standard' || v === 'high' ? v : 'high'; },
+  setAudioQuality(v) { safeLsSet('ks_audioQuality', v); },
+  videoQuality() { const v = safeLsGet('ks_videoQuality'); return v === 'standard' || v === 'high' ? v : 'standard'; },
+  setVideoQuality(v) { safeLsSet('ks_videoQuality', v); },
   // Backblaze B2's free plan includes 10 GB. Change it in Settings if your plan is different.
-  storageLimitMB() { const n = Number(localStorage.getItem('ks_storageLimitMB')); return n >= 50 ? n : 10000; },
-  setStorageLimitMB(n) { localStorage.setItem('ks_storageLimitMB', String(Math.round(n))); },
+  storageLimitMB() { const n = Number(safeLsGet('ks_storageLimitMB')); return n >= 50 ? n : 10000; },
+  setStorageLimitMB(n) { safeLsSet('ks_storageLimitMB', String(Math.round(n))); },
 };
 
 // Asks the device not to dim and sleep the screen while something long is running (compressing a video, sending
 // its parts). A phone that falls asleep in the middle is what makes big uploads fragile. Best effort: browsers
 // without the Wake Lock API simply carry on, and the upload still resumes from the next part if it is cut.
 const KeepAwake = {
-  lock: null, count: 0,
+  lock: null, count: 0, pending: false,
   async request() {
+    if (this.lock || this.pending || this.count <= 0 || !navigator.wakeLock || document.visibilityState !== 'visible') return;
+    this.pending = true;
     try {
-      if (!this.lock && this.count > 0 && navigator.wakeLock && document.visibilityState === 'visible') {
-        this.lock = await navigator.wakeLock.request('screen');
-        this.lock.addEventListener('release', () => { this.lock = null; });
-      }
+      const sentinel = await navigator.wakeLock.request('screen');
+      if (this.count <= 0) { sentinel.release().catch(() => {}); return; }
+      this.lock = sentinel;
+      sentinel.addEventListener('release', () => { if (this.lock === sentinel) this.lock = null; });
     } catch (e) { /* refused (low battery, say): not essential */ }
+    finally { this.pending = false; }
   },
   acquire() { this.count++; return this.request(); },
   release() {
     this.count = Math.max(0, this.count - 1);
-    if (!this.count && this.lock) { this.lock.release().catch(() => {}); this.lock = null; }
+    if (!this.count && this.lock) { const l = this.lock; this.lock = null; l.release().catch(() => {}); }
   },
 };
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') KeepAwake.request(); });
@@ -300,14 +314,20 @@ function noteSizeBreakdown() {
   return { text, photos, photoCount: photoIds.length, audio, clips, drawing, lockExtra, locked, content, media, total: content + media, videoBytes, videoCount: videoIds.length };
 }
 
-// Cheap fingerprint of a big base64 string (length + 48 sampled characters),
-// so "did the photos/audio change?" doesn't mean comparing megabytes of text.
+// Fast, higher-coverage fingerprint of a large base64 string (length + two FNV-1a hashes
+// across dense strides + head/tail), so edits are reliably detected without copying megabytes.
 function mediaSig(str) {
   str = String(str || '');
-  let sig = str.length + ':';
-  const step = Math.max(1, Math.floor(str.length / 48));
-  for (let i = 0; i < str.length; i += step) sig += str[i];
-  return sig + str.slice(-16);
+  const len = str.length;
+  let h1 = 0x811c9dc5;
+  let h2 = 0x9e3779b1;
+  const step = Math.max(1, Math.floor(len / 512));
+  for (let i = 0; i < len; i += step) {
+    const c = str.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193);
+    h2 = Math.imul(h2 ^ str.charCodeAt(len - 1 - i), 0x01000193);
+  }
+  return `${len}:${(h1 >>> 0).toString(36)}:${(h2 >>> 0).toString(36)}:${str.slice(0, 24)}:${str.slice(-24)}`;
 }
 
 // Identity of a snapshot's photos + audio — what decides "Saving photos…".
@@ -316,8 +336,8 @@ function mediaKey(snapshot) {
   const videos = snapshot.videos || {};
   return JSON.stringify([
     (snapshot.images || []).map(mediaSig),
-    Object.keys(audio).sort().map((id) => id + mediaSig(audio[id].data)),
-    Object.keys(videos).sort().map((id) => id + videos[id].parts.length),
+    Object.keys(audio).sort().map((id) => id + '|' + mediaSig(audio[id].data) + '|' + (audio[id].dur || 0) + '|' + (audio[id].name || '')),
+    Object.keys(videos).sort().map((id) => id + '|' + videos[id].base + '|' + videos[id].parts.length + '|' + (videos[id].enc ? 1 : 0) + '|' + (videos[id].name || '')),
   ]);
 }
 
@@ -331,9 +351,10 @@ function snapshotKey(snapshot) {
   const videos = {};
   for (const id of Object.keys(snapshot.videos || {}).sort()) {
     const v = snapshot.videos[id];
-    videos[id] = v.parts.length + '|' + v.name;
+    videos[id] = `${v.base}|${v.parts.length}|${v.enc ? 1 : 0}|${v.name}`;
   }
-  return JSON.stringify({ ...snapshot, images: (snapshot.images || []).map(mediaSig), audio, videos });
+  const { baseRev, baseUpdatedAt, forceOverwrite, ...contentSnap } = snapshot;
+  return JSON.stringify({ ...contentSnap, images: (snapshot.images || []).map(mediaSig), audio, videos });
 }
 
 // Precise-enough byte size of one compressed photo, straight from its
@@ -518,16 +539,20 @@ async function idbGetAllKeys(db, store) { return (await idbRequest(db, store, 'g
 // a few kilobytes, not the whole note's media.
 const DRAFT_MEDIA_SUFFIX = '#media';
 const draftMediaSigs = new Map(); // note id -> signature of the media last written
+const draftGen = new Map();       // note id -> monotonic generation to prevent save/clear races
 
 async function saveLocalDraft(id, title, body, images, imageIds, html, drawing, audio, videos) {
   if (!id) return;
+  const gen = (draftGen.get(id) || 0) + 1;
+  draftGen.set(id, gen);
   try {
     const db = await openKeepsakeDB();
+    if (draftGen.get(id) !== gen) return;
     const sig = mediaKey({ images, audio, videos });
     const entries = [[DRAFT_STORE, { id, title, body, html, drawing, imageIds, mediaSig: sig, savedAt: Date.now() }]];
     if (draftMediaSigs.get(id) !== sig) entries.push([DRAFT_STORE, { id: id + DRAFT_MEDIA_SUFFIX, images, audio, videos }]);
     await idbPutMany(db, entries); // one transaction: the two records never disagree
-    draftMediaSigs.set(id, sig);
+    if (draftGen.get(id) === gen) draftMediaSigs.set(id, sig);
   } catch (e) {
     // Best-effort only — local caching should never interrupt the editor.
   }
@@ -548,6 +573,7 @@ async function loadLocalDraft(id) {
 
 async function clearLocalDraft(id) {
   if (!id) return;
+  draftGen.set(id, (draftGen.get(id) || 0) + 1);
   draftMediaSigs.delete(id);
   try {
     const db = await openKeepsakeDB();
@@ -589,49 +615,69 @@ function contentMediaBytes(c) {
   return n;
 }
 
+const localMutationTimes = new Map();
+
 async function cacheNote(meta, content, lockedTitle) {
   try {
+    localMutationTimes.set(meta.id, Date.now());
     const db = await openKeepsakeDB();
-    const existing = await idbGet(db, NOTE_CACHE_STORE, meta.id);
     const found = contentMediaBytes(content);
     if (found > 0 && !(meta.mediaSize > 0)) meta = { ...meta, mediaSize: found };
-    const light = {
-      id: meta.id,
-      meta,
-      contentUpdatedAt: meta.updatedAt, // which version of the note the cached content is
-      hasContent: true,
-      bytes: contentStoredBytes(content),
-      lockedTitle: lockedTitle === undefined ? (existing ? existing.lockedTitle : undefined) : lockedTitle,
-      vault: existing ? existing.vault : undefined,
-      vaultUpdatedAt: existing ? existing.vaultUpdatedAt : undefined,
-      cachedAt: Date.now(),
-    };
-    await idbPutMany(db, [[NOTE_CACHE_STORE, light], [NOTE_CONTENT_STORE, { id: meta.id, content }]]);
-  } catch (e) { /* best-effort — a failed cache write just means this one note won't be available offline yet */ }
+    const bytes = contentStoredBytes(content);
+    await idbRun(db, [NOTE_CACHE_STORE, NOTE_CONTENT_STORE], 'readwrite', (tx) => {
+      const metaStore = tx.objectStore(NOTE_CACHE_STORE);
+      const contentStore = tx.objectStore(NOTE_CONTENT_STORE);
+      const r = metaStore.get(meta.id);
+      r.onsuccess = () => {
+        const existing = r.result;
+        metaStore.put({
+          id: meta.id,
+          meta,
+          contentUpdatedAt: meta.updatedAt,
+          hasContent: true,
+          bytes,
+          lockedTitle: lockedTitle === undefined ? (existing ? existing.lockedTitle : undefined) : lockedTitle,
+          vault: existing ? existing.vault : undefined,
+          vaultUpdatedAt: existing ? existing.vaultUpdatedAt : undefined,
+          cachedAt: Date.now(),
+        });
+        contentStore.put({ id: meta.id, content });
+      };
+    });
+  } catch (e) { /* best-effort */ }
 }
 
-// Used when only fresh *metadata* is on hand (the list endpoint doesn't
-// return content). The cached content stays exactly where it is; its
-// contentUpdatedAt is deliberately left alone, so a newer meta.updatedAt
-// shows up as "cached content is out of date" to prefetchOfflineData and to
-// fetchNoteContent.
 async function cacheNoteMetaOnly(meta) {
   try {
     const db = await openKeepsakeDB();
-    const existing = await idbGet(db, NOTE_CACHE_STORE, meta.id);
-    if (existing && JSON.stringify(existing.meta) === JSON.stringify(meta)) return; // nothing new to write
-    await idbPut(db, NOTE_CACHE_STORE, {
-      id: meta.id,
-      meta,
-      contentUpdatedAt: existing ? existing.contentUpdatedAt : undefined,
-      hasContent: !!(existing && existing.hasContent),
-      bytes: existing ? existing.bytes : undefined,
-      lockedTitle: existing ? existing.lockedTitle : undefined,
-      vault: existing ? existing.vault : undefined,
-      vaultUpdatedAt: existing ? existing.vaultUpdatedAt : undefined,
-      cachedAt: Date.now(),
+    let written = false;
+    await idbRun(db, [NOTE_CACHE_STORE], 'readwrite', (tx) => {
+      const metaStore = tx.objectStore(NOTE_CACHE_STORE);
+      const r = metaStore.get(meta.id);
+      r.onsuccess = () => {
+        const existing = r.result;
+        let nextMeta = meta;
+        if (existing && existing.meta && existing.meta.mediaSize > 0 && !(nextMeta.mediaSize > 0) && existing.contentUpdatedAt === nextMeta.updatedAt) {
+          nextMeta = { ...nextMeta, mediaSize: existing.meta.mediaSize };
+        }
+        if (existing && JSON.stringify(existing.meta) === JSON.stringify(nextMeta)) return;
+        written = true;
+        metaStore.put({
+          id: nextMeta.id,
+          meta: nextMeta,
+          contentUpdatedAt: existing ? existing.contentUpdatedAt : undefined,
+          hasContent: !!(existing && existing.hasContent),
+          bytes: existing ? existing.bytes : undefined,
+          lockedTitle: existing ? existing.lockedTitle : undefined,
+          vault: existing ? existing.vault : undefined,
+          vaultUpdatedAt: existing ? existing.vaultUpdatedAt : undefined,
+          cachedAt: Date.now(),
+        });
+      };
     });
+    return written;
   } catch (e) { /* best-effort */ }
+  return false;
 }
 
 // Remembers a locked note's title once it's been seen decrypted on this
@@ -714,8 +760,14 @@ async function removeCachedNote(id) {
 // The list the grid actually renders: every cached note's metadata, flagged
 // _pending when it has a queued-but-not-yet-synced change, with the size we
 // know for it (from the server if it says, else measured from the cached copy).
+// Notes this device may show. A master can switch normal notes, or locked notes, off for a device (devices.js);
+// what the device was told is remembered, so this holds from the first instant of a start and with no connection.
+function accessNow() { return window.KSDevices ? KSDevices.access() : { notes: true, locked: true, known: true }; }
+function noteAllowed(meta) { return !window.KSDevices || KSDevices.allows(meta); }
+
 async function buildNotesCacheFromLocal() {
-  const [cached, outboxIds] = await Promise.all([getAllCachedNotes(), getOutboxIds()]);
+  const [cachedAll, outboxIds] = await Promise.all([getAllCachedNotes(), getOutboxIds()]);
+  const cached = cachedAll.filter((c) => noteAllowed(c.meta));
   const pending = new Set(outboxIds);
   const metas = cached.map((c) => ({
     ...c.meta,
@@ -735,28 +787,38 @@ async function buildNotesCacheFromLocal() {
 // `info` (saves only) = { title, batch } where batch is { fileName: 'photo' | 'audio' } for the
 // photos/audio that were still waiting to upload. It is carried over from an earlier queued save of
 // the same note, so "43 of 100 photos" stays true across edits and across closing the app.
-// Resolves with the queuedAt stamp of the entry it wrote (0 if it could not be written).
+let outboxTokenSeq = 0;
+
+// Resolves with a unique monotonic queuedAt stamp (0 if it could not be written or was blocked by a queued delete).
 async function queueOutbox(id, op, payload, info) {
-  const queuedAt = Date.now();
+  const queuedAt = Date.now() * 1000 + (++outboxTokenSeq % 1000);
+  let blockedByDelete = false;
   try {
     const db = await openKeepsakeDB();
-    let batch = {};
-    if (op === 'save' && info && info.batch) {
-      const prev = await idbGet(db, OUTBOX_STORE, id);
-      const keep = new Set((payload && payload.mediaKeep) || []);
-      if (prev && prev.batch) for (const name of Object.keys(prev.batch)) if (keep.has(name)) batch[name] = prev.batch[name];
-      Object.assign(batch, info.batch);
-    }
+    localMutationTimes.set(id, Date.now());
     await idbRun(db, [OUTBOX_STORE, OUTBOX_PAYLOAD_STORE], 'readwrite', (tx) => {
-      const rec = { id, op, queuedAt };
-      if (op === 'save' && info) { rec.title = String(info.title || '').slice(0, 120); rec.batch = batch; }
-      tx.objectStore(OUTBOX_STORE).put(rec);
+      const outStore = tx.objectStore(OUTBOX_STORE);
       const payloads = tx.objectStore(OUTBOX_PAYLOAD_STORE);
-      if (op === 'save' && payload) payloads.put({ id, payload }); else payloads.delete(id);
+      const r = outStore.get(id);
+      r.onsuccess = () => {
+        const prev = r.result;
+        // Atomic TOCTOU guard: never overwrite a queued 'delete' with a 'save'.
+        if (op === 'save' && prev && prev.op === 'delete') { blockedByDelete = true; return; }
+        let batch = {};
+        if (op === 'save' && info && info.batch) {
+          const keep = new Set((payload && payload.mediaKeep) || []);
+          if (prev && prev.batch) for (const name of Object.keys(prev.batch)) if (keep.has(name)) batch[name] = prev.batch[name];
+          Object.assign(batch, info.batch);
+        }
+        const rec = { id, op, queuedAt };
+        if (op === 'save' && info) { rec.title = String(info.title || '').slice(0, 120); rec.batch = batch; }
+        outStore.put(rec);
+        if (op === 'save' && payload) payloads.put({ id, payload }); else payloads.delete(id);
+      };
     });
   } catch (e) { await refreshOutboxCount(); return 0; }
   await refreshOutboxCount();
-  return queuedAt;
+  return blockedByDelete ? 0 : queuedAt;
 }
 
 async function clearOutbox(id) {
@@ -770,10 +832,25 @@ async function clearOutbox(id) {
 // Clears the entry only if it is still the one this save wrote. A newer edit that replaced it
 // in the meantime stays queued.
 async function clearOutboxIfCurrent(id, queuedAt) {
-  const cur = await getOutboxItem(id);
-  if (cur && queuedAt && cur.queuedAt !== queuedAt) return false;
-  await clearOutbox(id);
-  return true;
+  if (!queuedAt) return false;
+  let cleared = false;
+  try {
+    const db = await openKeepsakeDB();
+    await idbRun(db, [OUTBOX_STORE, OUTBOX_PAYLOAD_STORE], 'readwrite', (tx) => {
+      const outStore = tx.objectStore(OUTBOX_STORE);
+      const payloads = tx.objectStore(OUTBOX_PAYLOAD_STORE);
+      const r = outStore.get(id);
+      r.onsuccess = () => {
+        const cur = r.result;
+        if (cur && cur.queuedAt !== queuedAt) return;
+        outStore.delete(id);
+        payloads.delete(id);
+        cleared = true;
+      };
+    });
+  } catch (e) { return false; }
+  if (cleared) await refreshOutboxCount();
+  return cleared;
 }
 
 async function getOutbox() { // light entries only: { id, op, queuedAt }
@@ -798,11 +875,9 @@ async function getOutboxItem(id) {
 }
 
 async function getOutboxPayload(id) {
-  try {
-    const db = await openKeepsakeDB();
-    const rec = await idbGet(db, OUTBOX_PAYLOAD_STORE, id);
-    return rec ? rec.payload : null;
-  } catch (e) { return null; }
+  const db = await openKeepsakeDB();
+  const rec = await idbGet(db, OUTBOX_PAYLOAD_STORE, id);
+  return rec ? rec.payload : null;
 }
 
 /* ---------------------------------------------------------------------
@@ -847,7 +922,7 @@ function makePreview(body) {
 }
 
 function localDatetimeInputMin() {
-  const d = new Date(Date.now() + 60000);
+  const d = new Date(lockNow() + 60000);
   d.setSeconds(0, 0);
   const pad = (n) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
@@ -862,20 +937,81 @@ function toast(msg) {
   toastTimer = setTimeout(() => el.classList.remove('show'), 2400);
 }
 
+const dialogStack = [];
+const dialogOpeners = new Map();
+const FOCUSABLE_SEL = 'a[href], button:not([disabled]):not([tabindex="-1"]), input:not([disabled]):not([type="hidden"]):not([tabindex="-1"]), select:not([disabled]):not([tabindex="-1"]), textarea:not([disabled]):not([tabindex="-1"]), [tabindex]:not([tabindex="-1"])';
+
+function updateBackgroundInert() {
+  const hasModal = dialogStack.length > 0;
+  const topEl = document.querySelector('header.top');
+  const mainEl = document.querySelector('main');
+  if (topEl) topEl.inert = hasModal;
+  if (mainEl) mainEl.inert = hasModal;
+  const topId = hasModal ? dialogStack[dialogStack.length - 1] : null;
+  for (const id of dialogStack) {
+    const ov = document.getElementById(id);
+    if (ov) ov.inert = id !== topId;
+  }
+}
+
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Tab' || !dialogStack.length) return;
+  const topId = dialogStack[dialogStack.length - 1];
+  const ov = document.getElementById(topId);
+  if (!ov || ov.classList.contains('hidden')) return;
+  const nodes = Array.from(ov.querySelectorAll(FOCUSABLE_SEL)).filter((n) => n.offsetParent !== null);
+  if (!nodes.length) return;
+  const first = nodes[0];
+  const last = nodes[nodes.length - 1];
+  if (e.shiftKey) {
+    if (document.activeElement === first || !ov.contains(document.activeElement)) {
+      e.preventDefault();
+      last.focus();
+    }
+  } else if (document.activeElement === last || !ov.contains(document.activeElement)) {
+    e.preventDefault();
+    first.focus();
+  }
+});
+
 function show(id) {
   const el = document.getElementById(id);
+  if (!el) return;
+  if (document.activeElement && !el.contains(document.activeElement)) {
+    dialogOpeners.set(id, document.activeElement);
+  }
   enhancePasswordInputs(el); // also covers the unlock dialog, whose fields are built fresh each time
   el.classList.remove('hidden');
+  el.inert = false;
+  const idx = dialogStack.indexOf(id);
+  if (idx >= 0) dialogStack.splice(idx, 1);
+  dialogStack.push(id);
+  updateBackgroundInert();
   applyViewportFix();
+  // Move focus inside modal dialogs (skip auto-focusing inputs inside editor so mobile keyboard stays closed)
+  if (id !== 'overlay-editor' && !el.contains(document.activeElement)) {
+    const first = el.querySelector(FOCUSABLE_SEL);
+    if (first && first.focus) { try { first.focus({ preventScroll: true }); } catch (e) {} }
+  }
 }
 function hide(id) {
   const el = document.getElementById(id);
+  if (!el) return;
   el.classList.add('hidden');
+  el.inert = false;
+  const idx = dialogStack.indexOf(id);
+  if (idx >= 0) dialogStack.splice(idx, 1);
+  updateBackgroundInert();
   if (id === 'overlay-record') recorderTeardown();
   if (id === 'overlay-clip') pauseClipPreview();
   if (id === 'overlay-editor') { clearAudioUrls(); clearThumbUrls(); closeVideoPlayer(); stopVideoStatusTimer(); }
   setPasswordsHidden(el); // never leave a password showing behind a closed dialog
   applyViewportFix();
+  const opener = dialogOpeners.get(id);
+  dialogOpeners.delete(id);
+  if (opener && opener.isConnected && !opener.closest('[inert]') && opener.focus) {
+    try { opener.focus({ preventScroll: true }); } catch (e) {}
+  }
 }
 
 /* ---------------------------------------------------------------------
@@ -953,23 +1089,6 @@ function applyViewportFix() {
   });
 }
 
-// Fields marked data-secret (now only the old Cloudflare access token) are for typing a secret in,
-// never for getting it back out: no copy, no cut, no drag, no context menu.
-function setupSecretFields() {
-  const isSecret = (t) => !!(t && t.closest && t.closest('[data-secret]'));
-  const block = (e) => {
-    if (!isSecret(e.target) && !isSecret(document.activeElement)) return;
-    e.preventDefault();
-    if (e.clipboardData) e.clipboardData.setData('text/plain', '');
-  };
-  ['copy', 'cut', 'dragstart', 'contextmenu'].forEach((ev) => document.addEventListener(ev, block, true));
-  document.addEventListener('keydown', (e) => { // Ctrl/Cmd+C, Ctrl/Cmd+X, Ctrl+Insert on a secret field
-    if (!isSecret(e.target)) return;
-    const k = e.key.toLowerCase();
-    if (((e.ctrlKey || e.metaKey) && (k === 'c' || k === 'x')) || (e.ctrlKey && k === 'insert')) e.preventDefault();
-  }, true);
-}
-
 function setupKeyboardViewportFix() {
   if (window.visualViewport) {
     window.visualViewport.addEventListener('resize', applyViewportFix);
@@ -995,14 +1114,21 @@ function setupKeyboardViewportFix() {
  * ------------------------------------------------------------------- */
 
 let syncBarHideTimer = null;
+let syncSrAnnouncedStart = false;
+function announceSync(msg) {
+  const sr = document.getElementById('sync-sr-announce');
+  if (sr && sr.textContent !== msg) sr.textContent = msg;
+}
 
 // `steps` (optional) = one row per kind of thing being sent - photos, audio, note text - each with
 // its own bar; see renderSyncSteps. Left out, the rows are hidden.
 function syncBarSet(label, fraction /* number 0..1, or null for indeterminate */, steps) {
   clearTimeout(syncBarHideTimer);
   const bar = document.getElementById('sync-bar');
+  const wasShown = bar.classList.contains('show');
   bar.classList.remove('error', 'done');
   bar.classList.add('show');
+  if (!wasShown && !syncSrAnnouncedStart) { syncSrAnnouncedStart = true; announceSync('Syncing changes'); }
   renderSyncSteps(steps);
   document.getElementById('sync-bar-label').textContent = label;
   document.getElementById('sync-bar-retry').classList.add('hidden');
@@ -1026,6 +1152,8 @@ function syncBarHideSoon(delay = 1100) {
 function syncBarSuccess(label = 'Saved', steps) {
   syncBarSet(label, 1, steps);
   document.getElementById('sync-bar').classList.add('done'); // finished: stop the spinner
+  syncSrAnnouncedStart = false;
+  announceSync(label);
   syncBarHideSoon(steps ? 2200 : 1100);
 }
 
@@ -1035,6 +1163,8 @@ function syncBarError(label, onRetry) {
   bar.classList.remove('done');
   bar.classList.add('show', 'error');
   document.getElementById('sync-bar-label').textContent = label;
+  syncSrAnnouncedStart = false;
+  announceSync(label);
   const retryBtn = document.getElementById('sync-bar-retry');
   // Rebuilt fresh each time so repeated failures never stack up duplicate
   // click listeners on the same button.
@@ -1254,22 +1384,32 @@ function renderSyncJobs() {
   syncBarSet(jobHeadline(sum), overallFraction(sum), stepsFromSummary(sum));
 }
 
+let pendingSyncBatchError = null;
+
 // A job is over. If it was the last one, close the bar out.
 function syncJobEnd(noteId, outcome /* 'ok' | 'offline' | 'error' */, message, retry) {
   refreshVideoStatus();
   const job = SyncJobs.get(noteId);
   SyncJobs.delete(noteId);
   clearTimeout(syncRenderTimer); syncRenderTimer = 0;
+  if (outcome === 'error') {
+    pendingSyncBatchError = { message: message || 'Couldn\u2019t save \u2014 tap to retry', retry: retry || (() => flushOutbox({ manual: true })) };
+  }
   if (SyncJobs.size) { renderSyncJobs(); return; }
+  if (pendingSyncBatchError) {
+    const err = pendingSyncBatchError;
+    pendingSyncBatchError = null;
+    syncBarError(err.message, err.retry);
+    return;
+  }
   if (outcome === 'ok') {
     if (job) {
       for (const f of Object.values(job.files)) f.done = true;
       job.text = 'done'; job.textFraction = 1; job.current = null;
       syncBarSuccess(Object.keys(job.files).length ? 'Everything uploaded' : 'Saved', stepsFromSummary(summarizeJobs([job])));
     } else syncBarSuccess('Saved');
-  } else if (outcome === 'error') {
-    syncBarError(message || 'Couldn\u2019t save \u2014 tap to retry', retry || (() => flushOutbox()));
   } else {
+    syncSrAnnouncedStart = false;
     syncBarHideSoon(300); // offline: the note is safe on this device; the header pill says what is waiting
   }
 }
@@ -1353,22 +1493,35 @@ const flushErrorSeen = new Map(); // note id -> last error shown, so a retry tim
 // was closed or the connection dropped this carries on from the next unsent file. Stops at the first
 // connection failure (the rest stay queued for next time); a real server error on one note leaves just
 // that note queued and carries on.
-async function flushOutbox() {
+async function flushOutbox(opts) {
+  if (window.KSDevices && KSDevices.locked()) return;
   if (isFlushing || !navigator.onLine) return;
-  const items = (await getOutbox()).sort((a, b) => a.queuedAt - b.queuedAt);
-  if (!items.length) {
-    if (syncSummaryShown) { syncSummaryShown = false; syncBarHideSoon(300); }
-    return;
-  }
+  if (opts && opts.manual) flushErrorSeen.clear();
   isFlushing = true;
   const mine = []; // jobs this flush opened (an editor's own job for the same note is never touched)
   try {
+    const items = (await getOutbox()).sort((a, b) => a.queuedAt - b.queuedAt);
+    if (!items.length) {
+      if (syncSummaryShown) { syncSummaryShown = false; syncBarHideSoon(300); }
+      return;
+    }
     // Register every queued save first, so the bar shows the whole queue as one piece of work.
     for (const item of items) {
       if (item.op !== 'save' || syncStateOf(item.id).inFlight || SyncJobs.has(item.id)) continue;
       await syncJobBegin(item.id, item.title, item.batch || {}, 'flush');
       mine.push(item.id);
     }
+    // Prioritize deletes and text-only saves before heavy media/video uploads so one large video
+    // never blocks quick text edits in other notes.
+    const itemWeight = (it) => {
+      if (it.op === 'delete') return 0;
+      const b = it.batch || {};
+      const kinds = Object.values(b);
+      if (!kinds.length) return 1;
+      if (kinds.includes('video')) return 3;
+      return 2;
+    };
+    items.sort((a, b) => itemWeight(a) - itemWeight(b) || (a.queuedAt || 0) - (b.queuedAt || 0));
     for (const item of items) {
       // A live editor/background save is already handling this note - let it. Marking the note
       // in flight also makes the editor queue any new edit instead of racing this upload.
@@ -1389,25 +1542,32 @@ async function flushOutbox() {
             if (delErr.status !== 404) throw delErr;
           }
         } else {
-          payload = await getOutboxPayload(item.id);
-          if (!payload) { await clearOutbox(item.id); SyncJobs.delete(item.id); continue; } // nothing left to send
+          try {
+            payload = await getOutboxPayload(item.id);
+          } catch (idbErr) {
+            // Transient IndexedDB error: keep the outbox entry intact so it retries later.
+            syncJobEnd(item.id, 'error', 'Couldn\u2019t read queued edit from this device \u2014 tap to retry', () => flushOutbox({ manual: true }));
+            continue;
+          }
+          if (!payload) { await clearOutbox(item.id); syncJobEnd(item.id, 'offline'); continue; } // genuinely missing
           result = await API.saveNote(item.id, payload, jobReporter(item.id));
         }
         setOnline(true);
         // If the note was edited again while this request was in flight, a
         // newer entry replaced this one in the outbox — leave that newer
         // one (and its cached copy) alone; the next flush sends it.
-        const latest = await getOutboxItem(item.id);
-        if (latest && latest.queuedAt !== item.queuedAt) { SyncJobs.delete(item.id); continue; }
+        // Atomically clear outbox ONLY if no newer edit replaced this exact queuedAt token.
+        const stillCurrent = await clearOutboxIfCurrent(item.id, item.queuedAt);
+        if (!stillCurrent) { SyncJobs.delete(item.id); continue; }
         if (item.op === 'delete') {
           await removeCachedNote(item.id);
         } else {
           await cacheNote(result.note, payload.content);
-          if (payload.lockType === 'time' && payload.password2) {
+          if (payload.lockType === 'time' && payload.password2 && payload.unlockAt && lockNow() >= payload.unlockAt) {
             await cacheVault(item.id, payload.password2, result.note.updatedAt);
           }
+          await keepIfAllowed(result.note);
         }
-        await clearOutbox(item.id);
         flushErrorSeen.delete(item.id);
         if (item.op === 'save') syncJobEnd(item.id, 'ok');
       } catch (e) {
@@ -1417,7 +1577,7 @@ async function flushOutbox() {
         if (item.op === 'save') {
           const fresh = flushErrorSeen.get(item.id) !== e.message;
           flushErrorSeen.set(item.id, e.message);
-          if (fresh) { toast(e.message || 'Couldn\u2019t finish saving.'); syncJobEnd(item.id, 'error', 'Couldn\u2019t finish saving \u2014 kept on this device, tap to retry', () => flushOutbox()); }
+          if (fresh) { toast(e.message || 'Couldn\u2019t finish saving.'); syncJobEnd(item.id, 'error', 'Couldn\u2019t finish saving \u2014 kept on this device, tap to retry', () => flushOutbox({ manual: true })); }
           else syncJobEnd(item.id, 'offline');
         }
       } finally {
@@ -1496,6 +1656,8 @@ function revealLockedCard(id) {
   keepRevealed(id);
 }
 let editingNoteId = null;        // generated client-side the moment the editor opens — see openEditorWithContent
+let editingBaseRev = null;       // server revision when opened (for multi-device conflict detection)
+let editingBaseUpdatedAt = null;
 let noteExistsOnServer = false;  // false until this note's first background save actually succeeds
 let editorAudio = {};            // clip id -> { data (audio data: URL), dur (seconds), name }
 let lightboxIndex = 0;
@@ -1516,6 +1678,117 @@ let serverSyncSafetyInterval = null;
 // closed can still be running while you open and start editing a
 // *different* note; keying by id is what stops the two from colliding.
 const syncStateByNote = new Map(); // id -> { inFlight: bool, queued: snapshot|null }
+
+/* ---------------------------------------------------------------------
+ * Start-up panel
+ *
+ * Shows, on the front page, every step the app takes while it opens, with what each one found and how long it took.
+ * The notes saved on this device are drawn first - before anything touches the network - and the panel says so the
+ * moment they are on screen; the steps after that (asking Backblaze, merging changes, sending waiting edits...)
+ * carry on underneath and tick off one by one. Once everything is done it folds into a single line.
+ * ------------------------------------------------------------------- */
+
+const plural = (n, one, many) => n + ' ' + (n === 1 ? one : many);
+
+const Boot = (() => {
+  const STEPS = [
+    ['shell', 'App opened'],
+    ['local', 'Reading the notes saved on this device'],
+    ['queue', 'Checking for edits waiting to upload'],
+    ['access', 'Checking what this device may open'],
+    ['list', 'Asking Backblaze for the latest notes'],
+    ['merge', 'Updating this device with what changed'],
+    ['upload', 'Sending edits that were waiting'],
+    ['drafts', 'Looking for unsaved drafts'],
+    ['tidy', 'Tidying leftover video pieces'],
+  ];
+  const steps = new Map(STEPS.map(([id, label]) => [id, { id, label, status: 'pending', detail: '', at: 0, ms: 0 }]));
+  const clock = () => (window.performance && performance.now ? performance.now() : Date.now());
+  const ICON = { pending: '○', running: '', done: '✓', skipped: '–', error: '!' };
+  const fmt = (ms) => (ms < 1000 ? Math.max(1, Math.round(ms)) + ' ms' : (ms / 1000).toFixed(1) + ' s');
+  let built = false;
+  let finished = false;
+  let readyAt = 0;
+  let userOpen = null;          // null until the person taps Details; then their choice wins
+  let foldTimer = 0;
+
+  const $ = (id) => document.getElementById(id);
+
+  function build() {
+    const ol = $('boot-steps');
+    if (built || !ol) return;
+    built = true;
+    ol.innerHTML = STEPS.map(([id, label]) =>
+      `<li class="boot-step" id="boot-step-${id}" data-state="pending"><span class="boot-step-icon" aria-hidden="true"></span><span class="boot-step-main"><span class="boot-step-name">${label}</span><span class="boot-step-detail"></span></span><span class="boot-step-time"></span></li>`).join('');
+    const t = $('boot-toggle');
+    if (t) t.addEventListener('click', () => { userOpen = !(($('boot').dataset.open) === 'true'); $('boot').dataset.open = String(userOpen); t.setAttribute('aria-expanded', String(userOpen)); });
+  }
+
+  function paint() {
+    const box = $('boot');
+    if (!box) return;
+    build();
+    const all = [...steps.values()];
+    const settled = all.filter((s) => s.status === 'done' || s.status === 'skipped' || s.status === 'error').length;
+    const failed = all.filter((s) => s.status === 'error').length;
+    const localDone = steps.get('local').status !== 'pending' && steps.get('local').status !== 'running';
+    for (const s of all) {
+      const li = $('boot-step-' + s.id);
+      if (!li) continue;
+      li.dataset.state = s.status;
+      li.querySelector('.boot-step-icon').textContent = ICON[s.status] || '';
+      li.querySelector('.boot-step-detail').textContent = s.detail;
+      li.querySelector('.boot-step-time').textContent = s.ms ? fmt(s.ms) : '';
+    }
+    $('boot-fill').style.transform = 'scaleX(' + (settled / all.length).toFixed(3) + ')';
+    const title = $('boot-title');
+    const sub = $('boot-sub');
+    if (settled === all.length) {
+      finished = true;
+      box.dataset.state = failed ? 'attention' : 'done';
+      title.textContent = failed ? 'Ready — ' + plural(failed, 'step needs', 'steps need') + ' attention' : 'Everything is up to date';
+      sub.textContent = settled + ' steps · finished in ' + fmt(clock());
+      if (userOpen === null) {
+        clearTimeout(foldTimer);
+        // Folds away by itself unless something needs a look, or the person opened it themselves.
+        foldTimer = setTimeout(() => { if (userOpen === null && !failed) { box.dataset.open = 'false'; $('boot-toggle').setAttribute('aria-expanded', 'false'); } }, 1600);
+        if (failed) { box.dataset.open = 'true'; $('boot-toggle').setAttribute('aria-expanded', 'true'); }
+      }
+    } else if (localDone) {
+      box.dataset.state = 'working';
+      title.textContent = 'Your notes are ready';
+      sub.textContent = 'On screen in ' + fmt(readyAt || clock()) + ' · still checking for changes (' + settled + ' of ' + all.length + ' steps done)';
+    } else {
+      box.dataset.state = 'starting';
+      title.textContent = 'Opening your notes…';
+      sub.textContent = settled + ' of ' + all.length + ' steps done';
+    }
+  }
+
+  function set(id, status, detail) {
+    const s = steps.get(id);
+    if (!s || finished) return;
+    if (status === 'running') { if (s.status !== 'pending') return; s.at = clock(); }
+    else {
+      if (s.status === 'done' || s.status === 'skipped' || s.status === 'error') return;
+      s.ms = s.at ? clock() - s.at : 0;
+      if (id === 'local' && !readyAt) readyAt = clock();
+    }
+    s.status = status;
+    if (detail !== undefined) s.detail = detail;
+    paint();
+  }
+
+  return {
+    init() { build(); set('shell', 'running'); set('shell', 'done', 'v' + (window.KEEPSAKE_VERSION || '')); },
+    begin: (id, detail) => set(id, 'running', detail || ''),
+    done: (id, detail) => { const s = steps.get(id); if (s && s.status === 'pending') { s.at = clock(); s.status = 'running'; } set(id, 'done', detail || ''); },
+    skip: (id, detail) => set(id, 'skipped', detail || ''),
+    fail: (id, detail) => set(id, 'error', detail || ''),
+    // Everything not yet finished is marked skipped (this device was not allowed in, or the app was not set up).
+    skipRest(reason) { for (const s of steps.values()) if (s.status === 'pending' || s.status === 'running') { s.status = 'skipped'; s.detail = reason || ''; } paint(); },
+  };
+})();
 
 /* ---------------------------------------------------------------------
  * Rendering
@@ -1580,21 +1853,79 @@ function cardHTML(meta) {
     </article>`;
 }
 
+// Placeholder cards while the very first list is on its way (nothing is saved on this device yet): the page has its
+// final shape straight away instead of an empty gap with a "Loading" line.
+function skeletonHTML(n) {
+  const card = '<div class="card skeleton" aria-hidden="true"><div class="sk-line sk-title"></div><div class="sk-line"></div><div class="sk-line sk-short"></div></div>';
+  return '<span class="visually-hidden" role="status">Loading your notes…</span>' + card.repeat(n || 6);
+}
+
+// Hides what a master has switched off for this device: the Locked tab, the Notes tab, the "Write something" bar and
+// the lock button in the editor. Cheap and idempotent, so the render functions simply call it.
+function applyAccessUI() {
+  const acc = accessNow();
+  if (!acc.known) return; // wait for first check-in before hiding tabs
+  const set = (id, show) => { const n = document.getElementById(id); if (n) n.hidden = !show; };
+  set('tab-locked', acc.locked);
+  set('tab-notes', acc.notes);
+  // Writing, and locking a note, stay available on every device: what a master restricts is what a device SHOWS,
+  // not what it may send. A note made here is saved to Backblaze under its own type (see keepIfAllowed).
+  if (currentView === 'locked' && !acc.locked && acc.notes) switchView('notes');
+  else if (currentView === 'notes' && !acc.notes && acc.locked) switchView('locked');
+}
+
 function renderNotes() {
-  const list = notesCache.filter((m) => m.lockType === 'none');
+  applyAccessUI();
   const grid = document.getElementById('grid-notes');
+  if (accessNow().known && !accessNow().notes) {
+    grid.innerHTML = emptyStateHTML('Notes are switched off for this device', 'A master turned them off. Log in as master under Settings → Devices to change that.');
+    return;
+  }
+  const list = notesCache.filter((m) => m.lockType === 'none');
   grid.innerHTML = list.length
     ? list.map(cardHTML).join('')
     : emptyStateHTML('No notes yet', 'Tap "Write something…" above to add your first one.');
 }
 
 function renderLocked() {
-  const list = notesCache.filter((m) => m.lockType !== 'none');
+  applyAccessUI();
   const grid = document.getElementById('grid-locked');
+  const acc = accessNow();
+  if (acc.known && !acc.locked) {
+    grid.innerHTML = emptyStateHTML('Locked notes are off for this device', acc.known
+      ? 'A master has to switch them on for this device. Log in as master under Settings → Devices to do it here.'
+      : 'Checking what this device may open…');
+    return;
+  }
+  const list = notesCache.filter((m) => m.lockType !== 'none');
   grid.innerHTML = list.length
     ? list.map(cardHTML).join('')
     : emptyStateHTML('Nothing locked', 'Lock a note from its editor and it shows up here.');
 }
+
+// A master changed what this device may open (or this device became / stopped being a master). Whatever is no
+// longer allowed is forgotten here - its saved text and files - except edits still waiting to upload; the lists are
+// redrawn; and anything newly allowed is fetched.
+let accessBusy = false;
+let accessDirty = false;
+async function onAccessChanged() {
+  if (accessBusy) { accessDirty = true; return; }
+  accessBusy = true;
+  try {
+    do {
+      accessDirty = false;
+      const keep = new Set(await getOutboxIds());
+      for (const c of await getAllCachedNotes()) {
+        if (!noteAllowed(c.meta) && !keep.has(c.id)) await removeCachedNote(c.id);
+      }
+      await rerenderFromLocal();
+      if (Config.configured() && navigator.onLine && !(window.KSDevices && KSDevices.locked())) syncFromServer();
+    } while (accessDirty);
+  } catch (e) { /* the next start applies it again */ }
+  finally { accessBusy = false; }
+}
+window.addEventListener('ks-access-changed', () => { onAccessChanged(); });
+window.addEventListener('ks-master-changed', () => { onAccessChanged(); });
 
 // Locked cards show a live countdown — cheap to just re-render locked view periodically.
 setInterval(() => { if (notesCache.some((m) => m.lockType === 'time')) renderLocked(); }, 60000);
@@ -1604,17 +1935,37 @@ setInterval(() => { if (notesCache.some((m) => m.lockType === 'time')) renderLoc
 // queued entry it supersedes, and redraws the grid — straight from the
 // response already in hand rather than re-fetching the whole list. This is
 // what makes a save actually feel instant in the list, not just the editor.
+// A note this device may not show (a master switched its type off here) is still saved to Backblaze, as the type it
+// was made as, and then forgotten by this device, so it never appears here. Says so once, so it does not look lost.
+const toldNotShown = new Set();
+async function keepIfAllowed(note) {
+  if (!note || !accessNow().known || noteAllowed(note)) return true;   // before the first check-in nothing is hidden or forgotten
+  await removeCachedNote(note.id);
+  if (toldNotShown.has(note.id)) return false;                          // autosaves of the same note: say it once
+  toldNotShown.add(note.id);
+  toast(note.lockType === 'none'
+    ? 'Saved to Backblaze. This device is not set to show normal notes, so it will not appear here.'
+    : 'Saved as a locked note in Backblaze. This device is not set to show locked notes, so it will not appear here.');
+  return false;
+}
+
+const deletedNotes = new Set();
+
 async function applySavedNote(noteId, note, payload, title, queuedAt) {
   const pending = await getOutboxItem(noteId);
-  // Deleted while this save was in flight — leave the queued delete alone
-  // (it'll clear the server copy this request just wrote) instead of
-  // resurrecting the note in the cache.
-  if (pending && pending.op === 'delete') return;
+  // Deleted while this save was in flight — never resurrect the note, and re-delete from server if needed.
+  if (deletedNotes.has(noteId) || (pending && pending.op === 'delete')) {
+    if (deletedNotes.has(noteId)) API.deleteNote(noteId).catch(() => {});
+    return;
+  }
   // The outbox entry is cleared only if it is still the one this save wrote; an edit that has
   // replaced it since stays queued, and its newer cached copy is left alone.
   if (!(await clearOutboxIfCurrent(noteId, queuedAt))) return;
   await cacheNote(note, payload.content, lockedTitleFor(payload, title));
-  if (payload.lockType === 'time' && payload.password2) await cacheVault(noteId, payload.password2, note.updatedAt);
+  if (payload.lockType === 'time' && payload.password2 && payload.unlockAt && lockNow() >= payload.unlockAt) {
+    await cacheVault(noteId, payload.password2, note.updatedAt);
+  }
+  if (!(await keepIfAllowed(note))) { await rerenderFromLocal(); return; }
   // Forget this device's copies of photos/audio the saved note no longer refers to.
   if (payload.mediaKeep && window.KSMedia) { try { await KSMedia.reconcile(noteId, payload.mediaKeep); } catch (e) { /* best-effort */ } }
   await rerenderFromLocal();
@@ -1654,15 +2005,16 @@ function synthesizeMeta(id, payload) {
 // the note was deleted meanwhile and nothing was written).
 async function persistLocalFirst(noteId, payload, title, info) {
   const pending = await getOutboxItem(noteId);
-  if (pending && pending.op === 'delete') return 0; // deleted meanwhile - don't resurrect it
+  if (deletedNotes.has(noteId) || (pending && pending.op === 'delete')) return 0; // deleted meanwhile - don't resurrect it
   const meta = synthesizeMeta(noteId, payload);
   await cacheNote(meta, payload.content, lockedTitleFor(payload, title));
-  if (payload.lockType === 'time' && payload.password2) await cacheVault(noteId, payload.password2, meta.updatedAt);
+  if (payload.lockType === 'time' && payload.password2 && payload.unlockAt && lockNow() >= payload.unlockAt) {
+    await cacheVault(noteId, payload.password2, meta.updatedAt);
+  }
   const queuedAt = await queueOutbox(noteId, 'save', payload, { title, batch: (info && info.batch) || {} });
   if (payload.mediaKeep && window.KSMedia) { try { await KSMedia.reconcile(noteId, payload.mediaKeep); } catch (e) { /* best-effort */ } }
-  // The outbox is now the durable local copy of this exact content, so the
-  // abrupt-close draft would just be a duplicate of it.
-  clearLocalDraft(noteId);
+  // Only drop the draft once the outbox write actually succeeded.
+  if (queuedAt > 0) await clearLocalDraft(noteId);
   return queuedAt;
 }
 
@@ -1672,85 +2024,84 @@ let lastServerSyncAt = 0;
 // Refreshes the local cache from the server (when reachable), then pushes
 // anything queued. Never throws and never blanks the grid: whatever is
 // cached stays on screen if the request fails.
+let syncFromServerRunning = null;
 async function syncFromServer() {
-  if (!navigator.onLine) { setOnline(false); return; }
+  if (window.KSDevices && KSDevices.locked()) return;
+  if (syncFromServerRunning) return syncFromServerRunning;
+  syncFromServerRunning = _syncFromServerImpl().finally(() => { syncFromServerRunning = null; });
+  return syncFromServerRunning;
+}
+
+async function _syncFromServerImpl() {
+  if (!navigator.onLine) {
+    setOnline(false);
+    Boot.skip('list', 'No connection — showing what is saved on this device');
+    Boot.skip('merge', 'Waits for a connection');
+    Boot.skip('upload', 'Waits for a connection');
+    return;
+  }
+  const listStartedAt = Date.now();
+  Boot.begin('list');
   let notes;
   try {
     ({ notes } = await API.listNotes());
   } catch (e) {
     if (e.isNetworkError) {
       setOnline(false);
+      Boot.fail('list', 'Could not reach Backblaze — showing what is saved on this device');
     } else {
       lastListErrorMessage = e.message;
       if (!notesLoaded) toast('Could not load notes: ' + e.message);
+      Boot.fail('list', e.message);
     }
+    Boot.skip('merge', 'Needs the list first');
+    Boot.skip('upload', 'Waits for a connection');
     return;
   }
   lastListErrorMessage = null;
   lastServerSyncAt = Date.now();
   setOnline(true);
+  Boot.done('list', plural(notes.length, 'note') + ' in your bucket');
   learnServerTitleSupport(notes);
   // A time-locked note exists: make sure the server clock is current (a no-op while Date headers keep it fresh).
   if (window.KSB2 && notes.some((n) => n && n.lockType === 'time')) KSB2.clock.ensureFresh(30 * 60 * 1000).catch(() => {});
 
+  Boot.begin('merge');
   const outboxIds = new Set(await getOutboxIds());
-  const serverIds = new Set(notes.map((n) => n.id));
+  // Notes this device may not open (a master can switch normal or locked notes off per device) are not kept here at
+  // all. Until the device has been told what it may open nothing is filtered or forgotten, so that never depends on a
+  // slow connection.
+  const visible = accessNow().known ? notes.filter(noteAllowed) : notes;
+  const serverIds = new Set(visible.map((n) => n.id));
+  let changed = 0;
   // A note with a queued local change keeps its local version — a possibly
   // stale server copy must not overwrite work the server hasn't seen yet.
-  for (const meta of notes) {
-    if (!outboxIds.has(meta.id)) await cacheNoteMetaOnly(meta);
+  const freshOutbox = new Set(await getOutboxIds());
+  for (const meta of visible) {
+    if (accessNow().known && !noteAllowed(meta)) continue;
+    if ((localMutationTimes.get(meta.id) || 0) >= listStartedAt) continue;
+    if (!freshOutbox.has(meta.id) && await cacheNoteMetaOnly(meta)) changed++;
   }
   // Cached but gone from the server (and not a local creation still waiting
-  // to upload) means it was deleted from another device.
+  // to upload or mutated since listNotes started) means it was deleted from another device.
+  let removed = 0;
   for (const c of await getAllCachedNotes()) {
-    if (!serverIds.has(c.id) && !outboxIds.has(c.id)) await removeCachedNote(c.id);
+    if ((localMutationTimes.get(c.id) || 0) >= listStartedAt) continue;
+    if (!serverIds.has(c.id) && !freshOutbox.has(c.id)) { await removeCachedNote(c.id); removed++; }
   }
+  Boot.done('merge', changed || removed ? [changed ? plural(changed, 'note', 'notes') + ' new or changed' : '', removed ? plural(removed, 'note', 'notes') + ' removed' : ''].filter(Boolean).join(' · ') : 'Already up to date');
 
   notesLoaded = true;
   await rerenderFromLocal();
+  Boot.begin('upload', outboxIds.size ? 'Sending ' + plural(outboxIds.size, 'edit', 'edits') + ' (progress is in the bar at the top)' : '');
   await flushOutbox();
-  prefetchOfflineData(notes.filter((m) => !outboxIds.has(m.id)));
-}
-
-// Quietly downloads the content of every note whose cached copy is missing
-// or older than the server's — this is what makes *all* notes, locked and
-// unlocked, open offline rather than just the ones opened before. Locked
-// notes are cached still-encrypted, exactly as the server holds them.
-// A time-locked note past its unlock date also gets its released second
-// password cached; before that date the server withholds it, so a note
-// whose date passes while you're offline has to wait for a connection.
-async function prefetchOfflineData(metas) {
-  if (window.KSOffline && KSOffline.prefetchHeld()) return; // offline data was just deleted: don't quietly refill it this session
-  for (const meta of metas) {
-    if (!navigator.onLine) return;
-    try {
-      const cached = await getCachedMeta(meta.id);
-      const needContent = !cached || !cached.hasContent || cached.contentUpdatedAt !== meta.updatedAt;
-      if (needContent) {
-        const { content } = await API.getNote(meta.id);
-        await cacheNote(meta, content);
-      }
-      const unlocked = meta.lockType === 'time' && meta.unlockAt && lockNow() >= meta.unlockAt;
-      const vaultFresh = !!(cached && cached.vault && cached.vaultUpdatedAt === meta.updatedAt);
-      if (unlocked && !vaultFresh) {
-        try {
-          const { password2 } = await API.getVault(meta.id);
-          if (password2) await cacheVault(meta.id, password2, meta.updatedAt);
-        } catch (e) { if (e.isNetworkError) return; }
-      }
-      // Photos and audio kept in Backblaze: bring them along too (while there's room on this
-      // device), so the note opens offline like every other.
-      // (While a full offline sync is on, that sync brings the media in small resumable pieces instead.)
-      if (meta.mediaSize > 0 && window.KSMedia && !(window.KSOffline && KSOffline.active())) await KSMedia.prefetchNote(meta.id, meta.mediaSize);
-    } catch (e) {
-      if (e.isNetworkError) { setOnline(false); return; }
-      // Anything else (e.g. one note's content missing server-side) —
-      // skip it and keep going with the rest.
-    }
-  }
+  Boot.done('upload', outboxIds.size ? plural(outboxIds.size, 'edit', 'edits') + ' handled' : 'Nothing was waiting');
+  // Nothing is downloaded in the background any more. A note's text and files come when you open it, or when you press
+  // Download under Settings → Offline copy (offline.js).
 }
 
 async function refreshNotes() {
+  if (window.KSDevices && KSDevices.locked()) return;
   // Cards come from the local cache first — instant, and the only source
   // when there's no connection. The server fetch below just refreshes it.
   notesCache = await buildNotesCacheFromLocal();
@@ -1760,9 +2111,8 @@ async function refreshNotes() {
     renderNotes();
     renderLocked();
   } else if (!notesLoaded) {
-    const loading = emptyStateHTML('Loading…', 'Fetching your notes.');
-    document.getElementById('grid-notes').innerHTML = loading;
-    document.getElementById('grid-locked').innerHTML = loading;
+    document.getElementById('grid-notes').innerHTML = skeletonHTML(6);
+    document.getElementById('grid-locked').innerHTML = skeletonHTML(3);
   }
 
   await syncFromServer();
@@ -1786,8 +2136,12 @@ async function refreshNotes() {
 function switchView(view) {
   hideRevealedCards();
   currentView = view;
-  document.getElementById('tab-notes').setAttribute('aria-selected', String(view === 'notes'));
-  document.getElementById('tab-locked').setAttribute('aria-selected', String(view === 'locked'));
+  const tabNotes = document.getElementById('tab-notes');
+  const tabLocked = document.getElementById('tab-locked');
+  tabNotes.setAttribute('aria-selected', String(view === 'notes'));
+  tabLocked.setAttribute('aria-selected', String(view === 'locked'));
+  tabNotes.tabIndex = view === 'notes' ? 0 : -1;
+  tabLocked.tabIndex = view === 'locked' ? 0 : -1;
   document.getElementById('grid-notes').classList.toggle('hidden', view !== 'notes');
   document.getElementById('grid-locked').classList.toggle('hidden', view !== 'locked');
 }
@@ -2030,8 +2384,8 @@ function videoSub(v) {
 
 function videoFileName(v) {
   const ext = { 'video/mp4': 'mp4', 'video/webm': 'webm', 'video/quicktime': 'mov', 'video/x-matroska': 'mkv', 'video/3gpp': '3gp' }[v.t] || 'mp4';
-  const clean = (v.name || '').replace(/\.[a-z0-9]{2,5}$/i, '').replace(/[^\w\- ]+/g, '').trim();
-  const title = (document.getElementById('editor-title').value || 'note').replace(/[^\w\- ]+/g, '').trim().slice(0, 40) || 'note';
+  const clean = (v.name || '').replace(/\.[a-z0-9]{2,5}$/i, '').replace(/[^\p{L}\p{N}\- ]+/gu, '').trim();
+  const title = (document.getElementById('editor-title').value || 'note').replace(/[^\p{L}\p{N}\- ]+/gu, '').trim().slice(0, 40) || 'note';
   return `${clean || title + ' - video'}.${ext}`.replace(/\s+/g, '-');
 }
 
@@ -2226,7 +2580,7 @@ async function compressSavedVideo(id) {
           out = await KSVideo.compress(src.blob, preset, {
             info: { ok: true, dur: v.dur, w: v.w, h: v.h },
             onProgress: (f) => vprepSet('Compressing\u2026', 0.08 + f * 0.82, `Plays through once, so it takes as long as the video${etaText(f)}. Keep this screen open.`),
-            shouldStop: () => VPrep.cancelled || editingNoteId !== noteId,
+            shouldStop: () => VPrep.cancelled || !editorShowing(noteId),
           });
         } finally { src.revoke(); }
         if (!out || out.size >= KSVideo.storedBytes(v) * 0.98) { vprepClose(); toast('Kept the original \u2014 compressing wouldn\u2019t have made it smaller'); return; }
@@ -2394,16 +2748,18 @@ async function attachVideoFiles(files) {
     const outcome = await addOneVideo(items[n], mode, n, items.length, targetNoteId, batch);
     if (outcome.cancelled) break;
     if (outcome.added) added++;
-    if (outcome.keptOriginal) kept++;
+    if (outcome.compressionFailed) compressFailed++;
+    else if (outcome.keptOriginal) kept++;
     if (outcome.error) { failed++; toast(outcome.error); }
     if (outcome.result) results.push(outcome.result);
   }
   vprepClose();
-  if (!failed && kept) toast(kept === 1 ? 'Kept the original \u2014 compressing wouldn\u2019t have made it smaller' : `Kept ${kept} originals \u2014 compressing wouldn\u2019t have made them smaller`);
+  if (!failed && compressFailed) toast(compressFailed === 1 ? 'Video compression failed \u2014 kept the original file instead' : `Compression failed for ${compressFailed} videos \u2014 kept the originals instead`);
+  else if (!failed && kept) toast(kept === 1 ? 'Kept the original \u2014 compressing wouldn\u2019t have made it smaller' : `Kept ${kept} originals \u2014 compressing wouldn\u2019t have made them smaller`);
   if (added) {
     updateSizeMeter();
     onEditorContentChanged();
-    if (!failed && !kept) toast(added === 1 ? 'Video added \u2014 it uploads in parts when the note is saved' : `${added} videos added`);
+    if (!failed && !kept && !compressFailed) toast(added === 1 ? 'Video added \u2014 it uploads in parts when the note is saved' : `${added} videos added`);
   }
   return added;
 }
@@ -2418,6 +2774,7 @@ async function addOneVideo(item, mode, index, count, noteId, batch) {
   let usedMode = 'original';
   let result = '';
   let keptOriginal = false;
+  let compressionFailed = false;
   try {
     if (mode === 'compressed') {
       const est = KSVideo.estimate(info, file.size, preset);
@@ -2429,7 +2786,7 @@ async function addOneVideo(item, mode, index, count, noteId, batch) {
           const out = await KSVideo.compress(file, preset, {
             info,
             onProgress: (f) => vprepSet('Compressing\u2026', f * 0.9, `Plays through once, so it takes as long as the video${etaText(f)}. Keep this screen open.`),
-            shouldStop: () => VPrep.cancelled || editingNoteId !== noteId,
+            shouldStop: () => VPrep.cancelled || !editorShowing(noteId),
           });
           if (out && out.size < file.size * 0.98) {
             source = out; usedMode = 'compressed';
@@ -2437,11 +2794,11 @@ async function addOneVideo(item, mode, index, count, noteId, batch) {
           } else keptOriginal = true;
         } catch (e) {
           if (e && e.cancelled) return { cancelled: true };
-          keptOriginal = true;
+          compressionFailed = true;
         } finally { KeepAwake.release(); }
       }
     }
-    if (VPrep.cancelled || editingNoteId !== noteId) return { cancelled: true };
+    if (VPrep.cancelled || !editorShowing(noteId)) return { cancelled: true };
 
     const locked = lockIsActive();
     const nk = locked ? await KSMedia.noteKey(noteId, true) : null;
@@ -2452,9 +2809,9 @@ async function addOneVideo(item, mode, index, count, noteId, batch) {
     }, {
       noteId, enc: nk,
       onProgress: (done, total) => vprepSet('Splitting into parts\u2026', base + (done / total) * (1 - base), `Part ${done} of ${total} \u00b7 each is checked and saved on this device before it uploads`),
-      shouldStop: () => VPrep.cancelled || editingNoteId !== noteId,
+      shouldStop: () => VPrep.cancelled || !editorShowing(noteId),
     });
-    if (editingNoteId !== noteId) { await KSVideo.discard(noteId, entry); return { cancelled: true }; }
+    if (!editorShowing(noteId)) { await KSVideo.discard(noteId, entry); return { cancelled: true }; }
     // The real final size, before the card appears.
     vprepSet('Done', 1, '');
     const resultEl = document.getElementById('vprep-result');
@@ -2466,7 +2823,7 @@ async function addOneVideo(item, mode, index, count, noteId, batch) {
     document.getElementById('btn-vprep-cancel').hidden = true;
     await new Promise((r) => setTimeout(r, usedMode === 'compressed' ? 1500 : 700));
     addVideoToBatch(batch, KSVideo.newVideoId(), entry);
-    return { added: true, keptOriginal, result };
+    return { added: true, keptOriginal, compressionFailed, result };
   } catch (e) {
     if (e && e.cancelled) return { cancelled: true };
     return { error: e && e.userMessage ? e.message : `Couldn\u2019t add ${file.name}`, keptOriginal };
@@ -2505,7 +2862,7 @@ function openLightbox(id) {
   show('overlay-lightbox');
 }
 
-function closeLightbox() { hide('overlay-lightbox'); }
+function closeLightbox() { const img = document.getElementById('lightbox-img'); if (img) img.removeAttribute('src'); hide('overlay-lightbox'); }
 
 function lightboxStep(delta) {
   const total = photoIdsInBody().length;
@@ -2521,7 +2878,17 @@ function renderLightbox() {
   if (lightboxIndex >= total) lightboxIndex = total - 1;
   if (lightboxIndex < 0) lightboxIndex = 0;
   const src = editorPhotos[lightboxIds[lightboxIndex]];
-  document.getElementById('lightbox-img').src = src;
+  const imgEl = document.getElementById('lightbox-img');
+  const thumb = thumbUrls.get(mediaSig(src));
+  if (thumb && thumb !== src) {
+    imgEl.src = thumb;
+    const targetIdx = lightboxIndex;
+    const fullImg = new Image();
+    fullImg.onload = () => { if (lightboxIndex === targetIdx) imgEl.src = src; };
+    fullImg.src = src;
+  } else {
+    imgEl.src = src;
+  }
   document.getElementById('lightbox-caption').textContent =
     total > 1
       ? `${lightboxIndex + 1} of ${total} — ${formatBytes(estimateImageBytes(src))}`
@@ -2666,14 +3033,17 @@ function setEditorContent(content) {
   updateSizeMeter();
 }
 
-function openEditorWithContent(meta, content) {
+function openEditorWithContent(meta, content, opts) {
   const isExisting = !!(meta && meta.id);
+  const fromDraft = !!(opts && opts.fromDraft);
   // A fresh note gets its id right now, up front, rather than whenever it
   // first gets saved. Every save — the Save button, autosave, a retry —
   // then PUTs to this same id, which is what makes them all idempotent:
   // there's no "create" request that a double-tap or a network retry
   // could ever fire twice into two different notes.
   editingNoteId = isExisting ? meta.id : crypto.randomUUID();
+  editingBaseRev = isExisting && Number.isFinite(meta.rev) ? meta.rev : null;
+  editingBaseUpdatedAt = isExisting && Number.isFinite(meta.updatedAt) ? meta.updatedAt : null;
   noteExistsOnServer = isExisting;
   stopAutosaveTimers();
 
@@ -2691,11 +3061,14 @@ function openEditorWithContent(meta, content) {
   // which carries the resolved lock passwords) or a locked note would always
   // look "changed" and get re-encrypted and re-uploaded just for being opened.
   const openedSnapshot = captureSnapshot();
-  lastAutosavedJSON = snapshotKey(openedSnapshot);
+  // When resuming a recovered draft, leave lastAutosavedJSON null so Save/close actually
+  // persists the recovered text instead of returning early as "unchanged".
+  lastAutosavedJSON = fromDraft ? null : snapshotKey(openedSnapshot);
   // A note locked before titles were stored has none. Make closing this note re-save it
   // once so every device gets the title — no edit needed.
-  if (isExisting && meta.lockType !== 'none' && meta.title == null
-      && localStorage.getItem('ks_titlesOnServer') === '1') {
+  let titlesOnServer = false;
+  try { titlesOnServer = localStorage.getItem('ks_titlesOnServer') === '1'; } catch (e) { /* private mode */ }
+  if (isExisting && meta.lockType !== 'none' && meta.title == null && titlesOnServer) {
     lastAutosavedJSON = null;
   }
   seedSyncStateImages(editingNoteId, openedSnapshot);
@@ -2708,7 +3081,7 @@ function openEditorWithContent(meta, content) {
   // swiped-away tab) before its background save could finish, offer to
   // bring those changes back rather than silently showing the older,
   // already-saved version underneath them.
-  maybeOfferDraftRestore(editingNoteId, content);
+  if (!fromDraft) maybeOfferDraftRestore(editingNoteId, content);
 }
 
 async function maybeOfferDraftRestore(noteId, serverContent) {
@@ -2785,6 +3158,8 @@ function captureSnapshot() {
     videos: snapshotVideos(html),
     drawing: inkGetData(),
     lock: resolveLockForSnapshot(),
+    baseRev: editingBaseRev,
+    baseUpdatedAt: editingBaseUpdatedAt,
   };
 }
 
@@ -2834,6 +3209,7 @@ async function buildSavePayload(snapshot, noteId, onPrepare) {
   let mediaSizes = {};
   let mediaCounts = null;
   let preparedVideos = null;
+  let releaseBases = [];
   let batch = {};
   const hasAudioClips = Object.keys(audio).length > 0;
   const prepWhat = hasAudioClips ? (images.length ? 'photos and audio' : 'audio') : 'photos';
@@ -2851,6 +3227,7 @@ async function buildSavePayload(snapshot, noteId, onPrepare) {
       mediaSizes = ext.sizes;
       mediaCounts = ext.counts;
       preparedVideos = ext.content.videos || null;
+      releaseBases = ext.releaseBases || [];
       batch = await KSMedia.pendingKinds(noteId, ext.keep, ext.kinds); // what still has to be sent
     } catch (e) {
       if (e && (e.tooBig || e.userMessage || hasVideos)) throw e; // a video can never be kept inside the note
@@ -2873,8 +3250,11 @@ async function buildSavePayload(snapshot, noteId, onPrepare) {
     payload = { lockType: 'time', title, unlockAt: lock.unlockAt, password2: lock.password2, content: record };
   }
   if (mediaKeep) { payload.mediaKeep = mediaKeep; payload.mediaBytes = mediaBytes; payload.mediaKinds = mediaKinds; payload.mediaSizes = mediaSizes; payload.mediaCounts = mediaCounts; }
+  if (Number.isFinite(snapshot.baseRev)) payload.baseRev = snapshot.baseRev;
+  if (Number.isFinite(snapshot.baseUpdatedAt)) payload.baseUpdatedAt = snapshot.baseUpdatedAt;
+  if (snapshot.forceOverwrite) payload.forceOverwrite = true;
 
-  return { payload, batch, hasImages: images.length > 0 || hasAudioClips || hasVideos, videos: preparedVideos };
+  return { payload, batch, hasImages: images.length > 0 || hasAudioClips || hasVideos, videos: preparedVideos, releaseBases };
 }
 
 /* ---------------------------------------------------------------------
@@ -2915,86 +3295,124 @@ function editorShowing(noteId) {
 
 async function syncRunOne(noteId, snapshot, state) {
   const editing = () => editorShowing(noteId);
-  const job = await syncJobBegin(noteId, snapshot.title, {}, 'editor');
-
-  // 1. Turn photos/audio into stored files (encrypting them first for a locked note). Each one is
-  //    saved on this device as it is made, so this is also where \"100 photos\" is worked through
-  //    one at a time rather than all at once.
-  let built;
+  let releaseBases = [];
   try {
-    built = await buildSavePayload(snapshot, noteId, (done, total, what) => {
-      job.prep = { done, total, what };
-      scheduleSyncRender();
-    });
-  } catch (e) {
-    state.inFlight = false;
-    const tooBig = !!(e && e.tooBig);
-    const said = !!(e && e.userMessage); // a message written for the person (a video that can't be locked, say)
-    toast(tooBig || said ? e.message : 'Could not lock note \u2014 try setting the lock again.');
-    syncJobEnd(noteId, 'error', said ? 'Couldn\u2019t save \u2014 tap to retry' : tooBig ? 'Couldn\u2019t save \u2014 a file is too big' : 'Couldn\u2019t save \u2014 check the lock', () => runSync(noteId, snapshot));
-    maybeContinueQueued(noteId, state);
-    return;
-  }
-  job.prep = null;
-  const { payload, batch } = built;
-  // A video encrypted for a lock now lives under new part names: the editor must use those from here on, or the
-  // next autosave would encrypt (and upload) it all over again.
-  if (built.videos && editing()) {
-    for (const [vid, nv] of Object.entries(built.videos)) {
-      if (editorVideos[vid]) editorVideos[vid] = { ...editorVideos[vid], base: nv.base, parts: nv.parts, enc: nv.enc };
+    if (deletedNotes.has(noteId)) return;
+    const job = await syncJobBegin(noteId, snapshot.title, {}, 'editor');
+
+    // 1. Turn photos/audio into stored files (encrypting them first for a locked note). Each one is
+    //    saved on this device as it is made, so this is also where "100 photos" is worked through
+    //    one at a time rather than all at once.
+    let built;
+    try {
+      built = await buildSavePayload(snapshot, noteId, (done, total, what) => {
+        job.prep = { done, total, what };
+        scheduleSyncRender();
+      });
+    } catch (e) {
+      const tooBig = !!(e && e.tooBig);
+      const said = !!(e && e.userMessage);
+      const isLocked = !!(snapshot.lock && snapshot.lock.type !== 'none');
+      const fallbackToast = isLocked
+        ? 'Could not lock note \u2014 try setting the lock again.'
+        : 'Couldn\u2019t prepare note to save \u2014 try again.';
+      const fallbackBar = said
+        ? 'Couldn\u2019t save \u2014 tap to retry'
+        : tooBig
+          ? 'Couldn\u2019t save \u2014 a file is too big'
+          : (isLocked ? 'Couldn\u2019t save \u2014 check the lock' : 'Couldn\u2019t save \u2014 tap to retry');
+      toast(tooBig || said ? e.message : fallbackToast);
+      syncJobEnd(noteId, 'error', fallbackBar, () => runSync(noteId, snapshot));
+      return;
     }
-    refreshVideoStatus();
-  }
-
-  // 2. Write it down - note, lock and queue - BEFORE uploading anything.
-  let queuedAt = 0;
-  try {
-    queuedAt = await persistLocalFirst(noteId, payload, snapshot.title, { batch });
-  } catch (e) { /* still try to send it below; the worst case is the old behaviour */ }
-  if (!queuedAt && (await getOutboxItem(noteId) || {}).op === 'delete') { // deleted while this was being prepared
-    SyncJobs.delete(noteId);
-    state.inFlight = false;
-    maybeContinueQueued(noteId, state);
-    return;
-  }
-  if (editing()) {
-    noteExistsOnServer = true;
-    setExistingNoteButtons(true);
-    document.getElementById('editor-heading').textContent = 'Edit note';
-    lastAutosavedJSON = snapshotKey(snapshot); // covered now: autosave need not send the same thing again
-  }
-  const queued = await getOutboxItem(noteId);
-  await fillJobFiles(job, (queued && queued.batch) || batch);
-  if (!editing()) await rerenderFromLocal(); // the card shows its lock / \"Not synced\" at once
-  scheduleSyncRender();
-
-  // 3. Send it.
-  try {
-    if (!navigator.onLine) {
-      const offlineErr = new Error('Offline');
-      offlineErr.isNetworkError = true;
-      throw offlineErr;
+    job.prep = null;
+    const { payload, batch } = built;
+    releaseBases = built.releaseBases || [];
+    // A video encrypted for a lock now lives under new part names: the editor must use those from here on, or the
+    // next autosave would encrypt (and upload) it all over again.
+    if (built.videos && editing()) {
+      for (const [vid, nv] of Object.entries(built.videos)) {
+        if (editorVideos[vid]) editorVideos[vid] = { ...editorVideos[vid], base: nv.base, parts: nv.parts, enc: nv.enc };
+      }
+      refreshVideoStatus();
     }
-    const { note } = await API.saveNote(noteId, payload, jobReporter(noteId));
-    setOnline(true);
-    learnServerTitleSupport([note]);
-    flushErrorSeen.delete(noteId);
-    state.lastSyncedImagesJSON = mediaKey(snapshot);
-    await applySavedNote(noteId, note, payload, snapshot.title, queuedAt);
-    syncJobEnd(noteId, 'ok');
-    flushOutbox(); // a working connection is the moment to drain anything else that's queued
-  } catch (e) {
-    if (e.isNetworkError) {
-      // Offline, or the connection dropped part-way. Not a failure: everything is already on this
-      // device and queued, marked \"Not synced\", and the upload picks up from the next unsent file.
-      setOnline(false);
-      syncJobEnd(noteId, 'offline');
-      syncBarSuccess('Saved on this device \u2014 will sync later');
-    } else {
-      toast(e.message || 'Couldn\u2019t finish saving.');
-      syncJobEnd(noteId, 'error', 'Couldn\u2019t finish saving \u2014 kept on this device, tap to retry', () => flushOutbox());
+
+    // 2. Write it down - note, lock and queue - BEFORE uploading anything.
+    let queuedAt = 0;
+    try {
+      queuedAt = await persistLocalFirst(noteId, payload, snapshot.title, { batch });
+    } catch (e) { /* handled below via savedLocally check */ }
+    const savedLocally = queuedAt > 0;
+    if (deletedNotes.has(noteId) || (!savedLocally && (await getOutboxItem(noteId) || {}).op === 'delete')) {
+      SyncJobs.delete(noteId);
+      return;
+    }
+    if (editing() && savedLocally) {
+      noteExistsOnServer = true;
+      setExistingNoteButtons(true);
+      document.getElementById('editor-heading').textContent = 'Edit note';
+      lastAutosavedJSON = snapshotKey(snapshot); // covered now: autosave need not send the same thing again
+    }
+    const queued = savedLocally ? await getOutboxItem(noteId) : null;
+    await fillJobFiles(job, (queued && queued.batch) || batch);
+    if (!editing() && savedLocally) await rerenderFromLocal(); // the card shows its lock / "Not synced" at once
+    scheduleSyncRender();
+
+    // 3. Send it.
+    try {
+      if (!navigator.onLine) {
+        const offlineErr = new Error('Offline');
+        offlineErr.isNetworkError = true;
+        throw offlineErr;
+      }
+      const { note } = await API.saveNote(noteId, payload, jobReporter(noteId));
+      if (deletedNotes.has(noteId)) {
+        API.deleteNote(noteId).catch(() => {});
+        SyncJobs.delete(noteId);
+        return;
+      }
+      setOnline(true);
+      learnServerTitleSupport([note]);
+      flushErrorSeen.delete(noteId);
+      state.lastSyncedImagesJSON = mediaKey(snapshot);
+      if (editing()) {
+        editingBaseRev = Number.isFinite(note.rev) ? note.rev : editingBaseRev;
+        editingBaseUpdatedAt = Number.isFinite(note.updatedAt) ? note.updatedAt : editingBaseUpdatedAt;
+        noteExistsOnServer = true;
+        setExistingNoteButtons(true);
+        document.getElementById('editor-heading').textContent = 'Edit note';
+        lastAutosavedJSON = snapshotKey(snapshot);
+      }
+      await applySavedNote(noteId, note, payload, snapshot.title, queuedAt);
+      syncJobEnd(noteId, 'ok');
+      flushOutbox(); // a working connection is the moment to drain anything else that's queued
+    } catch (e) {
+      if (e.isNetworkError) {
+        setOnline(false);
+        if (savedLocally) {
+          syncJobEnd(noteId, 'offline');
+          syncBarSuccess('Saved on this device \u2014 will sync later');
+        } else {
+          toast('Offline and device storage is full \u2014 this edit was not saved.');
+          syncJobEnd(noteId, 'error', 'Not saved (offline and local storage failed) \u2014 tap to retry', () => runSync(noteId, snapshot));
+        }
+      } else if (e.conflict) {
+        toast('This note was edited on another device. Reopen to see the latest, or tap Retry to overwrite.');
+        syncJobEnd(noteId, 'error', 'Conflict: edited on another device \u2014 tap Retry to overwrite', () => runSync(noteId, { ...snapshot, forceOverwrite: true }));
+      } else {
+        toast(e.message || 'Couldn\u2019t finish saving.');
+        syncJobEnd(
+          noteId,
+          'error',
+          savedLocally ? 'Couldn\u2019t finish saving \u2014 kept on this device, tap to retry' : 'Couldn\u2019t save \u2014 tap to retry',
+          savedLocally ? () => flushOutbox({ manual: true }) : () => runSync(noteId, snapshot)
+        );
+      }
     }
   } finally {
+    if (window.KSMedia && releaseBases.length) {
+      for (const base of releaseBases) KSMedia.release(base);
+    }
     state.inFlight = false;
     maybeContinueQueued(noteId, state);
   }
@@ -3043,6 +3461,7 @@ function onEditorContentChanged() {
 
 function triggerAutosave() {
   if (!editingNoteId || (!noteHasContent() && !noteExistsOnServer)) return;
+  if (sizeProblem(noteSizeBreakdown())) return;
   const snapshot = captureSnapshot();
   const key = snapshotKey(snapshot);
   if (key === lastAutosavedJSON) return; // nothing's changed since the last successful save
@@ -3088,11 +3507,11 @@ function closeEditorAndSync(isExplicitSave) {
   }
 
   if (overLimit) {
-    // Closing (not explicitly saving) with an oversized note: the local
-    // draft cache already has it, so nothing is lost — just skip sending a
-    // request that could never succeed.
-    // Nothing else holds this version (it can't be sent), so keep a local
-    // draft now \u2014 even for a locked note, since the alternative is losing it.
+    if (lockIsActive()) {
+      // Never write a locked note's plaintext to IndexedDB drafts; keep editor open so user can trim it.
+      toast(problem + ' Trim the note before closing so your locked text stays encrypted.');
+      return;
+    }
     saveDraftNow(noteId);
     hide('overlay-editor');
     currentUnlockCreds = null;
@@ -3122,6 +3541,7 @@ function confirmDelete(id, fromEditor) {
       editingNoteId = null;
       lastAutosavedJSON = null;
     }
+    deletedNotes.add(id);
     const doomed = syncStateByNote.get(id);
     if (doomed) doomed.queued = null;
     // Local-first: it disappears from the cache and grid right away, and the
@@ -3225,7 +3645,10 @@ function openLockChooser() {
  * Unlock flow
  * ------------------------------------------------------------------- */
 
+let openSeq = 0;
+
 function openUnlockFlow(meta) {
+  const mySeq = ++openSeq;
   document.getElementById('unlock-heading').textContent =
     meta.lockType === 'quick' ? 'Quick-locked note' : 'Time-locked note';
   const body = document.getElementById('unlock-body');
@@ -3253,6 +3676,7 @@ function openUnlockFlow(meta) {
       try {
         const record = await fetchNoteContent(meta);
         const content = await inflateForOpen(meta, await decryptNote(pw, record));
+        if (mySeq !== openSeq) return;
         currentUnlockCreds = { password: pw };
         hide('overlay-unlock');
         openEditorWithContent(meta, content);
@@ -3293,6 +3717,7 @@ function openUnlockFlow(meta) {
       try {
         const [password2, record] = await Promise.all([fetchVaultPassword2(meta), fetchNoteContent(meta)]);
         const content = await inflateForOpen(meta, await decryptNote(combine(pw, password2), record));
+        if (mySeq !== openSeq) return;
         currentUnlockCreds = { password: pw, password2 };
         hide('overlay-unlock');
         openEditorWithContent(meta, content);
@@ -3343,6 +3768,7 @@ function openUnlockFlow(meta) {
     try {
       const record = await fetchNoteContent(meta);
       const content = await inflateForOpen(meta, await decryptNote(combine(pw, pw2), record));
+      if (mySeq !== openSeq) return;
       currentUnlockCreds = { password: pw, password2: pw2 };
       hide('overlay-unlock');
       openEditorWithContent(meta, content);
@@ -3358,10 +3784,12 @@ function openUnlockFlow(meta) {
 // A wrong password is a failed decrypt. Anything else (server down, bad
 // token, clock skew) used to be reported as \"Wrong password.\" too.
 function unlockErrorText(e, wrongPasswordText) {
+  if (e && e.isDecryptError) return wrongPasswordText;
   if (e && e.notCached) return e.message;
   if (e && e.status === 403) return 'This note is still sealed \u2014 check this device\u2019s date and time.';
   if (e && e.status === 401) return e.message || 'Backblaze rejected your key \u2014 check Settings.';
   if (e && (e.status || e.isNetworkError)) return e.message;
+  if (e && e.message) return e.message;
   return wrongPasswordText;
 }
 
@@ -3427,8 +3855,13 @@ function inflateForOpen(meta, content) {
 
 // Same idea for the released second password of a time-locked note.
 async function fetchVaultPassword2(meta) {
+  if (meta.unlockAt && lockNow() < meta.unlockAt) {
+    const err = new Error('Still locked');
+    err.status = 403;
+    throw err;
+  }
   const light = await getCachedMeta(meta.id);
-  if (light && light.vault && light.vaultUpdatedAt === meta.updatedAt) return light.vault;
+  if (light && light.vault && light.vaultUpdatedAt === meta.updatedAt && (!meta.unlockAt || lockNow() >= meta.unlockAt)) return light.vault;
   if (navigator.onLine) {
     try {
       const { password2 } = await API.getVault(meta.id);
@@ -3452,8 +3885,10 @@ async function handleOpenCard(id) {
   const meta = notesCache.find((m) => m.id === id);
   if (!meta) return;
   if (meta.lockType === 'none') {
+    const mySeq = ++openSeq;
     try {
       const content = await inflateForOpen(meta, await fetchNoteContent(meta));
+      if (mySeq !== openSeq) return;
       currentUnlockCreds = null;
       openEditorWithContent(meta, content);
     } catch (e) {
@@ -3480,7 +3915,7 @@ async function downloadNote(id) {
         bundle = await API.exportNote(id);
         setOnline(true);
         await cacheNote(bundle.meta, bundle.content);
-        if (bundle.password2) await cacheVault(id, bundle.password2, bundle.meta.updatedAt);
+        if (bundle.password2 && (!bundle.meta.unlockAt || lockNow() >= bundle.meta.unlockAt)) await cacheVault(id, bundle.password2, bundle.meta.updatedAt);
       } catch (e) {
         if (!e.isNetworkError) throw e;
         setOnline(false);
@@ -3504,7 +3939,7 @@ async function downloadNote(id) {
     document.body.appendChild(a);
     a.click();
     a.remove();
-    URL.revokeObjectURL(url);
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
     toast('Downloaded');
   } catch (e) {
     toast('Could not download: ' + e.message);
@@ -3564,17 +3999,18 @@ async function clearCachedNoteContents() {
 // sync if the shell's file list ever changes.
 const FORCE_REFRESH_SHELL_FILES = [
   './index.html',
+  './version.js',
   './app.js',
   './b2.js',
   './media.js',
   './video.js',
   './player.js',
-  './migrate.js',
   './devices.js',
   './offline.js',
   './manifest.json',
   './icon-192.png',
   './icon-512.png',
+  './icon-512-maskable.png',
 ];
 
 function openSettings() {
@@ -3586,7 +4022,7 @@ function openSettings() {
   document.getElementById('settings-b2-appkey').value = c.appKey();
   setB2Status('', '');
   fillClockLine();
-  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.14.0';
+  document.getElementById('settings-version').textContent = window.KEEPSAKE_VERSION || '1.15.1';
   fillQualitySettings();
   show('overlay-settings');
   renderStorageSection();
@@ -3664,18 +4100,18 @@ async function saveSettings() {
     setB2Status('All four fields are needed.', 'bad');
     return;
   }
-  KSB2.config.set(vals);
   const btn = document.getElementById('btn-save-settings');
   setBusy(btn, true, 'Testing\u2026');
   setB2Status('', '');
   let result;
-  try { result = await KSB2.testConnection(); } finally { setBusy(btn, false); }
+  try { result = await KSB2.testConnection(vals); } finally { setBusy(btn, false); }
   if (!result.ok) {
-    // Saved, but not closed: the message below says what to fix.
-    if (window.KSDevices) KSDevices.failedAttempt(result.kind); // logged with the next login that gets through
+    // Do not overwrite working credentials when the connection test fails.
+    if (window.KSDevices) KSDevices.failedAttempt(result.kind);
     setB2Status(result.message, 'bad');
     return;
   }
+  KSB2.config.set(vals);
   setB2Status('Connected to your bucket.', 'ok');
   // Register this login (devices.js). A blocked device is refused here and sees its own notice.
   const dev = window.KSDevices ? await KSDevices.afterConnect() : { allowed: true };
@@ -3699,18 +4135,16 @@ function wireStaticEvents() {
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
     hideRevealedCards();
-    // The photo viewer handles its own Escape (see setupLightbox) \u2014 don't let
-    // the same keypress also close the editor behind it.
-    if (!document.getElementById('overlay-lightbox').classList.contains('hidden')) return;
-    if (!document.getElementById('overlay-video').classList.contains('hidden')) return;
     const openModals = document.querySelectorAll('.overlay:not(.hidden)');
     if (openModals.length) {
-      // A modal (settings, lock chooser, unlock, confirm) is on top — close
-      // just that, and leave the full-screen editor underneath it alone. A
-      // recording in progress is protected: it ends only through its own buttons.
-      openModals.forEach((ov) => { if (!overlayIsProtected(ov.id)) hide(ov.id); });
+      // Close the top-most modal first (even if opened over the lightbox or video player).
+      const topModal = openModals[openModals.length - 1];
+      if (!overlayIsProtected(topModal.id)) hide(topModal.id);
       return;
     }
+    // The photo viewer and video player handle their own Escape when no modal is above them.
+    if (!document.getElementById('overlay-lightbox').classList.contains('hidden')) return;
+    if (!document.getElementById('overlay-video').classList.contains('hidden')) return;
     if (!document.getElementById('overlay-editor').classList.contains('hidden')) {
       if (Ink.mode) { setDrawMode(false); return; }
       attemptCloseEditor();
@@ -3755,8 +4189,29 @@ function wireStaticEvents() {
     }
   });
 
-  document.getElementById('tab-notes').addEventListener('click', () => switchView('notes'));
-  document.getElementById('tab-locked').addEventListener('click', () => switchView('locked'));
+  const tabNotes = document.getElementById('tab-notes');
+  const tabLocked = document.getElementById('tab-locked');
+  tabNotes.addEventListener('click', () => switchView('notes'));
+  tabLocked.addEventListener('click', () => switchView('locked'));
+  const tabbar = tabNotes.parentElement;
+  if (tabbar) {
+    tabbar.addEventListener('keydown', (e) => {
+      const tabs = [tabNotes, tabLocked].filter((t) => !t.hidden);
+      if (tabs.length < 2) return;
+      const idx = tabs.indexOf(document.activeElement);
+      if (idx < 0) return;
+      let next = null;
+      if (e.key === 'ArrowRight' || e.key === 'ArrowDown') next = tabs[(idx + 1) % tabs.length];
+      else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') next = tabs[(idx - 1 + tabs.length) % tabs.length];
+      else if (e.key === 'Home') next = tabs[0];
+      else if (e.key === 'End') next = tabs[tabs.length - 1];
+      if (next) {
+        e.preventDefault();
+        switchView(next.id === 'tab-locked' ? 'locked' : 'notes');
+        next.focus();
+      }
+    });
+  }
 
   document.getElementById('btn-settings').addEventListener('click', openSettings);
   document.getElementById('btn-save-settings').addEventListener('click', saveSettings);
@@ -3806,7 +4261,7 @@ function wireStaticEvents() {
         results.push(`${formatBytes(files[i].size)} \u2192 ${formatBytes(estimateImageBytes(dataUrl))}`);
         // Compression is slow; if you've since opened a different note, these
         // must not be attached to it.
-        if (editingNoteId !== targetNoteId) { dropped++; continue; }
+        if (!editorShowing(targetNoteId)) { dropped++; continue; }
         if (!canFitMedia(dataUrl.length + 4).ok) { refused++; continue; }
         addPhotoToBatch(batch, dataUrl); // shown as soon as it's ready, not all at once at the end
         updateSizeMeter();
@@ -3858,9 +4313,10 @@ function wireStaticEvents() {
     const pw = document.getElementById('quick-password').value;
     const confirmPw = document.getElementById('quick-password-confirm').value;
     const err = document.getElementById('quick-lock-error');
-    if (!pw || pw.length < 4) { err.textContent = 'Choose a password (4+ characters).'; err.classList.remove('visually-hidden'); return; }
+    if (!pw || pw.length < 8) { err.textContent = 'Choose a password (8+ characters).'; err.classList.remove('visually-hidden'); return; }
     if (pw !== confirmPw) { err.textContent = 'Passwords don\u2019t match.'; err.classList.remove('visually-hidden'); return; }
     pendingLock = { type: 'quick', password: pw, existing: false };
+    if (editingNoteId) clearLocalDraft(editingNoteId);
     hide('overlay-lock-chooser');
     renderLockSummary();
     onEditorContentChanged();
@@ -3871,7 +4327,7 @@ function wireStaticEvents() {
     const confirmPw = document.getElementById('time-password-confirm').value;
     const unlockVal = document.getElementById('time-unlock-at').value;
     const err = document.getElementById('time-lock-error');
-    if (!pw || pw.length < 4) { err.textContent = 'Choose a password (4+ characters).'; err.classList.remove('visually-hidden'); return; }
+    if (!pw || pw.length < 8) { err.textContent = 'Choose a password (8+ characters).'; err.classList.remove('visually-hidden'); return; }
     if (pw !== confirmPw) { err.textContent = 'Passwords don\u2019t match.'; err.classList.remove('visually-hidden'); return; }
     if (!unlockVal) { err.textContent = 'Pick a date and time.'; err.classList.remove('visually-hidden'); return; }
     const unlockAt = new Date(unlockVal).getTime();
@@ -3879,19 +4335,26 @@ function wireStaticEvents() {
     // (the note just stays \"ready to open\"); any *changed* date must be in the future.
     const keepsDate = !!(pendingLock && pendingLock.type === 'time' && pendingLock.unlockAt
       && Math.floor(pendingLock.unlockAt / 60000) === Math.floor(unlockAt / 60000));
-    if (unlockAt <= lockNow() && !keepsDate) { err.textContent = 'Pick a time in the future.'; err.classList.remove('visually-hidden'); return; }
-    pendingLock = { type: 'time', password: pw, unlockAt: keepsDate ? pendingLock.unlockAt : unlockAt, existing: false };
+    if (!Number.isFinite(unlockAt) || (unlockAt <= lockNow() && !keepsDate)) { err.textContent = 'Pick a valid time in the future.'; err.classList.remove('visually-hidden'); return; }
+    pendingLock = {
+      type: 'time',
+      password: pw,
+      password2: keepsDate ? ((pendingLock && pendingLock.password2) || (currentUnlockCreds && currentUnlockCreds.password2) || undefined) : generateSecondPassword(),
+      unlockAt: keepsDate ? pendingLock.unlockAt : unlockAt,
+      existing: false,
+    };
+    if (editingNoteId) clearLocalDraft(editingNoteId);
     hide('overlay-lock-chooser');
     renderLockSummary();
     onEditorContentChanged();
   });
 
   document.getElementById('btn-remove-lock').addEventListener('click', () => {
-    const doRemove = () => { pendingLock = null; renderLockSummary(); onEditorContentChanged(); };
+    const doRemove = () => { pendingLock = null; currentUnlockCreds = null; renderLockSummary(); onEditorContentChanged(); };
     // One stray tap used to strip the lock and autosave the note unencrypted
     // two seconds later. If the server already holds an encrypted copy, ask first.
     if (pendingLock && (pendingLock.existing || noteExistsOnServer)) {
-      openConfirm('Remove this lock?', 'The note will be saved without a password, and its text, photos and drawing will no longer be encrypted.', doRemove, 'Remove lock');
+      openConfirm('Remove this lock?', 'The note will be saved without a password, and its text, photos, audio, video and drawing will no longer be encrypted.', doRemove, 'Remove lock');
     } else {
       doRemove();
     }
@@ -3940,7 +4403,8 @@ function sanitizeHTML(html) {
       }
       if (tag === 'KS-VIDEO') { // a video card in the text: only its id survives
         const videoId = child.getAttribute('data-id') || '';
-        if (window.KSVideo && KSVideo.VIDEO_ID_RE.test(videoId)) out += '<ks-video data-id="' + videoId + '"></ks-video>';
+        const videoRe = (window.KSVideo && KSVideo.VIDEO_ID_RE) || /^v[a-z0-9]{6,31}$/;
+        if (videoRe.test(videoId)) out += '<ks-video data-id="' + videoId + '"></ks-video>';
         return;
       }
       if (tag === 'KS-PHOTO') { // a photo in the text: only its id survives
@@ -4376,12 +4840,12 @@ function insertAudioChip(id) {
   let range = null;
   if (savedBodyRange && body.contains(savedBodyRange.startContainer) && body.contains(savedBodyRange.endContainer)) {
     range = savedBodyRange.cloneRange();
+    range.collapse(false);
   } else {
     range = document.createRange();
     range.selectNodeContents(body);
     range.collapse(false);
   }
-  range.deleteContents();
   range.insertNode(space);
   space.parentNode.insertBefore(chip, space);
   const sel = window.getSelection();
@@ -4666,7 +5130,13 @@ function voiceSeek(key, getSource, frac) {
   }
   const el = voiceEnsureEl();
   if (Voice.loadedKey !== Voice.key) { el.src = Voice.src.url; Voice.loadedKey = Voice.key; el.load(); }
-  try { el.currentTime = t; } catch (e) { /* not seekable yet */ }
+  clearTimeout(Voice.watchdog);
+  if (el.readyState === 0) {
+    el.addEventListener('loadedmetadata', () => { try { el.currentTime = t; } catch (e) {} voiceChanged(); }, { once: true });
+  } else {
+    try { el.currentTime = t; } catch (e) { /* not seekable yet */ }
+  }
+  if (Voice.playing) voiceWatch();
   voiceChanged();
 }
 
@@ -4751,6 +5221,9 @@ function registerMiniPlayer(el, key, known, getSource) {
     if (k) voiceSeek(k, getSource, Number(seek.value) / 1000);
     updateMiniPlayer(mp);
   });
+  const resetDrag = () => { if (mp.dragging) { mp.dragging = false; updateMiniPlayer(mp); } };
+  seek.addEventListener('pointercancel', resetDrag);
+  seek.addEventListener('blur', resetDrag);
   updateMiniPlayer(mp);
 }
 
@@ -4793,8 +5266,8 @@ function pauseClipPreview() {
 function clipFileName(id) {
   const clip = editorAudio[id];
   const ext = audioExtFor(clip);
-  const cleanName = (clip.name || '').replace(/\.[a-z0-9]{2,5}$/i, '').replace(/[^\w\- ]+/g, '').trim();
-  const title = (document.getElementById('editor-title').value || 'note').replace(/[^\w\- ]+/g, '').trim().slice(0, 40) || 'note';
+  const cleanName = (clip.name || '').replace(/\.[a-z0-9]{2,5}$/i, '').replace(/[^\p{L}\p{N}\- ]+/gu, '').trim();
+  const title = (document.getElementById('editor-title').value || 'note').replace(/[^\p{L}\p{N}\- ]+/gu, '').trim().slice(0, 40) || 'note';
   return `${cleanName || `${title} - clip ${clipIndex(id)}`}.${ext}`.replace(/\s+/g, '-');
 }
 
@@ -4817,6 +5290,9 @@ async function downloadClip(id) {
 function deleteClip(id) {
   document.querySelectorAll(`#editor-body ks-audio[data-id="${id}"]`).forEach((el) => el.remove());
   voiceStopIf('clip:' + id);
+  const oldUrl = audioUrls.get(id);
+  if (oldUrl) { URL.revokeObjectURL(oldUrl); audioUrls.delete(id); }
+  delete editorAudio[id];
   hide('overlay-clip');
   updateSizeMeter();
   onEditorContentChanged();
@@ -5153,7 +5629,7 @@ async function attachAudioFiles(files) {
     const file = files[n];
     const ext = ((/\.([a-z0-9]+)$/i.exec(file.name) || [])[1] || '').toLowerCase();
     if (!/^audio\//.test(file.type) && !EXT_MIME[ext]) { unreadable++; continue; }
-    if (!canFitMedia(Math.ceil(file.size * 4 / 3) + 40).ok) { refused++; continue; }
+    if (mode !== 'compressed' && !canFitMedia(Math.ceil(file.size * 4 / 3) + 40).ok) { refused++; continue; }
     try {
       let blob = file;
       let name = file.name;
@@ -5172,7 +5648,10 @@ async function attachAudioFiles(files) {
         } catch (e) { keptOriginal++; }
       }
       let data = await readFileAsDataURL(blob);
-      if (!/^data:audio\//.test(data)) data = data.replace(/^data:[^;,]*/, 'data:' + (EXT_MIME[ext] || 'audio/mpeg'));
+      if (!/^data:audio\//.test(data)) {
+        const mime = (blob.type && /^video\//i.test(blob.type)) ? blob.type.replace(/^video\//i, 'audio/') : (blob.type && /^audio\//i.test(blob.type) ? blob.type : (EXT_MIME[ext] || 'audio/mpeg'));
+        data = data.replace(/^data:[^;,]*/, 'data:' + mime.split(';')[0]);
+      }
       if (editingNoteId !== targetNoteId) break;
       const url = URL.createObjectURL(file);
       const dur = await probeAudioDuration(url);
@@ -5256,8 +5735,9 @@ function recorderTeardown() {
   stopMicAndMeter();
   voiceStopIf('preview');
   if (Rec.previewUrl) { URL.revokeObjectURL(Rec.previewUrl); Rec.previewUrl = null; }
-  Rec.chunks = []; Rec.blob = null; Rec.bytes = 0; Rec.autoStopped = false;
+  Rec.chunks = []; Rec.blob = null; Rec.bytes = 0; Rec.stopAt = 0; Rec.starting = false; Rec.autoStopped = false;
   Rec.state = 'idle';
+  voiceAudioSession('playback');
 }
 
 function startMeter(stream) {
@@ -5304,21 +5784,29 @@ function guardRecordingSize() {
 }
 
 async function startRecording() {
-  showRecError('');
-  if (!recorderSupported()) { showRecError('Recording isn\u2019t available here. You can still attach an audio file.'); return; }
-  const mode = await askMediaQuality('record');
-  if (!mode) return;
-  voiceStop();
-  voiceAudioSession('play-and-record');
-  // Original: the browser's own noise suppression, echo cancellation and auto-gain are switched off
-  // (they muddy music and quiet sounds), and the recorder runs at its highest quality.
-  const constraints = mode === 'original'
-    ? { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
-    : true;
-  let stream;
-  try { stream = await navigator.mediaDevices.getUserMedia({ audio: constraints }); }
-  catch (e) { showRecError(micErrorText(e)); return; }
-  if (document.getElementById('overlay-record').classList.contains('hidden')) { stream.getTracks().forEach((t) => t.stop()); return; }
+  if (Rec.starting || Rec.state === 'recording') return;
+  Rec.starting = true;
+  Rec.stopAt = 0;
+  const startBtn = document.getElementById('btn-record-start');
+  if (startBtn) startBtn.disabled = true;
+  try {
+    showRecError('');
+    if (!recorderSupported()) { showRecError('Recording isn\u2019t available here. You can still attach an audio file.'); return; }
+    const mode = await askMediaQuality('record');
+    if (!mode) return;
+    voiceStop();
+    voiceAudioSession('play-and-record');
+    const constraints = mode === 'original'
+      ? { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+      : true;
+    let stream;
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: constraints }); }
+    catch (e) { voiceAudioSession('playback'); showRecError(micErrorText(e)); return; }
+    if (document.getElementById('overlay-record').classList.contains('hidden')) {
+      stream.getTracks().forEach((t) => t.stop());
+      voiceAudioSession('playback');
+      return;
+    }
   const mime = pickRecorderMime();
   const q = mode === 'original' ? AUDIO_QUALITY.max : AUDIO_QUALITY[Config.audioQuality()];
   Rec.bps = q.bps;
@@ -5349,6 +5837,10 @@ async function startRecording() {
   clearInterval(Rec.tick);
   Rec.tick = setInterval(updateRecUI, 150);
   updateRecUI();
+  } finally {
+    Rec.starting = false;
+    if (startBtn) startBtn.disabled = false;
+  }
 }
 
 function stopRecording() {
@@ -5361,7 +5853,8 @@ function finishRecording() {
   clearInterval(Rec.tick);
   stopMicAndMeter();
   if (Rec.discard) { Rec.discard = false; return; }
-  const type = (Rec.recorder && Rec.recorder.mimeType) || 'audio/webm';
+  const rawType = (Rec.recorder && Rec.recorder.mimeType) || 'audio/webm';
+  const type = /^video\//i.test(rawType) ? rawType.replace(/^video\//i, 'audio/') : rawType;
   const blob = new Blob(Rec.chunks, { type });
   Rec.chunks = [];
   voiceAudioSession('playback'); // the mic is closed: play through the speaker again
@@ -5629,6 +6122,8 @@ function inkLoad(data) {
   Ink.undoStack = [];
   Ink.redoStack = [];
   Ink.current = null;
+  if (Ink.raf) { cancelAnimationFrame(Ink.raf); Ink.raf = 0; }
+  if (Ink.live) { const lctx = Ink.live.getContext('2d'); if (lctx) lctx.clearRect(0, 0, Ink.live.width, Ink.live.height); }
   inkRender();
   inkUpdateButtons();
 }
@@ -5802,6 +6297,8 @@ function inkEvents(e) {
 function inkPointerDown(e) {
   if (!Ink.mode || Ink.tool === 'scroll' || !e.isPrimary) return;
   if (e.pointerType === 'mouse' && e.button !== 0) return;
+  if (!Ink.W) inkResize();
+  if (!Ink.W) return;
   e.preventDefault();
   Ink.live.setPointerCapture(e.pointerId);
   const pt = inkPoint(e);
@@ -5935,8 +6432,13 @@ function setupInk() {
 async function checkForRecoverableDrafts() {
   const ids = await listLocalDraftIds();
   if (!ids.length) return;
-  const id = ids[0]; // surface one at a time; picking another note re-checks
-  const draft = await loadLocalDraft(id);
+  let id = null;
+  let draft = null;
+  for (const cand of ids) {
+    const d = await loadLocalDraft(cand);
+    if (d) { id = cand; draft = d; break; }
+    await clearLocalDraft(cand);
+  }
   if (!draft) return;
 
   const banner = document.getElementById('draft-banner');
@@ -5956,7 +6458,8 @@ async function checkForRecoverableDrafts() {
       openUnlockFlow(meta);
       return;
     }
-    openEditorWithContent(meta, { title: draft.title, body: draft.body, html: draft.html, images: draft.images || [], imageIds: draft.imageIds, drawing: draft.drawing, audio: draft.audio });
+    openEditorWithContent(meta, { title: draft.title, body: draft.body, html: draft.html, images: draft.images || [], imageIds: draft.imageIds, drawing: draft.drawing, audio: draft.audio, videos: draft.videos }, { fromDraft: true });
+    Object.values(editorVideos).forEach((v) => { if (window.KSMedia && v && v.base) KSMedia.hold(v.base); });
     // If the note this draft belonged to no longer exists server-side,
     // openEditorWithContent treats it as a new note under a new id — so
     // this old entry is now orphaned and needs clearing explicitly, or
@@ -5968,6 +6471,7 @@ async function checkForRecoverableDrafts() {
   document.getElementById('draft-banner-dismiss').onclick = async () => {
     banner.classList.add('hidden');
     await clearLocalDraft(id);
+    checkForRecoverableDrafts();
   };
 }
 
@@ -5975,47 +6479,124 @@ async function checkForRecoverableDrafts() {
  * Init
  * ------------------------------------------------------------------- */
 
+// The opening sequence. The notes saved on this device are drawn FIRST, before anything waits on the network or on
+// the "is this device still allowed in" check (which can take seconds on a bad connection); the start-up panel
+// (Boot) reports each step as it goes. A remembered block still stops everything (init), and what a master has
+// switched off for this device is already known from the last visit, so the first draw respects it.
+async function bootLoad() {
+  Boot.begin('local');
+  try {
+    notesCache = await buildNotesCacheFromLocal();
+    if (notesCache.length) {
+      notesLoaded = true;
+      renderNotes();
+      renderLocked();
+    } else {
+      document.getElementById('grid-notes').innerHTML = skeletonHTML(6);
+      document.getElementById('grid-locked').innerHTML = skeletonHTML(3);
+      applyAccessUI();
+    }
+    Boot.done('local', notesCache.length ? plural(notesCache.length, 'note', 'notes') + ' shown from this device' : 'Nothing saved on this device yet');
+  } catch (e) { Boot.fail('local', 'Could not read this device’s saved notes'); }
+
+  Boot.begin('queue');
+  try {
+    await refreshOutboxCount();
+    Boot.done('queue', outboxCount ? plural(outboxCount, 'edit', 'edits') + ' waiting' : 'Nothing waiting');
+  } catch (e) { Boot.fail('queue', 'Could not read the waiting edits'); }
+  showUnsyncedSummary().catch(() => {});   // data left waiting by an earlier session? say so straight away, with the counts
+
+  // Who is this device, and what may it open? (devices.js) If that is already known from the last visit the rest
+  // carries on at the same time; if not (first start, or first start after an update) it waits for the answer, so
+  // nothing is fetched for a device that may not see it.
+  Boot.begin('access');
+  const knownAtStart = accessNow().known;
+  const verdict = (window.KSDevices ? KSDevices.start() : Promise.resolve({ allowed: true })).then((r) => {
+    const a = accessNow();
+    if (!r.allowed) Boot.fail('access', 'This device is not allowed in');
+    else Boot.done('access', window.KSDevices ? (a.master ? 'Master — opens everything' : (a.notes ? 'Notes' : 'No notes') + ' · ' + (a.locked ? 'locked notes' : 'no locked notes')) : 'No device checks in this build');
+    return r;
+  });
+  if (!knownAtStart) {
+    const r = await verdict;
+    if (!r.allowed) { Boot.skipRest('This device is not allowed in'); return; }
+  }
+
+  await syncFromServer();
+  const r = await verdict;
+  if (!r.allowed) { Boot.skipRest('This device is not allowed in'); return; }
+  if (!notesLoaded && !notesCache.length) {
+    const offline = !navigator.onLine || !isOnline;
+    const empty = emptyStateHTML(
+      offline ? 'You’re offline' : 'Could not load notes',
+      offline
+        ? 'Your notes will appear here once you’ve connected at least once.'
+        : (lastListErrorMessage || 'Check your connection and try again.')
+    );
+    document.getElementById('grid-notes').innerHTML = empty;
+    document.getElementById('grid-locked').innerHTML = empty;
+  }
+
+  Boot.begin('drafts');
+  try {
+    await checkForRecoverableDrafts();
+    const found = !document.getElementById('draft-banner').classList.contains('hidden');
+    Boot.done('drafts', found ? 'Found unsaved changes — see the banner above' : 'None');
+  } catch (e) { Boot.fail('drafts', 'Could not look for drafts'); }
+  Boot.begin('tidy');
+  try { await sweepVideoOrphans(); Boot.done('tidy', 'Done'); } catch (e) { Boot.fail('tidy', 'Could not tidy up'); }
+}
+
 function init() {
+  // Clean up legacy Cloudflare migration keys if present (#38)
+  try { localStorage.removeItem('ks_token'); localStorage.removeItem('ks_apiBase'); } catch (e) {}
+  // Strip any ?_r= cache-buster left by Force refresh so the URL matches the SW offline cache
+  try {
+    const curUrl = new URL(location.href);
+    if (curUrl.searchParams.has('_r')) {
+      curUrl.searchParams.delete('_r');
+      history.replaceState(null, '', curUrl.pathname + (curUrl.search || '') + (curUrl.hash || ''));
+    }
+  } catch (e) {}
+
   wireStaticEvents();
-  setupSecretFields();
   setupKeyboardViewportFix();
   setupLightbox();
   setupRichText();
   setupMedia();
   setupInk();
-  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.14.0');
+  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.15.4');
 
   // Connectivity: react the moment the browser notices, and keep retrying
   // on a timer since navigator.onLine can't see a connection that's up but
   // not actually reaching Backblaze.
-  window.addEventListener('online', () => { setOnline(true); flushOutbox(); });
+  window.addEventListener('online', () => { if (window.KSDevices && KSDevices.locked()) return; setOnline(true); flushOutbox(); });
   window.addEventListener('offline', () => setOnline(false));
-  setInterval(() => { if (navigator.onLine && outboxCount > 0) flushOutbox(); }, 30000);
+  setInterval(() => { if (navigator.onLine && outboxCount > 0 && !(window.KSDevices && KSDevices.locked())) flushOutbox(); }, 30000);
   updateSyncStatusUI();
 
-  // Leaving the app (switching away, closing the tab) with an edit not yet sent: start saving it
-  // now rather than waiting for the autosave timer. It is written to the device first, so even if
-  // the page is killed a moment later the change is not lost.
+  // Leaving the app (switching away, closing the tab) with an edit not yet sent: for unlocked notes,
+  // flush the local draft immediately before starting the background sync; locked notes skip plaintext
+  // local drafts and go straight through encrypted outbox persistence in triggerAutosave().
   const editorOpen = () => editingNoteId && !document.getElementById('overlay-editor').classList.contains('hidden');
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden' && editorOpen()) triggerAutosave(); });
-  window.addEventListener('pagehide', () => { if (editorOpen()) triggerAutosave(); });
+  const flushBeforeLeave = () => {
+    if (!editorOpen()) return;
+    if (noteHasContent() && !lockIsActive()) saveDraftNow(editingNoteId);
+    triggerAutosave();
+  };
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushBeforeLeave(); });
+  window.addEventListener('pagehide', flushBeforeLeave);
 
+  Boot.init();
   if (window.KSDevices && KSDevices.locked()) {
     // This device was blocked or signed out by a master: devices.js shows the notice. Nothing is loaded.
+    Boot.skipRest('This device is signed out');
   } else if (!Config.configured()) {
+    Boot.skipRest('Backblaze is not set up yet');
     openSettings();
     toast('Add your Backblaze bucket details to get started');
   } else {
-    // Who is this device, and is it still allowed in? (devices.js) A slow or missing connection never
-    // keeps the notes from opening; a remembered block does.
-    const openNotes = () => {
-      // Data left waiting by an earlier session? Say so straight away, with the counts.
-      showUnsyncedSummary().catch(() => {});
-      refreshNotes().then(checkForRecoverableDrafts).then(sweepVideoOrphans);
-      if (window.KSOffline) setTimeout(() => KSOffline.resume(), 1500); // a full offline sync that was running carries on
-    };
-    if (window.KSDevices) KSDevices.start().then((r) => { if (r.allowed) openNotes(); });
-    else openNotes();
+    bootLoad();
   }
 
   if ('serviceWorker' in navigator) {

@@ -9,10 +9,51 @@
 <link rel="manifest" href="manifest.json">
 <link rel="icon" href="icon-192.png">
 <link rel="apple-touch-icon" href="icon-192.png">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: blob:; media-src 'self' data: blob:; connect-src 'self' https://*.backblazeb2.com; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self';">
 <style>
+  @font-face {
+    font-family: 'Inter';
+    src: url('./font-inter-400.woff2') format('woff2');
+    font-weight: 400;
+    font-style: normal;
+    font-display: swap;
+  }
+  @font-face {
+    font-family: 'Inter';
+    src: url('./font-inter-500.woff2') format('woff2');
+    font-weight: 500;
+    font-style: normal;
+    font-display: swap;
+  }
+  @font-face {
+    font-family: 'Inter';
+    src: url('./font-inter-600.woff2') format('woff2');
+    font-weight: 600;
+    font-style: normal;
+    font-display: swap;
+  }
+  @font-face {
+    font-family: 'Inter';
+    src: url('./font-inter-700.woff2') format('woff2');
+    font-weight: 700;
+    font-style: normal;
+    font-display: swap;
+  }
+  @font-face {
+    font-family: 'Keepsake Serif';
+    src: url('./font-serif-400.woff2') format('woff2');
+    font-weight: 400;
+    font-style: normal;
+    font-display: swap;
+  }
+  @font-face {
+    font-family: 'Keepsake Serif';
+    src: url('./font-serif-700.woff2') format('woff2');
+    font-weight: 700;
+    font-style: normal;
+    font-display: swap;
+  }
+
   :root {
     --pine: #21423A;
     --pine-light: #2F5D50;
@@ -30,7 +71,7 @@
     --line: #DEDACD;
     --line-strong: #8C8A7E; /* form-control edges: 3:1 non-text contrast */
     --shadow: 0 1px 2px rgba(35,36,31,0.06), 0 4px 14px rgba(35,36,31,0.06);
-    --font-display: 'Source Serif 4', Georgia, serif;
+    --font-display: 'Keepsake Serif', 'Source Serif 4', Georgia, serif;
     --font-body: 'Inter', system-ui, -apple-system, sans-serif;
     --radius: 14px;
     --radius-sm: 10px;
@@ -38,11 +79,21 @@
     --space-2: 8px;
     --space-3: 16px;
     --space-4: 24px;
+    --ok-bg: #E4EDE9;
+    --danger-bg: #F5E7E7;
+    --ease-out: cubic-bezier(0.22, 0.8, 0.3, 1);
     --z-sticky: 20;
     --z-modal: 100;
-    --z-toast: 200;
+    --z-toast: 600;
     --z-lightbox: 400;
     --z-confirm: 500; /* above the photo viewer, so "Remove this photo?" can be answered */
+    --z-lock: 900;
+    --space-5: 32px;
+    --radius-lg: 20px;
+    --radius-full: 9999px;
+    --shadow-sm: 0 1px 2px rgba(35,36,31,0.05);
+    --shadow-md: 0 4px 12px rgba(35,36,31,0.08), 0 1px 3px rgba(35,36,31,0.05);
+    --shadow-lg: 0 12px 28px rgba(35,36,31,0.14), 0 4px 10px rgba(35,36,31,0.07);
     --gutter-l: max(20px, env(safe-area-inset-left, 0px));
     --gutter-r: max(20px, env(safe-area-inset-right, 0px));
     color-scheme: light;
@@ -412,8 +463,10 @@
   /* ---------- Grid ---------- */
 
   .grid {
-    column-width: 260px;
-    column-gap: 16px;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 260px), 1fr));
+    gap: var(--space-3);
+    align-items: start;
   }
 
   .grid.hidden { display: none; }
@@ -618,8 +671,6 @@
   .dev-facts dt { color: var(--ink-soft); }
   .dev-facts dd { margin: 0; overflow-wrap: anywhere; }
   .dev-err { color: var(--brick); }
-  .off-bar { height: 8px; margin: 10px 0 4px; border-radius: 999px; background: var(--card-2); border: 1px solid var(--line); overflow: hidden; }
-  .off-bar > i { display: block; height: 100%; width: 0; background: var(--pine); transition: width .3s; }
   .dev-check { display: flex; align-items: flex-start; gap: 8px; min-height: 44px; margin: 10px 0 4px; cursor: pointer; }
   .dev-check input { margin-top: 3px; width: 18px; height: 18px; flex: none; }
   .ks-dev-ov textarea { width: 100%; box-sizing: border-box; font: 0.75rem/1.4 ui-monospace, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
@@ -1240,7 +1291,7 @@
     #btn-settings { order: 2; }
     .tabbar { order: 3; flex: 1 0 100%; }
     .tabbar button { flex: 1; }
-    .grid { column-width: 100%; }
+    .grid { grid-template-columns: 1fr; }
   }
 
   @media (forced-colors: active) {
@@ -1823,18 +1874,315 @@
     .vp-ring, .vp-spin { animation: none !important; border-top-color: var(--vp-track); border-right-color: var(--vp-accent); }
   }
 
+  /* =====================================================================
+     v1.15 — start-up panel, skeleton cards, Offline copy, Devices / Activity log
+     Rules: every colour is a token, targets are 44px, gaps are multiples of 8px (4px for tight icon gaps), motion is
+     transform/opacity only, state is never colour alone (icon or text too), and reduced-motion / forced-colors /
+     prefers-contrast are handled at the end of this block.
+     ===================================================================== */
+
+  /* ---------- Start-up panel ---------- */
+  .boot {
+    margin-block: 0 var(--space-3);
+    padding: var(--space-3);
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-inline-start: 4px solid var(--pine-light);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+  }
+  .boot[data-state="done"] { border-inline-start-color: var(--pine); }
+  .boot[data-state="attention"] { border-inline-start-color: var(--amber); }
+  .boot-head { display: flex; align-items: center; gap: var(--space-3); }
+  .boot-icon {
+    flex: none; position: relative; inline-size: 24px; block-size: 24px;
+    border-radius: 50%; border: 3px solid var(--line); border-block-start-color: var(--pine-light);
+    animation: ks-spin 0.9s linear infinite;
+  }
+  .boot[data-state="working"] .boot-icon { border-color: var(--line); border-block-start-color: var(--pine-light); }
+  .boot[data-state="done"] .boot-icon,
+  .boot[data-state="attention"] .boot-icon { animation: none; border: 0; display: grid; place-items: center; font-weight: 700; line-height: 1; }
+  .boot[data-state="done"] .boot-icon { background: var(--pine); color: var(--card); }
+  .boot[data-state="done"] .boot-icon::before { content: "\2713"; }
+  .boot[data-state="attention"] .boot-icon { background: var(--amber); color: var(--card); }
+  .boot[data-state="attention"] .boot-icon::before { content: "!"; }
+  .boot-text { flex: 1 1 auto; min-inline-size: 0; display: flex; flex-direction: column; gap: 2px; }
+  .boot-title { font-family: var(--font-display); font-size: 1.0625rem; line-height: 1.3; text-wrap: balance; }
+  .boot-sub { font-size: 0.8125rem; line-height: 1.4; color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+  .boot-toggle {
+    flex: none; min-block-size: 44px; min-inline-size: 44px; padding-inline: var(--space-3);
+    border-radius: var(--radius-sm); background: var(--card-2); color: var(--ink);
+    font: 600 0.8125rem/1 var(--font-body);
+    transition: background-color 0.15s ease, transform 0.1s ease;
+  }
+  .boot-toggle:hover { background: var(--line); }
+  .boot-toggle:active { transform: scale(0.97); }
+  .boot-track { block-size: 8px; margin-block: var(--space-3) 0; border-radius: 999px; background: var(--card-2); border: 1px solid var(--line); overflow: hidden; }
+  .boot-track > i { display: block; block-size: 100%; inline-size: 100%; background: var(--pine); transform: scaleX(0); transform-origin: left center; transition: transform 0.35s var(--ease-out); }
+  [dir="rtl"] .boot-track > i { transform-origin: right center; }
+  /* Fold away by animating grid rows (no height animation, nothing is measured) */
+  .boot-body { display: grid; grid-template-rows: 1fr; transition: grid-template-rows 0.25s var(--ease-out), opacity 0.2s ease; }
+  .boot[data-open="false"] .boot-body { grid-template-rows: 0fr; opacity: 0; }
+  .boot[data-open="false"] .boot-track { margin-block-end: 0; }
+  .boot-body-inner { overflow: hidden; min-block-size: 0; }
+  .boot-steps { list-style: none; margin: var(--space-3) 0 0; padding: 0; display: grid; gap: var(--space-1); }
+  .boot-step { display: grid; grid-template-columns: 24px 1fr auto; align-items: start; gap: var(--space-2); padding-block: var(--space-1); font-size: 0.8125rem; line-height: 1.4; color: var(--ink-soft); }
+  .boot-step-icon { inline-size: 24px; text-align: center; font-weight: 700; color: var(--ink-faint); }
+  .boot-step-main { min-inline-size: 0; display: flex; flex-direction: column; }
+  .boot-step-name { color: var(--ink); font-weight: 500; }
+  .boot-step-detail { overflow-wrap: anywhere; }
+  .boot-step-detail:empty { display: none; }
+  .boot-step-time { font-variant-numeric: tabular-nums; color: var(--ink-soft); white-space: nowrap; }
+  .boot-step[data-state="running"] .boot-step-icon::before {
+    content: ""; display: inline-block; inline-size: 12px; block-size: 12px; border-radius: 50%;
+    border: 2px solid var(--line); border-block-start-color: var(--pine-light); animation: ks-spin 0.9s linear infinite; vertical-align: -1px;
+  }
+  .boot-step[data-state="done"] .boot-step-icon { color: var(--pine); }
+  .boot-step[data-state="error"] .boot-step-icon { color: var(--brick); }
+  .boot-step[data-state="error"] .boot-step-detail { color: var(--brick); }
+  .boot-step[data-state="pending"] .boot-step-name { color: var(--ink-soft); font-weight: 400; }
+
+  @keyframes ks-spin { to { transform: rotate(360deg); } }
+  @keyframes ks-shimmer { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+
+  /* ---------- Skeleton cards (same shape as a real card, so nothing jumps when the notes arrive) ---------- */
+  .card.skeleton { pointer-events: none; }
+  .sk-line { position: relative; overflow: hidden; block-size: 12px; margin-block: 10px; border-radius: 6px; background: var(--card-2); }
+  .sk-line.sk-title { block-size: 18px; inline-size: 60%; margin-block-start: 4px; }
+  .sk-line.sk-short { inline-size: 45%; }
+  .sk-line::after {
+    content: ""; position: absolute; inset: 0;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.65), transparent);
+    animation: ks-shimmer 1.3s ease-in-out infinite;
+  }
+
+  /* ---------- Buttons added in 1.15 ---------- */
+  .btn-outline-danger { background: none; color: var(--brick); border: 1px solid var(--brick); }
+  .btn-outline-danger:hover { background: var(--danger-bg); }
+  .btn-outline-danger:active:not(:disabled) { transform: scale(0.97); }
+  .btn:disabled, .btn[aria-disabled="true"] { opacity: 0.55; cursor: not-allowed; }
+
+  /* ---------- Offline copy ---------- */
+  .off-status { padding: var(--space-3); background: var(--card-2); border: 1px solid var(--line); border-inline-start: 4px solid var(--line-strong); border-radius: var(--radius-sm); }
+  .off-status[data-state="running"] { border-inline-start-color: var(--pine-light); }
+  .off-status[data-state="done"] { border-inline-start-color: var(--pine); background: var(--ok-bg); }
+  .off-status[data-state="paused"] { border-inline-start-color: var(--amber); background: var(--amber-bg); }
+  .off-status[data-state="error"] { border-inline-start-color: var(--brick); background: var(--danger-bg); }
+  .off-status-head { display: flex; align-items: flex-start; gap: var(--space-2); }
+  .off-status-head b { display: block; line-height: 1.3; text-wrap: balance; }
+  .off-status-head .hint { margin-block-start: 2px; }
+  /* the dot is always paired with the title text, so state never depends on colour alone */
+  .off-dot { flex: none; inline-size: 12px; block-size: 12px; margin-block-start: 4px; border-radius: 50%; background: var(--line-strong); }
+  .off-status[data-state="running"] .off-dot { background: transparent; border: 2px solid var(--line); border-block-start-color: var(--pine-light); animation: ks-spin 0.9s linear infinite; }
+  .off-status[data-state="done"] .off-dot { background: var(--pine); }
+  .off-status[data-state="paused"] .off-dot { background: var(--amber); }
+  .off-status[data-state="error"] .off-dot { background: var(--brick); }
+  .off-track { block-size: 8px; margin-block: var(--space-3) var(--space-1); border-radius: 999px; background: var(--card); border: 1px solid var(--line); overflow: hidden; }
+  .off-fill { display: block; block-size: 100%; inline-size: 100%; background: var(--pine); transform: scaleX(0); transform-origin: left center; transition: transform 0.3s var(--ease-out); }
+  .off-cur { overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+  .off-cur:empty { display: none; }
+  .off-steps { list-style: none; margin: var(--space-2) 0 0; padding: 0; display: grid; gap: var(--space-1); }
+  .off-step { display: grid; grid-template-columns: 24px auto 1fr; align-items: baseline; gap: var(--space-1) var(--space-2); font-size: 0.8125rem; line-height: 1.4; color: var(--ink-soft); }
+  .off-step-icon { text-align: center; font-weight: 700; }
+  .off-step-name { color: var(--ink); font-weight: 500; }
+  .off-step-detail { text-align: end; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+  .off-step[data-state="running"] .off-step-icon::before { content: ""; display: inline-block; inline-size: 12px; block-size: 12px; border-radius: 50%; border: 2px solid var(--line); border-block-start-color: var(--pine-light); animation: ks-spin 0.9s linear infinite; vertical-align: -1px; }
+  .off-step[data-state="done"] .off-step-icon { color: var(--pine); }
+  .off-step[data-state="paused"] .off-step-icon { color: var(--amber); }
+  .off-step[data-state="pending"] .off-step-name { color: var(--ink-soft); font-weight: 400; }
+  .off-h { margin: var(--space-4) 0 var(--space-2); padding: 0; font-family: var(--font-display); font-size: 1rem; font-weight: 600; }
+  .off-have { display: grid; grid-template-columns: max-content 1fr; gap: var(--space-1) var(--space-3); margin: 0 0 var(--space-2); font-size: 0.875rem; font-variant-numeric: tabular-nums; }
+  .off-have dt { color: var(--ink-soft); }
+  .off-have dd { margin: 0; overflow-wrap: anywhere; }
+  .off-have + .hint { margin-block-end: var(--space-3); }
+  .off-pick { margin: 0; padding: 0; border: 0; min-inline-size: 0; }
+  .off-pick legend { float: none; }
+  .off-check { display: flex; align-items: flex-start; gap: var(--space-2); min-block-size: 44px; padding-block: var(--space-2); cursor: pointer; }
+  .off-check input { flex: none; inline-size: 20px; block-size: 20px; margin: 2px 0 0; accent-color: var(--pine); }
+  .off-check input:disabled { cursor: not-allowed; opacity: 0.55; }
+  .off-check:has(input:disabled) { cursor: not-allowed; }
+  .off-check span { display: flex; flex-direction: column; gap: 2px; }
+  .off-check small { color: var(--ink-soft); font-size: 0.8125rem; line-height: 1.4; }
+  #off-buttons { margin-block-start: var(--space-3); }
+
+  /* ---------- Devices and Activity log (two separate screens now) ---------- */
+  .dev-toolbar { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: var(--space-2) var(--space-3); margin-block: 0 var(--space-3); }
+  .dev-toolbar .hint { margin: 0; flex: 1 1 14rem; text-wrap: balance; }
+  .dev-filters { justify-content: flex-start; }
+  .dev-select { display: flex; flex-direction: column; gap: var(--space-1); flex: 1 1 10rem; min-inline-size: 0; font-size: 0.8125rem; font-weight: 600; color: var(--ink-soft); }
+  .dev-select select {
+    min-block-size: 44px; inline-size: 100%; padding-inline: 12px; border: 1px solid var(--line-strong); border-radius: var(--radius-sm);
+    background: var(--card); color: var(--ink); font: 500 0.9375rem/1.2 var(--font-body);
+  }
+  .dev-access { margin: var(--space-2) 0 var(--space-3); padding: 0; border: 0; min-inline-size: 0; }
+  .dev-access .dev-check { margin-block: 0; padding: var(--space-2) var(--space-3); border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--card); }
+  .dev-access .dev-check + .dev-check { margin-block-start: var(--space-2); }
+  .dev-access .dev-check span { display: flex; flex-direction: column; gap: 2px; }
+  .dev-access .dev-check small { color: var(--ink-soft); font-size: 0.8125rem; line-height: 1.4; }
+  .dev-check input { accent-color: var(--pine); }
+  .dev-access-line { align-items: center; margin-block-end: 0; }
+  .dev-row { transition: background-color 0.15s ease, transform 0.1s ease; }
+  .dev-row:active { transform: scale(0.99); }
+  .dev-chip[data-kind="off"] { background: var(--card-2); color: var(--ink-soft); }
+  .dev-select select:disabled, .dev-access input:disabled { cursor: not-allowed; opacity: 0.55; }
+
+  @media (min-width: 640px) {
+    .boot { padding: var(--space-3) var(--space-4); }
+    .dev-select { flex: 0 1 14rem; }
+  }
+
+  @media (prefers-contrast: more) {
+    .boot, .off-status, .dev-row, .dev-access .dev-check { border-color: var(--ink); }
+    .boot-sub, .boot-step-time, .off-check small, .dev-access .dev-check small { color: var(--ink); }
+  }
+  @media (forced-colors: active) {
+    .boot-track > i, .off-fill { background: Highlight; }
+    .boot-track, .off-track, .boot, .off-status { border-color: CanvasText; }
+    .boot[data-state="done"] .boot-icon, .boot[data-state="attention"] .boot-icon { background: Highlight; color: HighlightText; forced-color-adjust: none; }
+    .dev-chip { border: 1px solid CanvasText; }
+  }
   @media (prefers-reduced-motion: reduce) {
-    * { transition: none !important; animation: none !important; }
+    .boot-icon, .off-dot, .boot-step-icon::before, .off-step-icon::before, .sk-line::after { animation: none !important; }
+    .boot-icon { border-block-start-color: var(--pine-light); }
+    .sk-line::after { display: none; }
+    .boot-body { transition: none; }
+  }
+
+  /* =========================================================================
+     CSS Pro Max Polish — Accessibility, Interactive States, Performance,
+     Design Tokens, Responsive Layout, Typography, Forms & Motion
+     ========================================================================= */
+
+  html { scroll-behavior: smooth; }
+
+  .skip-link {
+    position: absolute;
+    inset-inline-start: -9999px;
+    inset-block-start: var(--space-2);
+    z-index: var(--z-confirm);
+    padding: 10px 16px;
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+    background: var(--pine);
+    color: var(--card);
+    border-radius: var(--radius-sm);
+    font-weight: 600;
+    font-size: 0.9375rem;
+    text-decoration: none;
+    box-shadow: var(--shadow-md);
+  }
+  .skip-link:focus-visible {
+    inset-inline-start: var(--space-3);
+  }
+
+  /* Typography & readable measure */
+  h1, h2, h3, .card-title, .brand-mark { text-wrap: balance; }
+  p, .card-preview, .hint { text-wrap: pretty; }
+  .brand-mark { font-size: clamp(1.25rem, 1.1rem + 0.6vw, 1.5rem); }
+  .card, .modal, .editor-sheet, .boot { overflow-wrap: break-word; }
+  .rich-body { line-height: 1.65; max-width: 68ch; }
+  .version-badge, .size-figure, .size-text, .vprep-pct, .vp-time, .mp-time {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Row-first grid cards: crisp elevation, containment & content-visibility */
+  .grid > .card {
+    margin-bottom: 0;
+    contain: layout style;
+    content-visibility: auto;
+    contain-intrinsic-size: auto 180px;
+    box-shadow: var(--shadow-sm);
+    transition: transform 150ms var(--ease-out), box-shadow 150ms var(--ease-out), border-color 150ms ease;
+  }
+  @media (hover: hover) {
+    .grid > .card:hover {
+      transform: translateY(-2px);
+      box-shadow: var(--shadow-md);
+      border-color: color-mix(in oklab, var(--pine) 30%, var(--line));
+    }
+    .btn-primary:hover:not(:disabled) {
+      background: color-mix(in oklab, var(--pine) 88%, black);
+    }
+    .btn-ghost:hover:not(:disabled) {
+      background: color-mix(in oklab, var(--card-2) 85%, var(--pine) 6%);
+    }
+  }
+
+  /* Touch targets (>= 44x44px) & spacing (>= 8px) */
+  .icon-btn, .pw-toggle, .tool-btn, .vp-btn, .lightbox-close, .lightbox-nav {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .btn, .tabbar [role="tab"] {
+    min-height: 44px;
+  }
+  .btn-row, .editor-toolbar, .tool-row {
+    gap: var(--space-2);
+  }
+  button:disabled, input:disabled, select:disabled, textarea:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+  button:disabled { pointer-events: none; }
+
+  /* Full-height mobile dvh & overscroll containment */
+  .editor-screen, .overlay, .lightbox, .vplayer {
+    height: 100dvh;
+  }
+  .overlay, .modal-body, .editor-scroll {
+    overscroll-behavior: contain;
+  }
+  section[id], .field {
+    scroll-margin-top: 84px;
+  }
+
+  /* Valid span-based lock-choice labels */
+  .lock-choice-title, .lock-choice-desc { display: block; }
+  .lightbox-compress:active { transform: translateX(-50%) scale(0.96); }
+
+  /* Form validation & passphrase strength feedback (never color alone) */
+  input:user-invalid, textarea:user-invalid, select:user-invalid {
+    border-color: var(--brick);
+  }
+  .dev-strength { margin-top: 6px; font-weight: 500; }
+  .dev-strength[data-level="weak"] { color: var(--brick); }
+  .dev-strength[data-level="weak"]::before { content: "⚠ "; }
+  .dev-strength[data-level="fair"] { color: var(--amber); }
+  .dev-strength[data-level="fair"]::before { content: "◐ "; }
+  .dev-strength[data-level="strong"] { color: var(--pine); }
+  .dev-strength[data-level="strong"]::before { content: "✓ "; }
+
+  @media (prefers-contrast: more) {
+    :root {
+      --line: #6F6D62;
+      --line-strong: #23241F;
+      --ink-soft: #23241F;
+      --ink-faint: #23241F;
+    }
+    .card, .modal, .btn, input, textarea, select {
+      border-width: 1.5px;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
   }
 </style>
 </head>
 <body>
+<a href="#main-content" class="skip-link">Skip to notes</a>
 
 <header class="top">
   <div class="top-inner">
     <div class="brand">
       <span class="brand-mark">Keepsake</span>
-      <span class="version-badge" id="version-badge">v1.11.0</span>
+      <span class="version-badge" id="version-badge">v1.15.4</span>
       <span class="sync-status hidden" id="sync-status" role="status" aria-live="polite"></span>
       <button class="storage-pill" id="storage-pill" type="button" data-zone="heavy" hidden>
         <span class="storage-pill-icon" id="storage-pill-icon" aria-hidden="true"></span>
@@ -1842,8 +2190,8 @@
       </button>
     </div>
     <div class="tabbar" role="tablist" aria-label="Note views">
-      <button role="tab" id="tab-notes" aria-selected="true">Notes</button>
-      <button role="tab" id="tab-locked" aria-selected="false">Locked</button>
+      <button type="button" role="tab" id="tab-notes" aria-selected="true" aria-controls="grid-notes" tabindex="0">Notes</button>
+      <button type="button" role="tab" id="tab-locked" aria-selected="false" aria-controls="grid-locked" tabindex="-1">Locked</button>
     </div>
     <button class="icon-btn" id="btn-settings" title="Settings" aria-label="Settings">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V21a2 2 0 1 1-4 0v-.2a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.6-1H3a2 2 0 1 1 0-4h.2a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.6V3a2 2 0 1 1 4 0v.2a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.6 1H21a2 2 0 1 1 0 4h-.2a1.7 1.7 0 0 0-1.5 1z"/></svg>
@@ -1855,7 +2203,8 @@
        .sync-bar rule) instead of sliding down over everything on every
        tick. Being part of the header means the full-screen editor
        automatically covers it while you're writing. -->
-  <div class="sync-bar" id="sync-bar" role="status" aria-live="polite">
+  <div class="visually-hidden" id="sync-sr-announce" role="status" aria-live="polite"></div>
+  <div class="sync-bar" id="sync-bar">
     <div class="sync-bar-body">
       <div class="sync-bar-inner">
         <span class="sync-bar-spin" aria-hidden="true"></span>
@@ -1869,7 +2218,22 @@
   </div>
 </header>
 
-<main>
+<main id="main-content">
+  <!-- Start-up panel (app.js: Boot). It is part of the page itself, so it is on screen from the very first paint,
+       before any script has run; the steps are filled in as the app works through them. -->
+  <section class="boot" id="boot" data-state="starting" data-open="true" aria-label="Start-up progress">
+    <div class="boot-head">
+      <span class="boot-icon" aria-hidden="true"></span>
+      <div class="boot-text">
+        <b class="boot-title" id="boot-title" role="status">Opening your notes…</b>
+        <span class="boot-sub" id="boot-sub">Starting up</span>
+      </div>
+      <button type="button" class="boot-toggle" id="boot-toggle" aria-expanded="true" aria-controls="boot-steps">Details</button>
+    </div>
+    <div class="boot-track" aria-hidden="true"><i id="boot-fill"></i></div>
+    <div class="boot-body"><div class="boot-body-inner"><ol class="boot-steps" id="boot-steps"></ol></div></div>
+  </section>
+
   <div class="draft-banner hidden" id="draft-banner">
     <span id="draft-banner-text"></span>
     <button class="btn-text" id="draft-banner-resume">Resume</button>
@@ -1880,8 +2244,8 @@
 
   <button class="composer" id="btn-new-note">Write something…</button>
 
-  <section class="grid" id="grid-notes" aria-label="Notes"></section>
-  <section class="grid hidden" id="grid-locked" aria-label="Locked notes"></section>
+  <section class="grid" id="grid-notes" role="tabpanel" aria-labelledby="tab-notes"></section>
+  <section class="grid hidden" id="grid-locked" role="tabpanel" aria-labelledby="tab-locked"></section>
 </main>
 
 <!-- Editor: full-screen, not a cramped popup -->
@@ -1964,7 +2328,7 @@
     <button class="icon-btn" id="btn-attach-image" title="Add photo" aria-label="Add photo">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8.5" cy="10" r="1.5"/><path d="M21 15l-5-5-4 4-3-3-6 6"/></svg>
     </button>
-    <input type="file" id="input-image" accept="image/*" multiple class="visually-hidden">
+    <input type="file" id="input-image" accept="image/*" multiple class="visually-hidden" tabindex="-1">
     <button class="icon-btn" id="btn-add-audio" title="Add audio" aria-label="Add audio" aria-haspopup="dialog">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
     </button>
@@ -2000,7 +2364,7 @@
   <button class="lightbox-nav lightbox-prev" id="btn-lightbox-prev" aria-label="Previous photo">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 6l-6 6 6 6"/></svg>
   </button>
-  <img class="lightbox-img" id="lightbox-img" src="" alt="">
+  <img class="lightbox-img" id="lightbox-img" alt="">
   <button class="lightbox-nav lightbox-next" id="btn-lightbox-next" aria-label="Next photo">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 6l6 6-6 6"/></svg>
   </button>
@@ -2023,17 +2387,17 @@
     </div>
     <div class="modal-body">
       <div class="lock-choice-row">
-        <button class="lock-choice" id="choice-quick" aria-pressed="false">
-          <div class="lock-choice-title">Quick lock</div>
-          <div class="lock-choice-desc">One password. Opens any time you enter it.</div>
+        <button type="button" class="lock-choice" id="choice-quick" aria-pressed="false">
+          <span class="lock-choice-title">Quick lock</span>
+          <span class="lock-choice-desc">One password (8+ chars). Opens any time you enter it.</span>
         </button>
-        <button class="lock-choice" id="choice-time" aria-pressed="false">
-          <div class="lock-choice-title">Time lock</div>
-          <div class="lock-choice-desc">Stays sealed until a date you set.</div>
+        <button type="button" class="lock-choice" id="choice-time" aria-pressed="false">
+          <span class="lock-choice-title">Time lock</span>
+          <span class="lock-choice-desc">Stays sealed until a date you set.</span>
         </button>
       </div>
 
-      <p class="modal-note">The note's title stays visible on its card so you can tell locked notes apart. Everything inside — text, photos and drawing — is encrypted.</p>
+      <p class="modal-note">Heads up: the note's title, media counts, size, and unlock date stay readable in your bucket so cards can be shown without unlocking. Avoid sensitive words in the title. Everything inside — text, photos, audio, video and drawing — is encrypted.</p>
 
       <div id="quick-lock-fields" style="display:none;">
         <div class="field">
@@ -2184,7 +2548,7 @@
         <li data-zone="danger"><span data-zone-icon="danger" aria-hidden="true"></span><span><b>100–150 MB</b> — close to the limit.</span></li>
         <li data-zone="over"><span data-zone-icon="over" aria-hidden="true"></span><span><b>Over 150 MB</b> — can’t be saved.</span></li>
       </ul>
-      <p class="hint">The size is the whole note: its text and drawing plus its photos and audio. One photo or clip can be up to 90 MB, and the written part alone up to 25 MB.</p>
+      <p class="hint">The size is the whole note: its text and drawing plus its photos and audio. One photo or clip can be up to 90 MB, and the written part alone up to 25 MB. Videos are stored separately in parts and don’t count toward the 150 MB note cap.</p>
     </div>
   </div>
 </div>
@@ -2236,11 +2600,14 @@
       <p class="hint b2-status" id="settings-b2-status" role="alert" hidden></p>
       <button class="btn btn-primary" id="btn-save-settings">Save and test</button>
 
-      <div id="migrate-slot"></div>
-
       <section class="settings-section" aria-labelledby="devices-heading">
-        <h3 id="devices-heading">Devices &amp; logins</h3>
+        <h3 id="devices-heading">Devices</h3>
         <div id="devices-slot"></div>
+      </section>
+
+      <section class="settings-section" aria-labelledby="log-heading">
+        <h3 id="log-heading">Activity log</h3>
+        <div id="log-slot"></div>
       </section>
 
       <section class="settings-section" id="offline-section" aria-labelledby="offline-heading" hidden>
@@ -2308,8 +2675,8 @@
         </div>
         <p class="hint">
           You're on v<span id="settings-version"></span>. If the app ever looks
-          out of date after you've pushed changes, tap this to clear the
-          cached shell and reload the newest version.
+          out of date after an update, tap this to clear the cached shell and
+          reload the newest version.
         </p>
       </div>
     </div>
@@ -2436,16 +2803,11 @@
 
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
-<script>
-// Bump this on EVERY change to the app, no matter how small — a typo fix,
-// a copy tweak, whatever. See CHANGELOG.md for the policy and history.
-window.KEEPSAKE_VERSION = "1.14.0";
-</script>
+<script src="version.js"></script>
 <script src="b2.js"></script>
 <script src="media.js"></script>
 <script src="video.js"></script>
 <script src="player.js"></script>
-<script src="migrate.js"></script>
 <script src="devices.js"></script>
 <script src="offline.js"></script>
 <script src="app.js"></script>

@@ -6,6 +6,47 @@ All notable changes to this project are recorded here, following
 small — gets a version bump. If the version number hasn't moved,
 nothing changed; that's the whole point of keeping one.
 
+## v1.15.1 — 2026-11-18
+
+- **A device a master has restricted can still make notes of that type.** Restricting is about what a device SHOWS, not
+  what it can make. In 1.15.0 the lock button was hidden on a device that may not show locked notes, so a locked note
+  could not be made there. The lock button is now on every device. A note made on a device that may not show its type
+  (locked, or normal) is saved to Backblaze as that type, then forgotten by the device, with a message saying so (once
+  per note). It appears only on devices a master allows. If the device is offline, the note waits marked "Not synced"
+  and goes through the same steps once it uploads. Before a device's first check-in nothing is hidden or forgotten.
+- Service worker cache v26.
+
+## v1.15.0 — 2026-11-18
+
+- **Offline copy fixed and made manual-only.** Nothing downloads by itself any more - not at start-up, not when the
+  connection returns, not for a master. The old hidden background download is gone (it was what filled the device with
+  files while the section said "0 notes synced"). **Download** works on any device and is the only way a copy starts.
+- **Text first, then only the files you tick.** A run saves the text of every note first, so every note opens at once
+  with no connection. Then it saves only the types you ticked - **Images, Audio, Videos**. Unticked types are fetched
+  live when you open a note. Locked notes whose files cannot be told apart are saved with Images (or Audio if only Audio
+  is ticked).
+- **You can see what happened.** The section shows a status card with a progress bar, a step list (notes, text, check,
+  images, audio, videos) and the file being handled, plus an "On this device now" count per type. Anything already
+  saved while you used the app counts as downloaded. Buttons: Download / Continue / Download again / Stop / Delete
+  offline data. A stopped or interrupted run says why and continues where it stopped.
+- **Fast start with every step visible.** Saved notes are drawn first, before the network is touched, with placeholder
+  cards while nothing is saved yet. A start-up panel at the top lists every step with its time (app opened, notes
+  read from the device, edits waiting, access check, latest list from Backblaze, merge, sending edits, drafts,
+  tidying), shows "Your notes are ready - on screen in N ms" while the rest continues, and folds away when finished
+  (Details reopens it). Fonts no longer block the first paint.
+- **A master controls what each device may open - normal notes and locked notes separately.** Settings -> Devices ->
+  tap a device -> *What this device can open*. A device that is not allowed locked notes does not show the Locked tab,
+  does not download them and forgets any it held; the same for normal notes. The setting is signed with the master key
+  and checked by the device. By default a device opens normal notes and no locked notes until a master allows them; a
+  master device and a bucket with no master account open everything. Until a device has checked in for the first time
+  it neither hides nor forgets anything.
+- **Devices and the activity log are now separate.** Devices lists the devices with what each may open; a device's own
+  screen has its info, its access choices and actions. The log has its own screen (Settings -> Activity log) with a
+  device picker and an "Everything / Problems only" filter.
+- All new styling follows the stylesheet checklist: design tokens, 44px targets, visible focus, reduced-motion,
+  high-contrast and forced-colors handling, state never shown by colour alone.
+- Service worker cache v25.
+
 ## v1.14.0 — 2026-11-10
 
 - **Sync all data offline** (Settings -> Offline copy, shown while this device is logged in as master). Downloads every

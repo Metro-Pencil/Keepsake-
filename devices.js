@@ -17,6 +17,12 @@
  * hash, not hidden.)
  * Replacing the master key makes a new pair, so every device that was logged in loses its master login.
  *
+ * A master also chooses, per device, whether it may open normal notes and whether it may open locked notes
+ * (signed the same way, in the device's inbox). A device that is not a master opens normal notes and opens
+ * locked notes only once a master has switched them on for it; a device that is switched off for a type does
+ * not show it, does not download it and forgets what it held. Nothing is held back while the bucket has no
+ * master account (nobody could switch anything on), and a master device always opens everything.
+ *
  * Honest limit: there is no server. Every device already holds the Backblaze application key, and this is
  * checked by the app itself. It stops this app on a device that obeys it. It cannot stop someone who copies
  * the Backblaze key out and uses it with other software - for that, make a new key in Backblaze.
@@ -32,9 +38,9 @@
   const LOG_CAP = 1000;       // entries kept per device per month
   const START_TIMEOUT_MS = 4000;
   const PW_ITER = 600000;     // PBKDF2 rounds for the master password
-  const PW_MIN = 8;           // shortest master password
+  const PW_MIN = 12;          // shortest master passphrase (wrapped key is readable offline)
   const SNOOZE_MS = 7 * 24 * 3600 * 1000;   // "Not now" on the create-master offer is remembered this long
-  let raceMs = 500;           // two devices creating the master at once: wait this long, then look again
+  let raceMs = 1500;          // two devices creating the master at once: verify twice with this gap
   const LS = { state: 'ks_dev_state', failed: 'ks_dev_failed', lastlog: 'ks_dev_lastlog' };
 
   const K = {
@@ -72,6 +78,7 @@
   const fmt = (ts) => (ts ? new Date(ts).toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' }) : '');
   const ym = (ts) => { const d = new Date(ts); return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0'); };
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const plural = (n, one, many) => n + ' ' + (n === 1 ? one : many);
 
   /* ------------------------------------------------- device-local storage (IndexedDB) */
 
@@ -80,9 +87,14 @@
     let dbp = null;
     const db = () => dbp || (dbp = new Promise((res, rej) => {
       const r = root.indexedDB.open('keepsake-device', 1);
-      r.onupgradeneeded = () => r.result.createObjectStore('kv');
-      r.onsuccess = () => res(r.result);
-      r.onerror = () => rej(r.error);
+      r.onupgradeneeded = () => { if (!r.result.objectStoreNames.contains('kv')) r.result.createObjectStore('kv'); };
+      r.onsuccess = () => {
+        const conn = r.result;
+        conn.onversionchange = () => { conn.close(); dbp = null; };
+        conn.onclose = () => { dbp = null; };
+        res(conn);
+      };
+      r.onerror = () => { dbp = null; rej(r.error); };
     }));
     const run = async (mode, fn) => {
       const d = await db();
@@ -118,8 +130,21 @@
       return await subtle().verify(SIG, verifyCache.get(k), unb64(sigB64), enc.encode(text));
     } catch (e) { return false; }
   }
-  const cmdText = (c) => ['ks-cmd', 1, c.id, c.action, c.wipe ? 1 : 0, c.at].join('|');
-  const claimText = (id) => 'ks-master|1|' + id;
+  const cmdText = (c) => (c && c.v >= 2
+    ? ['ks-cmd', 2, c.id, c.action, c.wipe ? 1 : 0, c.at, c.by || '', c.byName || '', c.note || ''].join('\u241f')
+    : ['ks-cmd', 1, c.id, c.action, c.wipe ? 1 : 0, c.at].join('|'));
+  const claimText = (id, at) => (at ? 'ks-master|2|' + id + '|' + at : 'ks-master|1|' + id);
+  async function proofValid(pub, id, rec) {
+    if (!pub || !rec || !rec.masterProof) return false;
+    if (rec.masterProofAt) return verify(pub, claimText(id, rec.masterProofAt), rec.masterProof);
+    return verify(pub, claimText(id), rec.masterProof);
+  }
+  // What a device may open is set by the master the same way: one signed record per device, checked by the device.
+  const policyText = (p) => ['ks-policy', 1, p.id, p.notes ? 1 : 0, p.locked ? 1 : 0, p.at].join('|');
+  async function policyValid(pub, p) {
+    const t = policyText(p);
+    return (await verify(pub, t, p.sig)) || (!!p.sig2 && await verify(pub, t, p.sig2));
+  }
   // A command is good if the current master key signed it. While the master key is being replaced a command
   // also carries a second signature (sig2) from the new key, so blocks never lapse in between.
   async function cmdValid(pub, c) {
@@ -258,15 +283,28 @@
   const readInbox = (id) => readJson(K.inbox(id));
   const readRecord = (id) => readJson(K.rec(id));
 
+  // The inbox holds what the master has told this device: a command (block / sign out / allow) and, since 1.15,
+  // the access policy (may it open normal notes, may it open locked notes).
   async function saveInbox(id, inbox) {
-    if (inbox && inbox.cmd) await writeJson(K.inbox(id), { cmd: inbox.cmd });      // (1.12 also kept promotion grants here; they are gone)
+    const out = {};
+    if (inbox && inbox.cmd) out.cmd = inbox.cmd;
+    if (inbox && inbox.policy) out.policy = inbox.policy;
+    if (out.cmd || out.policy) await writeJson(K.inbox(id), out);      // (1.12 also kept promotion grants here; they are gone)
     else await bucket().deleteObject(K.inbox(id));
   }
 
   async function appendLog(id, entries) {
     const key = K.log(id, ym(entries[0].t));
-    const old = (await readJson(key)) || [];           // a failed read throws: never overwrite what we couldn't read
-    await writeJson(key, entries.concat(Array.isArray(old) ? old : []).slice(0, LOG_CAP));
+    const bytes = await bucket().getBytesOrNull(key);
+    let old = [];
+    if (bytes) {
+      let parsed;
+      try { parsed = JSON.parse(dec.decode(bytes)); }
+      catch (e) { throw new Error('Device activity log is corrupted; refusing to overwrite it.'); }
+      if (!Array.isArray(parsed)) throw new Error('Device activity log has an unexpected format; refusing to overwrite it.');
+      old = parsed;
+    }
+    await writeJson(key, entries.concat(old).slice(0, LOG_CAP));
   }
 
   /* ---------------------------------------------------------------- identity */
@@ -314,7 +352,10 @@
     const wrapped = await wrapWithPassword(pair.privateKey, password);
     const nonce = randomId();
     await writeJson(K.master, { v: 2, pub: pair.pub, wrapped, createdBy: me.id, nonce, createdAt: now(), changedAt: now(), gen: 1 });
-    await sleep(raceMs);                               // two devices at once: last write wins, then both look again
+    await sleep(raceMs);                               // two devices at once: verify twice with a wider gap
+    const check1 = await readMaster();
+    if (!check1 || check1.nonce !== nonce) throw new Error('Another device created the master account at the same moment. Log in to it with its password instead.');
+    await sleep(raceMs);
     const check = await readMaster();
     if (!check || check.nonce !== nonce) throw new Error('Another device created the master account at the same moment. Log in to it with its password instead.');
     await startSession(me, check, await unwrapWithPassword(wrapped, password, false), 'created the master account');
@@ -336,14 +377,16 @@
   async function logoutMaster() {
     const me = await getIdentity(false);
     await store().del('master');
-    patchState({ masterSession: false });
+    patchState({ masterSession: false, access: null });
     masterChanged();
+    try { root.dispatchEvent(new root.CustomEvent('ks-access-changed', { detail: access() })); } catch (e) { /* UI only */ }
     if (!me) return;
     try {
       const env = await collectEnv();
       await writeRecord(me, env, await readMaster(), null, {});
       await appendLog(me.id, [entry(env, 'master', 'logged out of master')]);
     } catch (e) { /* offline: the record is corrected at the next check-in */ }
+    await poll();                                     // an ordinary device again: pick up what the master allows it to open
   }
 
   async function changePassword(current, next) {
@@ -368,15 +411,30 @@
     const wrapped = await wrapWithPassword(pair.privateKey, password);
     const inboxKeys = (await B.listAll('devices/')).map((o) => o.key).filter((k) => /^devices\/[0-9a-f]{32}\.inbox\.json$/.test(k));
     const withCmd = [];
-    for (const k of inboxKeys) {                                      // 1. commands get a second signature, by the new key
+    for (const k of inboxKeys) {                                      // 1. ONLY commands & policies validly signed by the OLD master key get sig2
+      const fm = /^devices\/([0-9a-f]{32})\.inbox\.json$/.exec(k);
+      const fileId = fm ? fm[1] : '';
       const inbox = await readJson(k);
-      if (inbox && inbox.cmd && inbox.cmd.id) { inbox.cmd.sig2 = await sign(pair.privateKey, cmdText(inbox.cmd)); await writeJson(k, inbox); withCmd.push(k); }
+      let touched = false;
+      if (inbox && inbox.cmd && inbox.cmd.id === fileId && await cmdValid(master.pub, inbox.cmd)) {
+        inbox.cmd.sig2 = await sign(pair.privateKey, cmdText(inbox.cmd));
+        touched = true;
+      }
+      if (inbox && inbox.policy && inbox.policy.id === fileId && await policyValid(master.pub, inbox.policy)) {
+        inbox.policy.sig2 = await sign(pair.privateKey, policyText(inbox.policy));
+        touched = true;
+      }
+      if (touched) { await writeJson(k, inbox); withCmd.push(k); }
     }
     const fresh = { ...master, v: 2, pub: pair.pub, wrapped, gen: (master.gen || 1) + 1, rotatedAt: now(), changedAt: next ? now() : master.changedAt };
     await writeJson(K.master, fresh);                                // 2. the new key takes over
     for (const k of withCmd) {                                        // 3. tidy up: the new signature becomes the signature
       const inbox = await readJson(k);
-      if (inbox && inbox.cmd && inbox.cmd.sig2) { inbox.cmd.sig = inbox.cmd.sig2; delete inbox.cmd.sig2; await writeJson(k, inbox); }
+      if (!inbox) continue;
+      let touched = false;
+      if (inbox.cmd && inbox.cmd.sig2) { inbox.cmd.sig = inbox.cmd.sig2; delete inbox.cmd.sig2; touched = true; }
+      if (inbox.policy && inbox.policy.sig2) { inbox.policy.sig = inbox.policy.sig2; delete inbox.policy.sig2; touched = true; }
+      if (touched) await writeJson(k, inbox);
     }
     await startSession(me, fresh, await unwrapWithPassword(wrapped, password, false), 'replaced the master key');
     return fresh;
@@ -402,10 +460,62 @@
     const c = inbox && inbox.cmd;
     if (!c || !master) return { status: 'active' };
     if (c.id !== me.id || !(await cmdValid(master.pub, c))) return { status: 'active', forged: true };
+    const st = getState();
+    const lastCmdAt = Number(st.lastCmdAt) || 0;
+    if (c.at < lastCmdAt) return { status: 'active', replayed: true };
+    if (c.at > lastCmdAt) patchState({ lastCmdAt: c.at });
     if (c.action === 'block') return { status: 'blocked', cmd: c };
-    if (c.action === 'terminate' && c.at !== getState().handled) return { status: 'terminated', cmd: c };
+    if (c.action === 'terminate' && c.at !== st.handled) return { status: 'terminated', cmd: c };
     return { status: 'active', cmd: c };
   }
+
+  /* ------------------------------------------------ what this device may open */
+
+  // A device that is not a master opens normal notes, and opens locked notes only once a master has switched them on
+  // for it. A master device always opens everything. With no master account in the bucket there is nobody who could
+  // switch anything on, so nothing is held back. A policy that is not signed by the master (or is for another
+  // device) is ignored, which leaves the default: locked notes stay off.
+  const DEFAULT_ACCESS = { notes: true, locked: false };
+
+  async function accessFor(id, master, hasMaster, inbox, isMasterDevice, minPolicyAt) {
+    if (isMasterDevice) return { notes: true, locked: true, source: 'master' };
+    if (!hasMaster) return { notes: true, locked: true, source: 'no-master' };
+    const p = inbox && inbox.policy;
+    if (p && master && p.id === id && await policyValid(master.pub, p)) {
+      if (Number.isFinite(minPolicyAt) && p.at < minPolicyAt) {
+        // Reject replayed older policy; retain the device's current stricter/latest remembered access.
+        const cur = getState().access;
+        if (cur) return { notes: !!cur.notes, locked: !!cur.locked, at: minPolicyAt, source: 'policy', replayed: true };
+      }
+      return { notes: !!p.notes, locked: !!p.locked, at: p.at, source: 'policy' };
+    }
+    return { ...DEFAULT_ACCESS, source: 'default' };
+  }
+
+  // What the app obeys right now: remembered on the device, so it holds from the first moment of the next start and
+  // with no connection. Not yet known (fresh install, or first start after updating): locked notes wait.
+  function access() {
+    const s = getState();
+    if (s.masterSession) return { notes: true, locked: true, known: true, master: true };
+    if (s.hasMaster === false) return { notes: true, locked: true, known: true };
+    if (s.access) return { notes: !!s.access.notes, locked: !!s.access.locked, known: true };
+    return { ...DEFAULT_ACCESS, known: false };
+  }
+  const allows = (meta) => { const a = access(); return !meta || meta.lockType === 'none' ? a.notes : a.locked; };
+
+  // Saves the verdict. Tells the app (ks-access-changed) only when it actually differs from what was remembered.
+  function commitAccess(acc, hasMaster) {
+    const prev = getState();
+    const changed = !prev.access || prev.access.notes !== acc.notes || prev.access.locked !== acc.locked || prev.hasMaster !== hasMaster;
+    const nextPatch = { access: { notes: acc.notes, locked: acc.locked }, hasMaster };
+    if (acc.source === 'policy' && Number.isFinite(acc.at) && acc.at > (Number(prev.lastPolicyAt) || 0)) {
+      nextPatch.lastPolicyAt = acc.at;
+    }
+    patchState(nextPatch);
+    if (changed) { try { root.dispatchEvent(new root.CustomEvent('ks-access-changed', { detail: access() })); } catch (e) { /* UI only */ } }
+    return changed;
+  }
+  const accessAck = (acc) => ({ notes: acc.notes, locked: acc.locked, at: acc.at || 0, t: now() });
 
   async function writeRecord(me, env, master, myKey, extra) {
     const prev = (await readRecord(me.id)) || {};
@@ -413,8 +523,10 @@
       v: 1, id: me.id, name: me.name, firstSeen: prev.firstSeen || me.createdAt, lastSeen: now(),
       logins: (prev.logins || 0) + (extra && extra.countLogin ? 1 : 0), env, pub: me.publicJwk,
       ack: (extra && extra.ack) || prev.ack || null,
+      access: (extra && extra.access) || prev.access || null,
+      resumedAfter: (extra && extra.resumedAfter !== undefined) ? extra.resumedAfter : (prev.resumedAfter || null),
     };
-    if (myKey) rec.masterProof = await sign(myKey, claimText(me.id));
+    if (myKey) { rec.masterProofAt = now(); rec.masterProof = await sign(myKey, claimText(me.id, rec.masterProofAt)); }
     await writeJson(K.rec(me.id), rec);
     return rec;
   }
@@ -457,9 +569,21 @@
         else entries.unshift(entry(env, verdict.status, cmdDetail(verdict.cmd)));
         if (lost) entries.unshift(entry(env, 'master', 'master login ended'));
 
-        const rec = await writeRecord(me, env, master, myKey, { countLogin: !skip, ack: verdict.status !== 'active' ? { kind: verdict.status, cmdAt: verdict.cmd.at, t: now() } : null });
-        if (entries.length) { await appendLog(me.id, entries); lsSet(LS.failed, '[]'); lsSet(LS.lastlog, String(now())); }
-        const out = { ...verdict, me, rec, master, hasMaster, isMaster: !!myKey };
+        const acc = await accessFor(me.id, master, hasMaster, inbox, !!myKey, Number(getState().lastPolicyAt) || 0);
+        commitAccess(acc, hasMaster);
+        let rec = null;
+        if (verdict.status !== 'active') {
+          // Commit local lock/wipe state FIRST before sending telemetry, and never let telemetry failures skip enforcement.
+          const ackObj = { kind: verdict.status, cmdAt: verdict.cmd.at, t: now() };
+          try { rec = await writeRecord(me, env, master, myKey, { countLogin: !skip, ack: ackObj, access: accessAck(acc) }); } catch (e) {}
+          if (entries.length) { try { await appendLog(me.id, entries); lsSet(LS.failed, '[]'); lsSet(LS.lastlog, String(now())); } catch (e) {} }
+          const out = { ...verdict, me, rec, master, hasMaster, isMaster: !!myKey, access: acc };
+          await apply(out);
+          return out;
+        }
+        rec = await writeRecord(me, env, master, myKey, { countLogin: !skip, ack: null, resumedAfter: getState().handled || null, access: accessAck(acc) });
+        if (entries.length) { try { await appendLog(me.id, entries); lsSet(LS.failed, '[]'); lsSet(LS.lastlog, String(now())); } catch (e) {} }
+        const out = { ...verdict, me, rec, master, hasMaster, isMaster: !!myKey, access: acc };
         await apply(out);
         return out;
       } finally { busy = null; }
@@ -477,14 +601,21 @@
       const myKey = await myMasterKey(master);
       const lost = !myKey && !!getState().masterSession;
       const verdict = await judge(me, master, inbox);
+      // The master may have changed what this device can open: pick that up, and tell the master it arrived.
+      const hasMaster = !!master || await masterExists();
+      const acc = await accessFor(me.id, master, hasMaster, inbox, !!myKey, Number(getState().lastPolicyAt) || 0);
+      if (commitAccess(acc, hasMaster) && verdict.status === 'active' && !lost) {
+        try { await writeRecord(me, await collectEnv(), master, myKey, { access: accessAck(acc) }); } catch (e) { /* shown at the next login */ }
+      }
       if (verdict.status !== 'active' || lost) {
         if (lost) { patchState({ masterSession: false }); masterChanged(); }
         const env = await collectEnv();
-        const rec = await writeRecord(me, env, master, myKey, { ack: verdict.status !== 'active' ? { kind: verdict.status, cmdAt: verdict.cmd.at, t: now() } : null });
+        let rec = null;
+        try { rec = await writeRecord(me, env, master, myKey, { ack: verdict.status !== 'active' ? { kind: verdict.status, cmdAt: verdict.cmd.at, t: now() } : null, access: accessAck(acc) }); } catch (e) {}
         const logs = [];
         if (lost) logs.push(entry(env, 'master', 'master login ended'));
         if (verdict.status !== 'active') logs.push(entry(env, verdict.status === 'blocked' ? 'blocked' : 'signed-out', cmdDetail(verdict.cmd)));
-        await appendLog(me.id, logs);
+        if (logs.length) { try { await appendLog(me.id, logs); } catch (e) {} }
         const out = { ...verdict, me, rec, master, isMaster: !!myKey };
         await apply(out);
         return out;
@@ -517,11 +648,30 @@
   }
 
   // Local copies are wiped before the app opens its databases, so nothing holds them open.
+  // Only clear wipePending once every database deletion actually succeeds, so a closed tab or
+  // blocked delete will retry on the next load.
   function runPendingWipe() {
     if (!getState().wipePending) return;
-    try { root.indexedDB.deleteDatabase('keepsake-drafts'); root.indexedDB.deleteDatabase('keepsake-media'); root.indexedDB.deleteDatabase('keepsake-offline'); } catch (e) { /* best effort */ }
     try { root.localStorage.removeItem('ks_offline'); } catch (e) { /* private mode */ }
-    patchState({ wipePending: false });
+    if (!root.indexedDB) { patchState({ wipePending: false }); return; }
+    const dbs = ['keepsake-drafts', 'keepsake-media', 'keepsake-offline'];
+    let remaining = dbs.length;
+    let failed = false;
+    const doneOne = (ok) => {
+      if (!ok) failed = true;
+      remaining--;
+      if (remaining === 0 && !failed) patchState({ wipePending: false });
+    };
+    for (const name of dbs) {
+      try {
+        const req = root.indexedDB.deleteDatabase(name);
+        req.onsuccess = () => doneOne(true);
+        req.onerror = () => doneOne(false);
+        req.onblocked = () => doneOne(false);
+      } catch (e) {
+        doneOne(false);
+      }
+    }
   }
 
   /* ------------------------------------------------------------ public flow */
@@ -543,9 +693,19 @@
 
   // Called after Save and test succeeded.
   async function afterConnect() {
-    patchState({ lock: null });
-    closeOverlay('ks-ov-lock');
-    try { const v = await checkIn('connect'); welcome(v); return { allowed: v.status === 'active' }; } catch (e) { return { allowed: true }; }
+    try {
+      const v = await checkIn('connect');
+      if (v.status === 'active') {
+        patchState({ lock: null });
+        closeOverlay('ks-ov-lock');
+        welcome(v);
+        return { allowed: true };
+      }
+      return { allowed: false };
+    } catch (e) {
+      if (getState().lock) { showLock(); return { allowed: false }; }
+      return { allowed: true };
+    }
   }
 
   // First-time steps that need the person: name the device, and - only if the bucket has no master account -
@@ -580,16 +740,27 @@
     if (!ID_RE.test(targetId)) throw new Error('Bad device id');
     const { key, me, master } = await needMaster();
     if (targetId === me.id && action !== 'allow') throw new Error('Pick another device, not the one you are holding.');
-    const rec = await readRecord(targetId);
-    if (rec && rec.masterProof && action !== 'allow' && await verify(master.pub, claimText(targetId), rec.masterProof)) {
-      throw new Error('A master device can\u2019t be blocked or signed out, because it can undo that itself.');
-    }
-    const cmd = { v: 1, id: targetId, action, wipe: !!(opts && opts.wipe) && action !== 'allow', at: now(), by: me.id, byName: me.name, note: ((opts && opts.note) || '').slice(0, 200) };
+    const cmd = { v: 2, id: targetId, action, wipe: !!(opts && opts.wipe) && action !== 'allow', at: now(), by: me.id, byName: me.name, note: ((opts && opts.note) || '').slice(0, 200) };
     cmd.sig = await sign(key, cmdText(cmd));
     const inbox = (await readInbox(targetId)) || {};
     inbox.cmd = cmd;
     await saveInbox(targetId, inbox);
     return cmd;
+  }
+
+  // What a device may open: normal notes, locked notes, either, both or neither. Signed with the master key; the device
+  // checks the signature and obeys it the next time it opens the app or checks in (about two minutes if it is open).
+  async function setAccess(targetId, want) {
+    if (!ID_RE.test(targetId)) throw new Error('Bad device id');
+    const { key, me, master } = await needMaster();
+    if (targetId === me.id) throw new Error('This device is a master, so it always opens everything.');
+
+    const policy = { v: 1, id: targetId, notes: !!(want && want.notes), locked: !!(want && want.locked), at: now(), by: me.id, byName: me.name };
+    policy.sig = await sign(key, policyText(policy));
+    const inbox = (await readInbox(targetId)) || {};
+    inbox.policy = policy;
+    await saveInbox(targetId, inbox);
+    return policy;
   }
 
   async function forget(targetId) {
@@ -638,11 +809,20 @@
     return out;
   }
 
-  async function statusOf(master, id, inbox) {
+  async function statusOf(master, id, inbox, rec) {
     const c = inbox && inbox.cmd;
     if (!c) return { status: 'active' };
     if (!master || c.id !== id || !(await cmdValid(master.pub, c))) return { status: 'active', forged: true };
-    return { status: c.action === 'block' ? 'blocked' : c.action === 'terminate' ? 'terminated' : 'active', cmd: c };
+    if (c.action === 'block') return { status: 'blocked', cmd: c };
+    if (c.action === 'terminate') {
+      const resumed = !!(rec && (
+        rec.resumedAfter === c.at ||
+        (rec.ack && rec.ack.kind === 'terminated' && rec.ack.cmdAt === c.at && (rec.lastSeen || 0) > (rec.ack.t || 0))
+      ));
+      if (resumed) return { status: 'active', cmd: c, reLoggedIn: true };
+      return { status: 'terminated', cmd: c };
+    }
+    return { status: 'active', cmd: c };
   }
 
   async function listDevices() {
@@ -653,9 +833,12 @@
     const rows = await pool(ids, 6, async (id) => {
       const [rec, inbox] = await Promise.all([readRecord(id), readInbox(id)]);
       if (!rec) return null;
-      const st = await statusOf(master, id, inbox);
-      const isMaster = !!(master && rec.masterProof && await verify(master.pub, claimText(id), rec.masterProof));
-      return { id, rec, ...st, isMaster, claimsMaster: !!rec.masterProof && !isMaster };
+      const st = await statusOf(master, id, inbox, rec);
+      const isMaster = !!(master && await proofValid(master.pub, id, rec));
+      const access = await accessFor(id, master, !!master, inbox, isMaster);
+      // "Confirmed" once the device has written back the policy it is now obeying.
+      const accessConfirmed = access.source !== 'policy' || !!(rec.access && rec.access.at === access.at);
+      return { id, rec, ...st, isMaster, claimsMaster: !!rec.masterProof && !isMaster, access, accessConfirmed };
     });
     return { master, devices: rows.filter(Boolean).sort((a, b) => (b.rec.lastSeen || 0) - (a.rec.lastSeen || 0)) };
   }
@@ -700,11 +883,13 @@
     return ov.querySelector('.modal-body');
   }
 
-  function chip(kind, icon, label) { return '<span class="dev-chip" data-kind="' + kind + '"><span aria-hidden="true">' + icon + '</span> ' + esc(label) + '</span>'; }
+  function chip(kind, icon, label) { return '<span class="dev-chip" data-kind="' + esc(kind) + '"><span aria-hidden="true">' + esc(icon) + '</span> ' + esc(label) + '</span>'; }
+  // On or off is shown by the tick or cross and the word, never by colour alone.
+  const accChip = (label, on) => chip(on ? 'ok' : 'blocked', on ? '✓' : '✕', label + (on ? ' on' : ' off'));
   const say = (m) => { if (root.toast) root.toast(m); };
-  const ask = (t, m, fn, label, calm) => (root.openConfirm ? root.openConfirm(t, m, fn, label, calm) : fn());
+  const ask = (t, m, fn, label, calm) => (root.openConfirm ? root.openConfirm(t, m, fn, label, calm) : say('Confirmation dialog unavailable — action cancelled.'));
   // The buttons that cut a device off, erase things or end every master login ask twice.
-  const askTwice = (t, m, t2, m2, fn, label, label2, calm) => (root.openConfirmTwice ? root.openConfirmTwice(t, m, t2, m2, fn, label, label2, calm) : fn());
+  const askTwice = (t, m, t2, m2, fn, label, label2, calm) => (root.openConfirmTwice ? root.openConfirmTwice(t, m, t2, m2, fn, label, label2, calm) : say('Confirmation dialog unavailable — action cancelled.'));
 
   async function copyText(text) {
     try { await root.navigator.clipboard.writeText(text); say('Copied'); } catch (e) { say('Could not copy - select the text and copy it by hand'); }
@@ -755,6 +940,27 @@
         finally { btn.disabled = false; }
       } }, { label: 'Cancel' }]);
     const inputs = body.querySelectorAll('input[id^="' + id + '-f"]');
+    const newPwIdx = fields.findIndex((f) => f.auto === 'new-password');
+    if (newPwIdx >= 0 && inputs[newPwIdx]) {
+      const meter = doc().createElement('p');
+      meter.className = 'hint dev-strength';
+      meter.setAttribute('aria-live', 'polite');
+      inputs[newPwIdx].parentNode.appendChild(meter);
+      const updateStrength = () => {
+        const val = inputs[newPwIdx].value || '';
+        if (!val) { meter.textContent = 'Use a long passphrase (' + PW_MIN + '+ characters, e.g. 4 unrelated words).'; meter.dataset.level = ''; return; }
+        let classes = 0;
+        if (/[a-z]/.test(val)) classes++;
+        if (/[A-Z]/.test(val)) classes++;
+        if (/[0-9]/.test(val)) classes++;
+        if (/[^A-Za-z0-9]/.test(val)) classes++;
+        if (val.length < PW_MIN) { meter.textContent = 'Too short — needs at least ' + PW_MIN + ' characters (' + val.length + '/' + PW_MIN + ').'; meter.dataset.level = 'weak'; }
+        else if (val.length >= 16 || (val.length >= 12 && classes >= 3)) { meter.textContent = 'Strong passphrase.'; meter.dataset.level = 'strong'; }
+        else { meter.textContent = 'Fair — consider adding another word or symbol for offline safety.'; meter.dataset.level = 'fair'; }
+      };
+      inputs[newPwIdx].addEventListener('input', updateStrength);
+      updateStrength();
+    }
     body.querySelector('.dev-show').addEventListener('change', (e) => inputs.forEach((i) => { i.type = e.target.checked ? 'text' : 'password'; i.classList.toggle('dev-pw', e.target.checked); }));
     inputs.forEach((i) => i.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); body.querySelector('.dev-actions .btn').click(); } }));
     inputs[0].focus();
@@ -783,7 +989,7 @@
   }
   function replaceKeyDialog() {
     formDialog('ks-ov-pw', 'Replace the master key',
-      'Use this if a device that was logged in as master is lost or stolen. Every device that is logged in as master, including this one, is logged out, and you log in again with the password. Blocks you already set stay in force. Leave the new password empty to keep the current one.',
+      'Use this if a device that was logged in as master is lost or stolen. Every other device logged in as master is logged out; this device stays logged in with the new key. Blocks you already set stay in force. Leave the new password empty to keep the current one.',
       [{ label: 'Current password', auto: 'current-password' }, { label: 'New password (optional)', auto: 'new-password' }, { label: 'New password again', auto: 'new-password' }], 'Replace master key',
       async (v) => { if (v[1] || v[2]) mustMatch(v[1], v[2]); await replaceMasterKey(v[0], v[1]); say('Master key replaced. Other master logins are ended.'); renderSettings(); }, true);
   }
@@ -827,17 +1033,22 @@
     if (unreachable) { buttons = btn('retry', 'Try again'); hint = 'Could not reach your bucket to look for a master account.'; }
     else if (!master) { buttons = btn('create', 'Create master account', 'btn-primary'); hint = 'There is no master account yet. Create one to see every device and sign out or block devices from any device, with one password.'; }
     else if (isMaster && pw) {
-      buttons = btn('manage', 'Devices &amp; logins', 'btn-primary') + btn('change', 'Change password') + btn('replace', 'Replace master key') + btn('logout', 'Log out of master');
-      hint = 'You are logged in as master on this device: it sees every login and can sign devices out or block them. Log out when you are done.';
+      buttons = btn('manage', 'Manage devices', 'btn-primary') + btn('change', 'Change password') + btn('replace', 'Replace master key') + btn('logout', 'Log out of master');
+      hint = 'You are logged in as master on this device: it sees every device and can choose what each one may open, sign it out or block it. Log out when you are done.';
     } else if (isMaster) {
-      buttons = btn('manage', 'Devices &amp; logins', 'btn-primary') + btn('legacy', 'Set a master password') + btn('logout', 'Log out of master');
+      buttons = btn('manage', 'Manage devices', 'btn-primary') + btn('legacy', 'Set a master password') + btn('logout', 'Log out of master');
       hint = 'This master account has no password yet. Set one so it can be opened from any device.';
-    } else if (pw) { buttons = btn('login', 'Log in as master', 'btn-primary') + btn('mine', 'This device’s logins'); hint = 'A master account exists. Log in with its password to see every device. Every time this device opens the app, the login is recorded.'; }
-    else { buttons = btn('enter', 'Enter old master key') + btn('mine', 'This device’s logins'); hint = 'A master account exists but it has no password yet (made by an older version). On the device that holds its key, open Settings and set one. If that device is gone, delete the devices/ folder in Backblaze and create a new master account.'; }
+    } else if (pw) { buttons = btn('login', 'Log in as master', 'btn-primary') + btn('mine', 'This device’s info'); hint = 'A master account exists. Log in with its password to see every device and choose what each one may open.'; }
+    else { buttons = btn('enter', 'Enter old master key') + btn('mine', 'This device’s info'); hint = 'A master account exists but it has no password yet (made by an older version). On the device that holds its key, open Settings and set one. If that device is gone, delete the devices/ folder in Backblaze and create a new master account.'; }
+    const acc = access();
+    const opens = isMaster ? chip('master', '★', 'Opens everything') : accChip('Notes', acc.notes) + ' ' + accChip('Locked notes', acc.locked);
     slot.innerHTML =
       '<div class="dev-me"><div><b>' + esc(me.name) + '</b> ' + (isMaster ? chip('master', '★', 'Logged in as master') : chip('device', '•', 'Device')) + '</div>' +
-      '<div class="hint">ID ' + esc(shortId(me.id)) + ' · first connected ' + esc(fmt(me.createdAt)) + '</div></div>' +
-      '<div class="btn-row dev-wrap">' + buttons + btn('rename', 'Rename') + '</div><p class="hint">' + hint + '</p>';
+      '<div class="hint">ID ' + esc(shortId(me.id)) + ' · first connected ' + esc(fmt(me.createdAt)) + '</div>' +
+      '<div class="dev-wrap dev-access-line"><span class="hint">This device opens:</span> ' + opens + '</div></div>' +
+      '<div class="btn-row dev-wrap">' + buttons + btn('rename', 'Rename') + '</div><p class="hint">' + hint + '</p>' +
+      (!isMaster && !acc.locked && master ? '<p class="hint">Locked notes are off for this device. A master turns them on under Manage devices, or log in as master here.</p>' : '');
+    renderLogSection(me, isMaster);
     slot.onclick = async (e) => {
       const d = e.target.closest('[data-d]'); if (!d) return;
       const act = d.dataset.d;
@@ -847,7 +1058,7 @@
         else if (act === 'create') createMasterDialog();
         else if (act === 'login') loginMasterDialog();
         else if (act === 'change') changePasswordDialog();
-        else if (act === 'replace') askTwice('Replace the master key?', 'Every device logged in as master, including this one, is logged out. You log in again with the password.', 'Really replace it?', 'Last check: use this for a lost or stolen device. Nothing is deleted, but every master login on every device ends right now.', replaceKeyDialog, 'Continue', 'Yes, replace it');
+        else if (act === 'replace') askTwice('Replace the master key?', 'Every other device logged in as master is logged out; this device stays logged in with the new key.', 'Really replace it?', 'Last check: use this for a lost or stolen device. Nothing is deleted, but every other device’s master login ends right now (this device stays logged in with the new key).', replaceKeyDialog, 'Continue', 'Yes, replace it');
         else if (act === 'legacy') legacyPasswordDialog();
         else if (act === 'enter') enterMasterDialog();
         else if (act === 'logout') ask('Log out of master?', 'This device goes back to being an ordinary device. Log in again any time with the master password.', async () => { await logoutMaster(); say('Logged out of master'); renderSettings(); }, 'Log out', true);
@@ -857,35 +1068,89 @@
     };
   }
 
+  // The Activity log section of Settings: just a pointer to the log itself, which has its own screen.
+  function renderLogSection(me, isMaster) {
+    const slot = doc().getElementById('log-slot');
+    if (!slot) return;
+    const last = Number(lsGet(LS.lastlog)) || 0;
+    slot.innerHTML = '<p class="hint">' + (isMaster ? 'Every sign-in, blocked attempt and sign-out, for all devices.' : 'Every time this device opened the app or tried to sign in.') + (last ? ' This device last logged in ' + esc(fmt(last)) + '.' : '') + '</p>' +
+      '<div class="btn-row dev-wrap"><button type="button" class="btn btn-ghost" data-l="log">Open activity log</button></div>';
+    slot.onclick = (e) => { if (e.target.closest('[data-l]')) openLog(isMaster ? 'all' : me.id).catch((err) => say(err.message)); };
+  }
+
   function entryHTML(e, showName) {
-    const r = RESULT[e.r] || ['?', e.r];
-    return '<li class="dev-ev" data-r="' + esc(e.r) + '"><div class="dev-ev-top">' + chip(e.r, r[0], r[1] + (e.d && e.r !== 'ok' ? ' \u2014 ' + e.d : '')) +
+    const safeKind = Object.prototype.hasOwnProperty.call(RESULT, e.r) ? e.r : 'other';
+    const r = RESULT[safeKind] || ['?', String(e.r || 'Event')];
+    return '<li class="dev-ev" data-r="' + esc(safeKind) + '"><div class="dev-ev-top">' + chip(safeKind, r[0], r[1] + (e.d && safeKind !== 'ok' ? ' \u2014 ' + e.d : '')) +
       '<time>' + esc(fmt(e.t)) + '</time></div><div class="hint">' + (showName ? '<b>' + esc(e.name || shortId(e.id)) + '</b> \u00b7 ' : '') + esc(e.s || '') +
       (e.disp ? ' \u00b7 ' + esc(e.disp) : '') + (e.net ? ' \u00b7 ' + esc(e.net) : '') + (e.tz ? ' \u00b7 ' + esc(e.tz) : '') + (e.ver ? ' \u00b7 v' + esc(e.ver) : '') + '</div></li>';
   }
 
   async function openManager() {
-    const body = shell('ks-ov-devices', 'Devices & logins', true);
+    const body = shell('ks-ov-devices', 'Devices', true);
     body.innerHTML = '<p class="hint">Loading\u2026</p>';
     openOverlay('ks-ov-devices');
-    let data, feed;
-    try { data = await listDevices(); feed = await loadActivity(data.devices, 40); }
+    let data;
+    try { data = await listDevices(); }
     catch (e) { body.innerHTML = '<p class="hint dev-err">' + esc(e.message || 'Could not load') + '</p>'; return; }
     const me = await getIdentity(false);
+    // Devices only: what each one is and what it may open. Logins have their own screen (the Activity log).
     body.innerHTML =
+      '<div class="dev-toolbar"><p class="hint">' + plural(data.devices.length, 'device', 'devices') + '. Tap one to see its details and choose what it may open.</p>' +
+      '<button type="button" class="btn btn-ghost" data-l="log">Activity log</button></div>' +
       '<ul class="dev-list">' + data.devices.map((d) => {
         const st = STATUS[d.status];
         const mine = me && d.id === me.id;
+        const opens = d.isMaster ? chip('master', '\u2605', 'Opens everything') : accChip('Notes', d.access.notes) + ' ' + accChip('Locked notes', d.access.locked);
         return '<li><button type="button" class="dev-row" data-id="' + d.id + '"><span class="dev-row-main"><b>' + esc(d.rec.name || shortId(d.id)) + '</b> ' +
           (mine ? chip('self', '\u2022', 'This device') + ' ' : '') + (d.isMaster ? chip('master', '\u2605', 'Master login') + ' ' : '') + chip(d.status, st[0], st[1]) +
           (d.claimsMaster ? ' ' + chip('wait', '\u2026', 'Old master login') : '') + (d.forged ? ' ' + chip('blocked', '!', 'Unsigned command ignored') : '') +
-          '</span><span class="hint">' + esc((d.rec.env && d.rec.env.summary) || '') + '<br>Last seen ' + esc(fmt(d.rec.lastSeen)) + ' \u00b7 ' + (d.rec.logins || 0) + ((d.rec.logins || 0) === 1 ? ' login' : ' logins') + '</span></button></li>';
-      }).join('') + '</ul>' +
-      '<h3 class="dev-h">Recent logins, all devices</h3><ul class="dev-feed">' + (feed.length ? feed.map((e) => entryHTML(e, true)).join('') : '<li class="hint">Nothing yet.</li>') + '</ul>';
+          '</span><span class="dev-row-main">' + opens + (d.accessConfirmed ? '' : ' ' + chip('wait', '\u2026', 'Access change not confirmed yet')) + '</span>' +
+          '<span class="hint">' + esc((d.rec.env && d.rec.env.summary) || '') + '<br>Last seen ' + esc(fmt(d.rec.lastSeen)) + '</span></button></li>';
+      }).join('') + '</ul>';
     body.querySelector('.dev-list').onclick = (e) => {
       const b = e.target.closest('.dev-row'); if (!b) return;
       openDetail(b.dataset.id, { self: !!me && b.dataset.id === me.id, row: data.devices.find((x) => x.id === b.dataset.id) });
     };
+    body.querySelector('[data-l="log"]').onclick = () => openLog('all').catch((err) => say(err.message));
+  }
+
+  // The activity log, on its own screen: every login, blocked attempt and sign-out. A master can look at one device
+  // or at all of them; any other device sees its own.
+  async function openLog(filterId) {
+    const body = shell('ks-ov-log', 'Activity log', true);
+    body.innerHTML = '<p class="hint">Loading\u2026</p>';
+    openOverlay('ks-ov-log');
+    const me = await getIdentity(false);
+    let devices = [], isMaster = false;
+    try {
+      const master = await readMaster();
+      isMaster = !!(await myMasterKey(master));
+      if (isMaster) devices = (await listDevices()).devices;
+    } catch (e) { body.innerHTML = '<p class="hint dev-err">' + esc(e.message || 'Could not load') + '</p>'; return; }
+    const nameOf = (id) => { const d = devices.find((x) => x.id === id); return (d && d.rec.name) || (me && id === me.id ? me.name : shortId(id)); };
+    const scope = isMaster ? (filterId || 'all') : (me ? me.id : '');
+    body.innerHTML =
+      '<div class="dev-toolbar dev-filters">' +
+      (isMaster ? '<label class="dev-select"><span>Device</span><select id="ks-log-dev"><option value="all">All devices</option>' + devices.map((d) => '<option value="' + d.id + '"' + (d.id === scope ? ' selected' : '') + '>' + esc(d.rec.name || shortId(d.id)) + '</option>').join('') + '</select></label>' : '<p class="hint">This device\u2019s logins.</p>') +
+      '<label class="dev-select"><span>Show</span><select id="ks-log-kind"><option value="all">Everything</option><option value="problems">Problems only</option></select></label></div>' +
+      '<ul class="dev-feed" id="ks-log-feed" aria-live="polite"><li class="hint">Loading\u2026</li></ul>';
+    const feedEl = body.querySelector('#ks-log-feed');
+    let seq = 0;
+    const paint = async () => {
+      const mine = ++seq;
+      const dev = isMaster ? body.querySelector('#ks-log-dev').value : scope;
+      const kind = body.querySelector('#ks-log-kind').value;
+      feedEl.innerHTML = '<li class="hint">Loading\u2026</li>';
+      let rows;
+      try { rows = dev === 'all' ? await loadActivity(devices, 120) : (await loadLog(dev, 2)).slice(0, 120).map((e) => ({ ...e, id: dev, name: nameOf(dev) })); }
+      catch (e) { if (mine === seq) feedEl.innerHTML = '<li class="hint dev-err">' + esc(e.message || 'Could not load') + '</li>'; return; }
+      if (mine !== seq) return;
+      if (kind === 'problems') rows = rows.filter((e) => e.r !== 'ok' && e.r !== 'master');
+      feedEl.innerHTML = rows.length ? rows.map((e) => entryHTML(e, dev === 'all')).join('') : '<li class="hint">Nothing recorded' + (kind === 'problems' ? ' that went wrong' : ' yet') + '.</li>';
+    };
+    body.querySelectorAll('select').forEach((s) => { s.onchange = paint; });
+    paint();
   }
 
   // Sign out / Block: the confirmation, with the choice of also erasing that device's saved notes.
@@ -903,8 +1168,6 @@
     body.innerHTML = '<p class="hint">Loading\u2026</p>';
     openOverlay('ks-ov-device');
     const row = ctx.row || {};
-    let log = [];
-    try { log = await loadLog(id, 2); } catch (e) { /* shown empty */ }
     const env = rec.env || {};
     const facts = [['ID', shortId(id)], ['System', env.summary], ['How it runs', env.display], ['Screen', env.screen], ['Language', env.language], ['Time zone', env.timeZone],
       ['Cores / memory', [env.cores, env.memoryGB ? env.memoryGB + ' GB' : ''].filter(Boolean).join(' / ')], ['Network', env.network], ['App version', env.appVersion],
@@ -915,21 +1178,56 @@
       ackLine = '<p class="hint">' + (ok ? 'Confirmed on the device ' + esc(fmt(rec.ack.t)) + (row.cmd.wipe ? '; its saved notes were erased.' : '.') : 'Not confirmed yet \u2014 it takes effect when that device next opens the app, or within about two minutes if it is open.' + (row.cmd.wipe ? ' Its saved notes will be erased then.' : '')) + '</p>';
     }
     const canAct = row.id && !ctx.self;
+    // What this device may open. Only a master sets it, and only for another device that is not itself a master.
+    const acc = row.access || (ctx.self ? access() : { notes: true, locked: false });
+    let accessBlock = '';
+    if (canAct && !row.isMaster) {
+      const pending = row.access && row.access.source === 'policy' && !row.accessConfirmed;
+      const how = !row.access ? '' : row.access.source === 'policy'
+        ? (pending ? 'Saved. It takes effect when that device next opens the app, or within about two minutes if it is open.' : 'Confirmed on the device' + (rec.access && rec.access.t ? ' ' + fmt(rec.access.t) : '') + '.')
+        : 'Not set yet, so the default applies: notes on, locked notes off.';
+      accessBlock =
+        '<h3 class="dev-h">What this device can open</h3>' +
+        '<fieldset class="dev-access"><legend class="visually-hidden">What this device can open</legend>' +
+        '<label class="dev-check"><input type="checkbox" id="ks-acc-notes"' + (acc.notes ? ' checked' : '') + '><span><b>Notes</b><small>Everyday notes, in the Notes tab</small></span></label>' +
+        '<label class="dev-check"><input type="checkbox" id="ks-acc-locked"' + (acc.locked ? ' checked' : '') + '><span><b>Locked notes</b><small>The Locked tab: quick-locked and time-locked notes</small></span></label>' +
+        '</fieldset><p class="hint" id="ks-acc-state">' + esc(how) + '</p>' +
+        '<div class="btn-row dev-wrap"><button type="button" class="btn btn-primary" data-a="access" id="ks-acc-save" disabled>Save access</button></div>' +
+        '<p class="hint">A device that is switched off for a type of note does not show it, does not download it and forgets any copy it holds. This is checked by the app on that device (see the limit in Settings \u2192 Devices).</p>';
+    } else {
+      accessBlock = '<h3 class="dev-h">What this device can open</h3><div class="dev-wrap">' + (row.isMaster ? chip('master', '\u2605', 'Everything, because it is a master') : accChip('Notes', acc.notes) + ' ' + accChip('Locked notes', acc.locked)) + '</div>' +
+        (ctx.self && !row.isMaster && !acc.locked ? '<p class="hint">A master turns Locked notes on for this device under Manage devices.</p>' : '');
+    }
     body.innerHTML =
       '<div class="dev-me">' + (row.isMaster ? chip('master', '\u2605', 'Master login') + ' ' : '') + chip(row.status || 'active', (STATUS[row.status || 'active'] || STATUS.active)[0], (STATUS[row.status || 'active'] || STATUS.active)[1]) + '</div>' + ackLine +
+      '<h3 class="dev-h">Device info</h3>' +
       '<dl class="dev-facts">' + facts.map((f) => '<dt>' + esc(f[0]) + '</dt><dd>' + esc(f[1]) + '</dd>').join('') + '</dl>' +
-      (canAct ? '<div class="btn-row dev-wrap">' +
+      accessBlock +
+      '<h3 class="dev-h">Logins</h3><div class="btn-row dev-wrap"><button type="button" class="btn btn-ghost" data-a="log">See this device\u2019s activity log</button></div>' +
+      (canAct ? '<h3 class="dev-h">Actions</h3><div class="btn-row dev-wrap">' +
         (row.isMaster ? '' : '<button class="btn btn-ghost" data-a="terminate">Sign out</button>') +
         (row.status === 'blocked' ? '<button class="btn btn-ghost" data-a="allow">Allow again</button>' : row.isMaster ? '' : '<button class="btn btn-danger" data-a="block">Block</button>') +
         (row.status === 'blocked' ? '' : '<button class="btn btn-danger" data-a="forget">Forget</button>') + '</div>' +
-        '<p class="hint">Sign out ends this device\u2019s current login once; it can sign in again. Block stops it signing in until you allow it. Both can also erase the notes saved on that device. Forget removes it and its history from the list.' + (row.isMaster ? ' A device logged in as master can\u2019t be signed out or blocked, because it could undo that: use Replace master key first.' : '') + '</p>' : '') +
-      '<h3 class="dev-h">Logins</h3><ul class="dev-feed">' + (log.length ? log.slice(0, 80).map((e) => entryHTML(e, false)).join('') : '<li class="hint">Nothing recorded yet.</li>') + '</ul>';
+        '<p class="hint">Sign out ends this device\u2019s current login once; it can sign in again. Block stops it signing in until you allow it. Both can also erase the notes saved on that device. Forget removes it and its history from the list.' + (row.isMaster ? ' A device logged in as master can\u2019t be signed out or blocked, because it could undo that: use Replace master key first.' : '') + '</p>' : '');
     const done = async (msg) => { say(msg); await openManager(); closeOverlay('ks-ov-device'); };
+    const saveBtn = body.querySelector('#ks-acc-save');
+    if (saveBtn) {
+      const nBox = body.querySelector('#ks-acc-notes'), lBox = body.querySelector('#ks-acc-locked');
+      const dirty = () => { saveBtn.disabled = nBox.checked === !!acc.notes && lBox.checked === !!acc.locked; };
+      nBox.onchange = dirty; lBox.onchange = dirty;
+    }
     body.onclick = (e) => {
       const b = e.target.closest('[data-a]'); if (!b) return;
       const a = b.dataset.a, nm = rec.name || 'this device';
       const run = (fn, msg) => async () => { try { await fn(); await done(msg); } catch (err) { say(err.message); } };
-      if (a === 'terminate') wipeDialog('Sign out ' + nm + '?', 'It is signed out the next time it opens the app or checks in, and the Backblaze key is removed from it. It can sign in again.', 'Sign out', false, (wipe) => {
+      if (a === 'log') openLog(id).catch((err) => say(err.message));
+      else if (a === 'access') {
+        const want = { notes: body.querySelector('#ks-acc-notes').checked, locked: body.querySelector('#ks-acc-locked').checked };
+        const apply = async () => { try { await setAccess(id, want); await done('Saved: ' + nm + ' opens ' + (want.notes && want.locked ? 'notes and locked notes' : want.notes ? 'notes only' : want.locked ? 'locked notes only' : 'nothing')); } catch (err) { say(err.message); } };
+        if (!want.notes && !want.locked) ask('Switch off everything for ' + nm + '?', 'It will show no notes at all until you switch something back on. Its saved copies of them are removed from that device.', apply, 'Switch off', true);
+        else apply();
+      }
+      else if (a === 'terminate') wipeDialog('Sign out ' + nm + '?', 'It is signed out the next time it opens the app or checks in, and the Backblaze key is removed from it. It can sign in again.', 'Sign out', false, (wipe) => {
         const go = run(() => command(id, 'terminate', { wipe }), wipe ? 'Sign-out sent; saved notes will be erased' : 'Sign-out sent');
         if (wipe) ask('Erase ' + nm + '\u2019s saved notes?', 'Last check: the notes, photos, audio, video and unsent edits saved on that device will be deleted when it next checks in. This can\u2019t be undone. Your notes in the bucket stay.', go, 'Yes, sign out and erase');
         else go();
@@ -946,14 +1244,27 @@
     if (!st || !doc().body) return;
     const blocked = st.kind === 'blocked';
     const body = shell('ks-ov-lock', blocked ? 'This device is blocked' : 'This device was signed out', false);
-    doc().getElementById('ks-ov-lock').style.zIndex = '9999';
+    doc().getElementById('ks-ov-lock').style.zIndex = 'var(--z-lock, 9999)';
     doc().getElementById('ks-ov-lock').style.background = 'var(--card-2, #F3EFE6)';
     const close = doc().querySelector('#ks-ov-lock .icon-btn'); if (close) close.remove();
     body.innerHTML = '<p>' + (blocked ? 'A master has blocked this device. Its Backblaze key has been removed.' : 'A master signed this device out. Its Backblaze key has been removed.') + (st.wiped ? ' The notes saved on it were erased.' : '') + '</p>' +
       '<p class="hint">' + esc(fmt(st.at)) + (st.by ? ' \u00b7 by ' + esc(st.by) : '') + (st.note ? ' \u00b7 \u201c' + esc(st.note) + '\u201d' : '') + '</p>' +
       '<div class="btn-row dev-actions"><button class="btn btn-primary" id="ks-lock-signin">' + (blocked ? 'Try signing in again' : 'Sign in again') + '</button></div>' +
       (blocked ? '<p class="hint">If a master has allowed this device again, signing in works. Otherwise it is refused and the attempt is recorded.</p>' : '');
-    body.querySelector('#ks-lock-signin').onclick = () => { patchState({ lock: null }); closeOverlay('ks-ov-lock'); if (root.openSettings) root.openSettings(); };
+    body.querySelector('#ks-lock-signin').onclick = () => {
+      closeOverlay('ks-ov-lock');
+      if (root.openSettings) root.openSettings();
+      const settingsOv = doc().getElementById('overlay-settings');
+      if (settingsOv) {
+        const obs = new MutationObserver(() => {
+          if (settingsOv.classList.contains('hidden')) {
+            obs.disconnect();
+            if (getState().lock) showLock();
+          }
+        });
+        obs.observe(settingsOv, { attributes: true, attributeFilter: ['class'] });
+      }
+    };
     openOverlay('ks-ov-lock');
   }
 
@@ -974,9 +1285,11 @@
   }
 
   root.KSDevices = {
-    start, afterConnect, failedAttempt, renderSettings, nameDialog, poll,
+    start, afterConnect, failedAttempt, renderSettings, nameDialog, poll, openLog,
     locked: () => !!getState().lock,
     isMaster: () => !!getState().masterSession,
-    _test: { checkIn, poll, command, forget, rename, listDevices, loadLog, adoptMasterKey, getIdentity, readMaster, parseAgent, summarize, importMasterText, exportMasterText, makeMasterPair, keyMatches, createMaster, loginMaster, logoutMaster, changePassword, replaceMasterKey, setLegacyPassword, setKV: (x) => { kv = x; }, setRaceMs: (n) => { raceMs = n; }, getState, setState, verify, sign, cmdText, claimText, b64, unb64 },
+    // What this device may open (set by a master). allows(meta) is true when a note of that kind may be shown here.
+    access, allows,
+    _test: { setAccess, accessFor, policyText, policyValid, commitAccess, checkIn, poll, command, forget, rename, listDevices, loadLog, adoptMasterKey, getIdentity, readMaster, parseAgent, summarize, importMasterText, exportMasterText, makeMasterPair, keyMatches, createMaster, loginMaster, logoutMaster, changePassword, replaceMasterKey, setLegacyPassword, setKV: (x) => { kv = x; }, setRaceMs: (n) => { raceMs = n; }, getState, setState, verify, sign, cmdText, claimText, b64, unb64 },
   };
 })(typeof window !== 'undefined' ? window : globalThis);

@@ -46,7 +46,7 @@
   function lsDel(k) { try { root.localStorage.removeItem(k); } catch (e) { /* private mode */ } }
 
   // Tolerates "https://s3.us-west-004.backblazeb2.com/" pasted with the scheme or a trailing slash.
-  function cleanHost(s) { return String(s || '').trim().replace(/^https?:\/\//i, '').replace(/\/+$/, ''); }
+  function cleanHost(s) { return String(s || '').trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '').toLowerCase(); }
 
   const config = {
     endpoint() { return cleanHost(lsGet(LS.endpoint)); },
@@ -62,7 +62,7 @@
     configured() { return !!(this.endpoint() && this.bucket() && this.keyId() && this.appKey()); },
     region() {
       const m = /^s3\.([a-z0-9-]+)\.backblazeb2\.com$/i.exec(this.endpoint());
-      return m ? m[1] : 'us-west-004';
+      return m ? m[1].toLowerCase() : 'us-west-004';
     },
     clear() { Object.values(LS).forEach(lsDel); lsDel(META_CACHE_KEY); },
   };
@@ -89,11 +89,14 @@
   }
 
   function xmlUnescape(s) {
-    return s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+    return String(s || '')
+      .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+      .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)))
+      .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
   }
 
   function nowAmzDate() {
-    return new Date().toISOString().replace(/[:-]|\.\d{3}/g, ''); // 20260101T120000Z
+    return new Date(clock.now()).toISOString().replace(/[:-]|\.\d{3}/g, ''); // 20260101T120000Z
   }
 
   // Builds the headers for one signed S3 request. `headers` are extra headers to sign
@@ -123,6 +126,40 @@
       canonicalQuery,
       canonicalPath,
       authorization: `AWS4-HMAC-SHA256 Credential=${keyId}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
+    };
+  }
+
+  // Builds a presigned query-string URL for GET requests. Because the signature lives in
+  // query parameters instead of an Authorization header, browsers treat plain GETs as
+  // CORS simple requests and skip the OPTIONS preflight round trip.
+  async function signV4Query({ method, host, path, query, region, keyId, secret, amzDate, expires }) {
+    const date = amzDate.slice(0, 8);
+    const scope = `${date}/${region}/s3/aws4_request`;
+    const q = {
+      ...(query || {}),
+      'X-Amz-Algorithm': 'AWS4-HMAC-SHA256',
+      'X-Amz-Credential': `${keyId}/${scope}`,
+      'X-Amz-Date': amzDate,
+      'X-Amz-Expires': String(expires || 300),
+      'X-Amz-SignedHeaders': 'host',
+    };
+    const canonicalPath = path.split('/').map(uriEncode).join('/');
+    const canonicalQuery = Object.keys(q)
+      .map((k) => [uriEncode(k), uriEncode(q[k])])
+      .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+      .map(([k, v]) => k + '=' + v)
+      .join('&');
+    const canonicalHeaders = 'host:' + String(host).trim() + '\n';
+    const canonicalRequest = [method, canonicalPath, canonicalQuery, canonicalHeaders, 'host', 'UNSIGNED-PAYLOAD'].join('\n');
+    const stringToSign = ['AWS4-HMAC-SHA256', amzDate, scope, await sha256Hex(canonicalRequest)].join('\n');
+    let k = await hmacSha256(enc.encode('AWS4' + secret), date);
+    k = await hmacSha256(k, region);
+    k = await hmacSha256(k, 's3');
+    k = await hmacSha256(k, 'aws4_request');
+    const signature = toHex(await hmacSha256(k, stringToSign));
+    return {
+      url: 'https://' + host + canonicalPath + '?' + canonicalQuery + '&X-Amz-Signature=' + signature,
+      amzDate,
     };
   }
 
@@ -227,17 +264,32 @@
 
   /* ------------------------------------------------------------ signed requests */
 
-  async function prepare(method, key, query, payloadHash) {
+  const DEFAULT_FETCH_TIMEOUT_MS = 30000;
+
+  function resolveCreds(creds) {
+    if (creds) {
+      const host = cleanHost(creds.endpoint);
+      const bucketName = String(creds.bucket || '').trim();
+      const keyId = String(creds.keyId || '').trim();
+      const secret = String(creds.appKey || '').trim();
+      if (!host || !bucketName || !keyId || !secret) throw notConfiguredError();
+      const m = /^s3\.([a-z0-9-]+)\.backblazeb2\.com$/i.exec(host);
+      return { host, bucket: bucketName, keyId, secret, region: m ? m[1] : 'us-west-004' };
+    }
     if (!config.configured()) throw notConfiguredError();
-    const host = config.endpoint();
-    const path = '/' + config.bucket() + (key ? '/' + key : '');
+    return { host: config.endpoint(), bucket: config.bucket(), keyId: config.keyId(), secret: config.appKey(), region: config.region() };
+  }
+
+  async function prepare(method, key, query, payloadHash, creds) {
+    const c = resolveCreds(creds);
+    const path = '/' + c.bucket + (key ? '/' + key : '');
     const signed = await signV4({
-      method, host, path, query: query || {}, payloadHash,
-      region: config.region(), keyId: config.keyId(), secret: config.appKey(),
+      method, host: c.host, path, query: query || {}, payloadHash,
+      region: c.region, keyId: c.keyId, secret: c.secret,
       amzDate: nowAmzDate(),
     });
     return {
-      url: 'https://' + host + signed.canonicalPath + (signed.canonicalQuery ? '?' + signed.canonicalQuery : ''),
+      url: 'https://' + c.host + signed.canonicalPath + (signed.canonicalQuery ? '?' + signed.canonicalQuery : ''),
       headers: {
         'x-amz-date': signed.amzDate,
         'x-amz-content-sha256': payloadHash,
@@ -246,17 +298,55 @@
     };
   }
 
+  async function preparePresignedGet(key, query, creds) {
+    const c = resolveCreds(creds);
+    const path = '/' + c.bucket + (key ? '/' + key : '');
+    return signV4Query({
+      method: 'GET', host: c.host, path, query: query || {},
+      region: c.region, keyId: c.keyId, secret: c.secret,
+      amzDate: nowAmzDate(), expires: 300,
+    });
+  }
+
   // One signed request. `body` (Uint8Array) is optional. Resolves with the Response; throws
-  // a network error if the request never got an HTTP answer at all.
+  // a network error if the request never got an HTTP answer at all (or timed out).
   async function s3(method, key, opts) {
     const o = opts || {};
-    const payloadHash = o.payloadHash || (o.body ? await sha256Hex(o.body) : EMPTY_SHA);
-    const req = await prepare(method, key, o.query, payloadHash);
-    const init = { method, headers: o.headers ? { ...req.headers, ...o.headers } : req.headers };
+    const timeoutMs = o.timeoutMs || DEFAULT_FETCH_TIMEOUT_MS;
+    const usePresignedGet = method === 'GET' && o.body === undefined && !o.forceHeaderSign;
+    let url, headers;
+    if (usePresignedGet) {
+      const req = await preparePresignedGet(key, o.query, o.creds);
+      url = req.url;
+      headers = o.headers ? { ...o.headers } : undefined;
+    } else {
+      const payloadHash = o.payloadHash || (o.body ? await sha256Hex(o.body) : EMPTY_SHA);
+      const req = await prepare(method, key, o.query, payloadHash, o.creds);
+      url = req.url;
+      headers = o.headers ? { ...req.headers, ...o.headers } : req.headers;
+    }
+    const init = { method, cache: 'no-store' };
+    if (headers && Object.keys(headers).length) init.headers = headers;
     if (o.body !== undefined) init.body = o.body;
+    let ac = null, timer = null;
+    if (typeof root.AbortController === 'function' && timeoutMs > 0) {
+      ac = new root.AbortController();
+      init.signal = ac.signal;
+      timer = root.setTimeout(() => { try { ac.abort(); } catch (e) {} }, timeoutMs);
+    }
     let res;
-    try { res = await root.fetch(req.url, init); } catch (e) { throw networkError(); }
-    noteServerDate(res.headers.get('date'));
+    try { res = await root.fetch(url, init); }
+    catch (e) { throw networkError(); }
+    finally { if (timer) root.clearTimeout(timer); }
+    const gotDate = noteServerDate(res.headers.get('date'));
+    // If the device clock was skewed and Backblaze gave us its Date header, retry once with the corrected clock.
+    if (res.status === 403 && gotDate && !o._clockRetried) {
+      let clonedText = '';
+      try { clonedText = await res.clone().text(); } catch (e) {}
+      if (/RequestTimeTooSkewed/.test(clonedText)) {
+        return s3(method, key, { ...o, _clockRetried: true });
+      }
+    }
     return res;
   }
 
@@ -298,6 +388,7 @@
     return new Promise((resolve, reject) => {
       const xhr = new root.XMLHttpRequest();
       xhr.open('PUT', req.url);
+      xhr.timeout = Math.max(60000, Math.min(600000, Math.ceil((bytes ? bytes.length : 0) / 20000) * 1000));
       for (const h of Object.keys(req.headers)) xhr.setRequestHeader(h, req.headers[h]);
       if (onProgress) xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(e.loaded, e.total); };
       xhr.onload = () => {
@@ -363,7 +454,8 @@
       const query = { 'list-type': '2', prefix, 'max-keys': '1000' };
       if (token) query['continuation-token'] = token;
       const res = await s3ok('GET', '', { query });
-      const xml = await res.text();
+      let xml;
+      try { xml = await res.text(); } catch (e) { throw networkError(); }
       for (const m of xml.matchAll(/<Contents>([\s\S]*?)<\/Contents>/g)) {
         const key = /<Key>([\s\S]*?)<\/Key>/.exec(m[1]);
         if (!key) continue;
@@ -380,7 +472,8 @@
       if (/<IsTruncated>true<\/IsTruncated>/.test(xml)) {
         const t = /<NextContinuationToken>([\s\S]*?)<\/NextContinuationToken>/.exec(xml);
         token = t ? xmlUnescape(t[1]) : null;
-        if (!token) break;
+        if (!token) throw new Error('Bucket listing was truncated without a continuation token.');
+        if (page === 199) throw new Error('Bucket listing exceeded the 200-page pagination limit.');
       } else break;
     }
     return items;
@@ -389,8 +482,16 @@
   // How many bytes the bucket holds for exactly this key, or null if there is no such object.
   // (A listing by exact key works with the CORS rule the app has always needed - no HEAD required.)
   async function objectSize(key) {
-    const hit = (await listAll(key)).find((o) => o.key === key);
-    return hit ? hit.size : null;
+    const res = await s3ok('GET', '', { query: { 'list-type': '2', prefix: key, 'max-keys': '1' } });
+    let xml;
+    try { xml = await res.text(); } catch (e) { throw networkError(); }
+    for (const m of xml.matchAll(/<Contents>([\s\S]*?)<\/Contents>/g)) {
+      const k = /<Key>([\s\S]*?)<\/Key>/.exec(m[1]);
+      if (!k || xmlUnescape(k[1]) !== key) continue;
+      const sz = /<Size>(\d+)<\/Size>/.exec(m[1]);
+      return sz ? Number(sz[1]) : 0;
+    }
+    return null;
   }
 
   // Reads back what the bucket actually stored and insists it is the size we sent. Nothing is
@@ -410,20 +511,29 @@
   // Tells apart the failures that matter. A browser reports a blocked cross-origin request
   // exactly like being offline, so when the signed request fails but the host itself answers,
   // it is almost certainly the bucket's CORS rule.
-  async function testConnection() {
-    if (!config.configured()) return { ok: false, kind: 'config', message: 'Fill in all four fields first.' };
+  async function testConnection(candidate) {
+    let host;
+    if (candidate) {
+      host = cleanHost(candidate.endpoint);
+      if (!host || !String(candidate.bucket || '').trim() || !String(candidate.keyId || '').trim() || !String(candidate.appKey || '').trim()) {
+        return { ok: false, kind: 'config', message: 'Fill in all four fields first.' };
+      }
+    } else {
+      if (!config.configured()) return { ok: false, kind: 'config', message: 'Fill in all four fields first.' };
+      host = config.endpoint();
+    }
     try {
-      await s3ok('GET', '', { query: { 'list-type': '2', 'max-keys': '1' } });
+      await s3ok('GET', '', { query: { 'list-type': '2', 'max-keys': '1' }, creds: candidate || null });
       return { ok: true };
     } catch (e) {
       if (!e.isNetworkError) {
         return { ok: false, kind: e.status === 401 ? 'auth' : 'other', message: e.message };
       }
       let reachable = false;
-      try { await root.fetch('https://' + config.endpoint() + '/', { mode: 'no-cors' }); reachable = true; } catch (e2) { /* unreachable */ }
+      try { await root.fetch('https://' + host + '/', { mode: 'no-cors', cache: 'no-store' }); reachable = true; } catch (e2) { /* unreachable */ }
       return reachable
         ? { ok: false, kind: 'cors', message: 'Backblaze answered, but this page isn\u2019t allowed to talk to the bucket. Add the CORS rule from the README (it must list ' + root.location.origin + ').' }
-        : { ok: false, kind: 'network', message: 'Couldn\u2019t reach ' + config.endpoint() + ' \u2014 check the endpoint and your connection.' };
+        : { ok: false, kind: 'network', message: 'Couldn\u2019t reach ' + host + ' \u2014 check the endpoint and your connection.' };
     }
   }
 
@@ -456,14 +566,21 @@
     return out.photos + out.clips + out.videos ? out : undefined;
   }
 
+  function validUnlockAt(v) {
+    const n = typeof v === 'number' ? v : (typeof v === 'string' && v.trim() !== '' ? Number(v) : NaN);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
+  }
+
   function metaFromBody(existing, body, now, size) {
     const lockType = body.lockType === 'quick' || body.lockType === 'time' ? body.lockType : 'none';
+    const prevRev = existing && Number.isFinite(existing.rev) ? existing.rev : 0;
     return {
       id: existing ? existing.id : body.id,
       createdAt: existing ? existing.createdAt : now,
       updatedAt: now,
+      rev: prevRev + 1,
       lockType,
-      unlockAt: lockType === 'time' ? (body.unlockAt || null) : null,
+      unlockAt: lockType === 'time' ? validUnlockAt(body.unlockAt) : null,
       // The title is stored in plain text for every note, locked or not, so a locked note can be
       // recognised on its card on any device. Only the preview (a slice of the body) stays plain
       // for unlocked notes alone - a locked note's text, photos and drawing are encrypted client-side.
@@ -482,7 +599,10 @@
   async function readMeta(id) {
     const bytes = await getBytesOrNull(metaKey(id));
     if (!bytes) return null;
-    try { return JSON.parse(dec.decode(bytes)); } catch (e) { return null; }
+    try { return JSON.parse(dec.decode(bytes)); }
+    catch (e) {
+      return { id, createdAt: 0, updatedAt: 0, lockType: 'none', unlockAt: null, title: 'Damaged note (unreadable metadata)', preview: 'Metadata JSON in Backblaze could not be parsed.', corrupted: true };
+    }
   }
 
   function loadMetaCache() {
@@ -550,21 +670,43 @@
       throw err;
     }
     const existing = await readMeta(id); // also refreshes the server clock
+    // Optimistic concurrency check: if another device saved a newer revision since this edit began,
+    // surface a 409 conflict instead of silently overwriting it (unless explicitly forced).
+    if (existing && !existing.corrupted && !body.forceOverwrite) {
+      const hasBaseRev = Number.isFinite(body.baseRev);
+      const hasBaseUpdated = Number.isFinite(body.baseUpdatedAt);
+      const revConflict = hasBaseRev && Number.isFinite(existing.rev) && existing.rev > body.baseRev;
+      const timeConflict = !hasBaseRev && hasBaseUpdated && existing.updatedAt && existing.updatedAt > body.baseUpdatedAt;
+      if (revConflict || timeConflict) {
+        const err = new Error('This note was updated on another device since you opened it.');
+        err.status = 409;
+        err.conflict = true;
+        err.serverMeta = existing;
+        throw err;
+      }
+    }
     const now = body.lockType === 'time' ? clock.now() : Date.now();
     const contentJSON = JSON.stringify(body.content);
-    const meta = metaFromBody(existing, { ...body, id }, now, contentJSON.length);
-
-    // Content first, then meta: a note never shows up in the list without its content.
-    // Each is read back (size) before the save counts as done.
     const contentBytes = enc.encode(contentJSON);
+    const meta = metaFromBody(existing && !existing.corrupted ? existing : null, { ...body, id }, now, contentBytes.length);
+
+    // Order: content -> vault (for time-locked notes) -> meta.
+    // Meta goes last and every file is verified before proceeding, so a dropped connection
+    // never leaves a listed note missing its content or its time-lock vault password.
     await putBytes(contentKey(id), contentBytes, await sha256Hex(contentBytes), onProgress ? (loaded, total) => onProgress(total ? loaded / total : 1) : null);
     await verifyStored(contentKey(id), contentBytes.length);
+
+    if (meta.lockType === 'time' && body.password2) {
+      const vaultBytes = enc.encode(String(body.password2));
+      await putBytes(vaultKey(id), vaultBytes, await sha256Hex(vaultBytes), null);
+      await verifyStored(vaultKey(id), vaultBytes.length);
+    }
+
     const metaBytes = enc.encode(JSON.stringify(meta));
     await putBytes(metaKey(id), metaBytes, await sha256Hex(metaBytes), null);
     await verifyStored(metaKey(id), metaBytes.length);
 
-    if (meta.lockType === 'time' && body.password2) await putText(vaultKey(id), String(body.password2));
-    else if (meta.lockType !== 'time') await deleteObject(vaultKey(id)).catch(() => {});
+    if (meta.lockType !== 'time') await deleteObject(vaultKey(id)).catch(() => {});
 
     // The save lists every media file it refers to. Anything else stored for this note is an
     // orphan and is swept (after a grace period, see pruneMedia).
@@ -577,10 +719,11 @@
 
   async function deleteNote(id) {
     assertId(id);
-    // Meta goes last: if this is interrupted the note is still listed, so it can simply be deleted again.
+    // Media first, then content & vault, and meta last: an interrupted media delete never
+    // leaves meta pointing at missing content, and the delete can simply be repeated.
+    await deleteAllMedia(id);
     await deleteObject(contentKey(id));
     await deleteObject(vaultKey(id));
-    await deleteAllMedia(id).catch(() => {});
     await deleteObject(metaKey(id));
     return { deleted: true };
   }
@@ -594,7 +737,8 @@
     if (meta.lockType !== 'time') { const e = new Error('Not a time-locked note'); e.status = 400; throw e; }
     // The phone's clock is not consulted: ask Backblaze what time it is right now.
     const serverNow = await clock.sync();
-    if (!meta.unlockAt || serverNow < meta.unlockAt) {
+    const unlockAt = validUnlockAt(meta.unlockAt);
+    if (!unlockAt || serverNow < unlockAt) {
       const e = new Error('Still locked');
       e.status = 403;
       e.body = { error: 'Still locked' };
@@ -639,7 +783,7 @@
   // so a save still in flight can't lose the files it is about to reference.
   async function pruneMedia(noteId, keepNames) {
     const keep = new Set(keepNames);
-    const cutoff = Date.now() - ORPHAN_GRACE_MS;
+    const cutoff = clock.now() - ORPHAN_GRACE_MS;
     const stale = (await listMedia(noteId)).filter((i) => !keep.has(i.name) && i.modified < cutoff);
     await deleteMedia(noteId, stale.map((i) => i.name));
   }
@@ -659,6 +803,6 @@
     // media
     listMedia, deleteMedia, mediaKey,
     // handy for the tests
-    _test: { signV4, uriEncode, metaFromBody, metaKey, contentKey, vaultKey },
+    _test: { signV4, signV4Query, validUnlockAt, uriEncode, metaFromBody, metaKey, contentKey, vaultKey },
   };
 })(typeof window !== 'undefined' ? window : globalThis);

@@ -223,19 +223,27 @@
         const infoStart = pos; const bodyStart = pos + id.len + size.len; const bodyEnd = bodyStart + size.size;
         if (bodyEnd > head.length) return blob;
         let scale = 1000000; let p = bodyStart;
+        let existingDurAt = -1; let existingDurSize = 0;
         while (p < bodyEnd) {
           const cid = readId(p); if (!cid) return blob;
           const csz = readSize(p + cid.len); if (!csz || csz.unknown) return blob;
           const dataAt = p + cid.len + csz.len;
           if (cid.id === 0x2AD7B1) { scale = 0; for (let i = 0; i < csz.size; i++) scale = scale * 256 + head[dataAt + i]; }
-          if (cid.id === 0x4489) { // a Duration is there: keep it unless it says zero
+          if (cid.id === 0x4489) { // a Duration is there: keep it unless it says zero/NaN
             const dv = new DataView(head.buffer, head.byteOffset + dataAt, csz.size);
             const have = csz.size === 8 ? dv.getFloat64(0) : csz.size === 4 ? dv.getFloat32(0) : 0;
             if (have > 0) return blob;
+            existingDurAt = dataAt; existingDurSize = csz.size;
           }
           p = dataAt + csz.size;
         }
         const ticks = seconds * 1e9 / (scale || 1000000);
+        if (existingDurAt >= 0 && (existingDurSize === 8 || existingDurSize === 4)) {
+          const patched = head.slice();
+          const dv = new DataView(patched.buffer, patched.byteOffset + existingDurAt, existingDurSize);
+          if (existingDurSize === 8) dv.setFloat64(0, ticks); else dv.setFloat32(0, ticks);
+          return new root.Blob([patched, blob.slice(head.length)], { type: blob.type });
+        }
         const dur = new Uint8Array(11);
         dur[0] = 0x44; dur[1] = 0x89; dur[2] = 0x88;
         new DataView(dur.buffer).setFloat64(3, ticks);
@@ -285,7 +293,7 @@
       v.style.cssText = 'position:fixed;left:0;top:0;width:2px;height:2px;opacity:0.01;pointer-events:none';
       doc.body.appendChild(v);
 
-      let actx = null; let dest = null; let rec = null; let raf = 0; let tick = 0;
+      let actx = null; let dest = null; let rec = null; let stream = null; let raf = 0; let tick = 0;
       let settled = false; let lastTime = -1; let lastMove = Date.now();
       const chunks = [];
 
@@ -293,11 +301,12 @@
         cancelAnimationFrame(raf); clearInterval(tick);
         doc.removeEventListener('visibilitychange', onVisibility);
         try { if (rec && rec.state !== 'inactive') rec.stop(); } catch (e) { /* already stopped */ }
+        if (stream) { try { stream.getTracks().forEach((t) => t.stop()); } catch (e) { /* done */ } stream = null; }
         try { v.pause(); } catch (e) { /* done */ }
         v.removeAttribute('src');
         try { v.load(); } catch (e) { /* done */ }
         v.remove();
-        if (actx) { try { actx.close(); } catch (e) { /* done */ } }
+        if (actx) { try { actx.close(); } catch (e) { /* done */ } actx = null; }
         root.URL.revokeObjectURL(url);
       };
       const fail = (err) => { if (settled) return; settled = true; cleanup(); reject(err); };
@@ -305,7 +314,15 @@
       const onVisibility = () => {
         // A hidden page stops painting, which would record a frozen picture: wait, and carry on when it is back.
         if (doc.hidden) { try { v.pause(); if (rec && rec.state === 'recording') rec.pause(); } catch (e) { /* ignore */ } }
-        else { try { if (rec && rec.state === 'paused') rec.resume(); v.play().catch(() => {}); } catch (e) { /* ignore */ } }
+        else {
+          lastMove = Date.now();
+          try {
+            v.play().then(() => {
+              if (!settled && rec && rec.state === 'paused') { try { rec.resume(); } catch (e) {} }
+              lastMove = Date.now();
+            }).catch(() => fail(userError('Compressing paused when you switched away \u2014 try again while keeping this screen open.')));
+          } catch (e) { fail(userError('Compressing could not resume \u2014 try again.')); }
+        }
       };
       doc.addEventListener('visibilitychange', onVisibility);
 
@@ -318,14 +335,21 @@
           if (AC) {
             try {
               actx = new AC();
-              if (actx.state === 'suspended') await actx.resume().catch(() => {});
+              if (actx.state === 'suspended') {
+                await Promise.race([
+                  actx.resume().catch(() => {}),
+                  new Promise((r) => setTimeout(r, 1500)),
+                ]);
+              }
+              if (settled) return;
               const src = actx.createMediaElementSource(v);
               dest = actx.createMediaStreamDestination();
               src.connect(dest);
               audioTracks = dest.stream.getAudioTracks();
-            } catch (e) { actx = null; dest = null; }
+            } catch (e) { if (actx) { try { actx.close(); } catch (e2) {} } actx = null; dest = null; }
           }
-          const stream = canvas.captureStream(preset.fps);
+          if (settled) return;
+          stream = canvas.captureStream(preset.fps);
           audioTracks.forEach((t) => stream.addTrack(t));
           rec = new root.MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: videoBitrate(out, preset), audioBitsPerSecond: preset.abps });
           rec.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
@@ -424,7 +448,7 @@
     const c = ctx || {};
     const v = sanitize(entry);
     if (!v) throw userError('A video in this note looks damaged and can\u2019t be saved.');
-    if (!c.locked || v.enc) { root.KSMedia.release(v.base); return { ...v, poster: entry.poster || v.poster }; }
+    if (!c.locked || v.enc) { if (c.deferRelease && Array.isArray(c.releaseBases)) c.releaseBases.push(v.base); else root.KSMedia.release(v.base); return { ...v }; }
     if (!c.key) throw userError('This note is locked, but its key isn\u2019t ready \u2014 try again.');
     const base = st.randomName();
     root.KSMedia.hold(base);
@@ -454,9 +478,9 @@
       root.KSMedia.release(base);
       throw e;
     }
-    root.KSMedia.release(v.base);
-    root.KSMedia.release(base);
-    return { ...v, base, parts, enc: true, poster: entry.poster || v.poster };
+    if (c.deferRelease && Array.isArray(c.releaseBases)) { c.releaseBases.push(v.base, base); }
+    else { root.KSMedia.release(v.base); root.KSMedia.release(base); }
+    return { ...v, base, parts, enc: true };
   }
 
   /* ------------------------------------------------------------------------ playing */
@@ -483,8 +507,20 @@
     async function loadPart(i) {
       const p = v.parts[i]; const name = partName(v.base, i);
       let blob = await st.cacheGetBlob(noteId, name);
-      if (blob && blob.size !== p.n) { await st.cacheDelete([{ id: noteId + '/' + name }]).catch(() => {}); blob = null; } // damaged copy: fetch a fresh one
-      if (!blob) {
+      let fromCache = !!blob;
+      if (blob) {
+        let bad = blob.size !== p.n;
+        if (!bad && p.h) {
+          const cachedBytes = new Uint8Array(await st.blobBytes(blob));
+          if ((await st.sha256Hex(cachedBytes)) !== p.h) bad = true;
+        }
+        if (bad) {
+          await st.cacheDelete([{ id: noteId + '/' + name }]).catch(() => {});
+          blob = null;
+          fromCache = false;
+        }
+      }
+      const fetchPart = async () => {
         let bytes;
         try { bytes = await st.downloadBytes(noteId, name); }
         catch (e) {
@@ -493,12 +529,22 @@
         }
         if (bytes.length !== p.n) throw userError('Part ' + (i + 1) + ' of this video came back the wrong size \u2014 try again.');
         if (p.h && (await st.sha256Hex(bytes)) !== p.h) throw userError('Part ' + (i + 1) + ' of this video came back damaged \u2014 try again.');
-        blob = new root.Blob([bytes]);
-        await st.cachePut(noteId, name, blob, false, { kind: 'video', sha: p.h || '' }).catch(() => {});
-      }
+        const b = new root.Blob([bytes]);
+        await st.cachePut(noteId, name, b, false, { kind: 'video', sha: p.h || '' }).catch(() => {});
+        return b;
+      };
+      if (!blob) blob = await fetchPart();
       if (v.enc) {
-        const plain = await st.decryptBytes(key, p.iv, new Uint8Array(await st.blobBytes(blob)));
-        return new root.Blob([plain]);
+        try {
+          const plain = await st.decryptBytes(key, p.iv, new Uint8Array(await st.blobBytes(blob)));
+          return new root.Blob([plain]);
+        } catch (decErr) {
+          if (!fromCache) throw decErr;
+          await st.cacheDelete([{ id: noteId + '/' + name }]).catch(() => {});
+          blob = await fetchPart();
+          const plain = await st.decryptBytes(key, p.iv, new Uint8Array(await st.blobBytes(blob)));
+          return new root.Blob([plain]);
+        }
       }
       return blob;
     }

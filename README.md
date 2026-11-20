@@ -126,8 +126,7 @@ Settings → Compressed quality (a photo already at that strength usually won't 
 tells you instead of changing it). The original is gone from the note once you confirm; its file is
 deleted from the bucket the next time that note is saved after an hour. Progress runs along the top
 of the screen with the file size and a percentage. Audio takes as long as the clip plays and needs
-the note to stay open; leaving the note stops it. The app has no video support, so there is nothing
-to compress there.
+the note to stay open; leaving the note stops it. Videos can also be compressed (up to 720p or 1080p) and are stored in 4 MB encrypted parts up to 2 GB per video.
 
 ## Devices and logins
 
@@ -140,12 +139,12 @@ on the device and logged with its next successful login. The IP address is not r
 between, the app cannot see it.
 
 **The master account.** The first time the app opens against a bucket that has none, it offers to create one: you
-choose a password (at least 8 characters). After that, **any device can log in as master with that password alone**
-(Settings -> Devices & logins -> *Log in as master*) and **log out of master** when it is done. If a master account
+choose a passphrase (at least 12 characters). After that, **any device can log in as master with that password alone**
+(Settings -> Devices -> *Log in as master*) and **log out of master** when it is done. If a master account
 already exists, no one is offered the chance to create another, and creating a second is refused. The password is
 stored in the bucket as the master key encrypted with it (PBKDF2 then AES-GCM): it is not hidden from someone who holds
 the Backblaze key, only slowed down. While logged in, a device sees every device with its status, system and last
-login, the recent logins of all devices, and one device's full history (two months at a time). From there it can:
+login, the recent logins of all devices, and each device's recent history (up to the last two months / 120 entries). From there it can:
 
 - **Sign out** a device: its Backblaze key is removed the next time it opens the app or checks in (about every
   two minutes while open). It can sign in again by typing the key.
@@ -155,8 +154,8 @@ login, the recent logins of all devices, and one device's full history (two mont
   photos, audio, video and unsent edits kept in that device's browser. Your notes in the bucket are not touched.
 - **Forget** a device: removes its record and history (not allowed while it is blocked).
 - **Change password**: needs the current password; nothing else changes.
-- **Replace master key**: makes a new key, which logs out every device that was logged in as master, including this
-  one (log in again with the password). Use it when a device that was logged in as master is lost or stolen: a device
+- **Replace master key**: makes a new key, which logs out every other device logged in as master while keeping this
+  device logged in with the new key. Use it when a device that was logged in as master is lost or stolen: a device
   logged in as master can't be signed out or blocked by another (it could undo it), so replace the key first, then block
   it. Blocks already given stay in force; a new password can be set at the same time.
 
@@ -164,14 +163,25 @@ Every command is signed with the master key and checked by the device that recei
 can't block anyone; an unsigned command shows up in the list as ignored. A master account made by 1.12 has no password
 yet: on a device that is already master, Settings offers *Set a master password*.
 
-**A full offline copy.** Normally the app keeps note text and some recent photos and audio on the device. A device
-logged in as master can also choose *Sync all data offline* (Settings -> Offline copy) to keep **everything**: all
-note text, photos, audio and videos. It downloads one file at a time (big files in 4 MB slices that are saved as they
-arrive), so closing the app mid-way costs at most one slice: it carries on where it stopped the next time the app
-opens. Synced files are never dropped by the usual size limits. It needs free space (the confirmation shows the total)
-and uses mobile data off Wi-Fi. *Delete offline data* removes everything saved for offline use on that device, and
-asks twice; your notes in the bucket and any edits not yet uploaded are not touched. The same double check guards
-Block, Sign out with erase, Forget and Replace master key.
+**What a device may open.** A master chooses, per device, whether it may open **normal notes** and whether it may open
+**locked notes** (Settings -> Devices -> tap a device -> *What this device can open*). A device that is switched off for
+a type does not show it (the Locked tab disappears), does not download it and forgets what it held. A device that is not
+a master opens normal notes and no locked notes until a master allows them; a master device, and a bucket with no master
+account, open everything. The choice is signed with the master key and checked by the device. It limits what a device *shows*, not what it can
+make: a locked note written on a device that may not show locked notes is still saved to Backblaze as a locked note, and
+then disappears from that device (the app says so).
+
+**Activity log.** Separate from the device list: Settings -> Activity log shows every time a device opened the app or
+tried to sign in, with a device picker (master) and an "Everything / Problems only" filter.
+
+**An offline copy, only when you ask.** Nothing in the app downloads notes or files by itself. Settings -> Offline copy ->
+*Download* (any device) saves the text of every note first, then only the types you tick: Images, Audio, Videos. Unticked
+types are loaded live when you open a note. Big files come in 4 MB slices saved as they arrive, so *Continue* picks up
+where a stopped or interrupted run left off. Anything already kept while you used the app counts as downloaded, and the
+section shows what is on the device per type. Saved files are never dropped by the usual size limits. It needs free space
+and uses mobile data off Wi-Fi. *Delete offline data* removes everything saved for offline use on that device, and asks
+twice; your notes in the bucket and any edits not yet uploaded are not touched. The same double check guards Block, Sign
+out with erase, Forget and Replace master key.
 
 **What this can and can't do.** There is no server, so every device still holds the Backblaze application key and
 the check is made by Keepsake itself on that device. Sign out and Block stop the app on a device that is running
@@ -241,11 +251,9 @@ encrypted with everything else. Recording needs HTTPS and microphone permission.
 
 ## Offline
 
-Keepsake keeps a copy of every note on the device (in IndexedDB), so the
-list, reading, unlocking, downloading, writing, and deleting all work with
-no connection. A note opens straight from that copy whenever it matches what the
+Keepsake caches notes you open (and anything you download via **Settings → Offline copy**) in IndexedDB, so reading, unlocking, writing, and deleting cached notes work with no connection. A note opens straight from that copy whenever it matches what the
 bucket last reported (the list is refreshed on launch, after saves and when you come
-back to the app), so opening doesn't wait on the network. Changes made offline are queued and sent automatically once
+back to the app), so opening doesn't wait on the network. Saved notes are drawn before the network is touched, and a panel at the top lists each start-up step with its time. Changes made offline are queued and sent automatically once
 you're back online; until then the note shows a "Not synced" tag and the
 top bar shows an offline / not-synced indicator. Locked notes are cached in
 their encrypted form, exactly as the bucket stores them. This is

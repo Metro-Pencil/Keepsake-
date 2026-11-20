@@ -42,6 +42,7 @@
   let S = null;       // state of the open video
   let wired = false;
   let opener = null;
+  let singleTimer = 0;
 
   function wire() {
     if (wired) return;
@@ -59,7 +60,7 @@
     on('vp-speed', 'click', cycleSpeed);
     on('vp-full', 'click', toggleFullscreen);
     on('vp-pip', 'click', togglePip);
-    on('vp-menu-btn', 'click', (e) => { e.stopPropagation(); setMenu(!S.menuOpen); });
+    on('vp-menu-btn', 'click', (e) => { e.stopPropagation(); if (S) setMenu(!S.menuOpen); });
     on('vp-cancel', 'click', () => { if (S) S.cancelled = true; close(); });
     on('vp-err-download', 'click', () => S && S.onDownload && S.onDownload());
     on('vp-act-download', 'click', () => { setMenu(false); if (S && S.onDownload) S.onDownload(); });
@@ -69,9 +70,11 @@
 
     // Picture: tap shows/hides the controls, double-tap jumps.
     const stage = $('vp-stage');
-    let lastTap = { t: 0, side: 0 }; let singleTimer = 0;
+    let lastTap = { t: 0, side: 0 };
     stage.addEventListener('pointerup', (e) => {
-      if (e.target.closest('button, #vp-menu, #vp-loading, #vp-error') || !S || S.loading) return;
+      if (!S) return;
+      if (S.menuOpen && !e.target.closest('#vp-menu, #vp-menu-btn')) { setMenu(false); return; }
+      if (e.target.closest('button, #vp-menu, #vp-loading, #vp-error') || S.loading) return;
       const r = stage.getBoundingClientRect();
       const x = (e.clientX - r.left) / r.width;
       const side = x < 0.34 ? -1 : x > 0.66 ? 1 : 0;
@@ -84,6 +87,8 @@
       lastTap = { t: now, side };
       clearTimeout(singleTimer);
       singleTimer = setTimeout(() => {
+        singleTimer = 0;
+        if (!S) return;
         if (S.menuOpen) { setMenu(false); return; }
         if (el.classList.contains('is-idle')) wake(); else if (!v.paused) el.classList.add('is-idle'); else toggle();
       }, 300);
@@ -117,7 +122,7 @@
     // The video itself
     v.addEventListener('play', () => { setPlaying(true); wake(); });
     v.addEventListener('pause', () => { setPlaying(false); wake(); });
-    v.addEventListener('ended', () => { setPlaying(false); S.ended = true; syncPlayIcons(); wake(); });
+    v.addEventListener('ended', () => { if (!S) return; setPlaying(false); S.ended = true; syncPlayIcons(); wake(); });
     v.addEventListener('timeupdate', paint);
     v.addEventListener('progress', paintBuffered);
     v.addEventListener('durationchange', paint);
@@ -206,9 +211,11 @@
   }
 
   function seekTo(t) {
+    if (!S || S.loading) return;
     const d = duration();
     try { v.currentTime = Math.max(0, Math.min(d || t, t)); } catch (e) { /* not seekable yet */ }
     S.ended = false;
+    syncPlayIcons();
     paint();
   }
 
@@ -229,7 +236,7 @@
 
   function toggleFullscreen() {
     const d = root.document;
-    if (d.fullscreenElement || d.webkitFullscreenElement) { (d.exitFullscreen || d.webkitExitFullscreen).call(d); return; }
+    if (d.fullscreenElement || d.webkitFullscreenElement) { const ex = (d.exitFullscreen || d.webkitExitFullscreen).call(d); if (ex && ex.catch) ex.catch(() => {}); return; }
     const req = el.requestFullscreen || el.webkitRequestFullscreen;
     if (req) { const p = req.call(el); if (p && p.catch) p.catch(() => {}); }
     else if (v.webkitEnterFullscreen) v.webkitEnterFullscreen(); // iPhone: only the video itself can go full screen
@@ -242,6 +249,7 @@
   }
 
   function setMenu(open) {
+    if (!S) return;
     S.menuOpen = open;
     $('vp-menu').hidden = !open;
     $('vp-menu-btn').setAttribute('aria-expanded', String(open));
@@ -253,6 +261,8 @@
     if (!el) return;
     el.classList.remove('is-idle');
     clearTimeout(wake.timer);
+    clearTimeout(singleTimer);
+    singleTimer = 0;
     wake.timer = setTimeout(() => {
       if (S && !v.paused && !S.menuOpen && !S.dragging) el.classList.add('is-idle');
     }, IDLE_MS);
@@ -267,6 +277,7 @@
       if (S.menuOpen) setMenu(false); else close();
       return;
     }
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
     if (e.target && e.target.closest && e.target.closest('button') && (e.key === ' ' || e.key === 'Enter')) return; // let the button act
     const k = e.key.toLowerCase();
     const acts = {
@@ -278,6 +289,7 @@
   }
 
   function showError() {
+    if (!S) return;
     S.failed = true;
     el.classList.add('has-error');
     el.classList.remove('is-buffering');
@@ -352,8 +364,12 @@
     try { v.load(); } catch (e) { /* closing anyway */ }
     if (src) src.revoke();
     const d = root.document;
-    if (d.fullscreenElement || d.webkitFullscreenElement) { try { (d.exitFullscreen || d.webkitExitFullscreen).call(d); } catch (e) { /* ignore */ } }
+    if (d.fullscreenElement || d.webkitFullscreenElement) { try { const ex = (d.exitFullscreen || d.webkitExitFullscreen).call(d); if (ex && ex.catch) ex.catch(() => {}); } catch (e) { /* ignore */ } }
+    if (v.webkitDisplayingFullscreen && v.webkitExitFullscreen) { try { v.webkitExitFullscreen(); } catch (e) { /* ignore */ } }
     if (d.pictureInPictureElement) d.exitPictureInPicture().catch(() => {});
+    $('vp-menu').hidden = true;
+    $('vp-menu-btn').setAttribute('aria-expanded', 'false');
+    $('vp-scrub').classList.remove('is-drag');
     el.classList.add('hidden');
     d.body.classList.remove('vp-open');
     if (opener && opener.isConnected && opener.focus) { try { opener.focus(); } catch (e) { /* ignore */ } }

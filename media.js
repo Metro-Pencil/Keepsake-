@@ -194,7 +194,7 @@
     let sha = x.sha || '';
     if (!sha && pending) sha = await sha256Hex(blobIn ? new Uint8Array(await blobBytes(bytes)) : bytes);
     const prev = await req(INFO, 'get', id).catch(() => null);
-    const info = { id, noteId, name, size, used: Date.now(), pending: !!pending, kind: x.kind || '', sha };
+    const info = { id, noteId, name, size, used: Date.now(), pending: !!pending, kind: x.kind || (prev && prev.kind) || '', sha: sha || (prev && prev.size === size ? prev.sha : '') || '' };
     if (x.pinned || (prev && prev.pinned)) info.pinned = true;
     const write = (value) => run([INFO, BLOB], 'readwrite', (tx) => {
       tx.objectStore(BLOB).put({ id, bytes: value });
@@ -209,15 +209,18 @@
       const whole = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength;
       await write(whole ? bytes.buffer : bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
     }
-    if (!pending) await evict().catch(() => {});
+    if (!pending && !info.pinned) scheduleEvict();
   }
 
   async function cacheRecord(noteId, name) {
     const id = idOf(noteId, name);
     const rec = await req(BLOB, 'get', id);
     if (!rec) return null;
-    const info = await req(INFO, 'get', id);
-    if (info) run(INFO, 'readwrite', (tx) => { tx.objectStore(INFO).put({ ...info, used: Date.now() }); }).catch(() => {});
+    run(INFO, 'readwrite', (tx) => {
+      const st = tx.objectStore(INFO);
+      const r = st.get(id);
+      r.onsuccess = () => { if (r.result) st.put({ ...r.result, used: Date.now() }); };
+    }).catch(() => {});
     return rec.bytes;
   }
 
@@ -242,8 +245,12 @@
   }
 
   async function markSynced(noteId, name) {
-    const info = await infoGet(noteId, name);
-    if (info) await run(INFO, 'readwrite', (tx) => { tx.objectStore(INFO).put({ ...info, pending: false, used: Date.now() }); });
+    const id = idOf(noteId, name);
+    await run(INFO, 'readwrite', (tx) => {
+      const st = tx.objectStore(INFO);
+      const r = st.get(id);
+      r.onsuccess = () => { if (r.result) st.put({ ...r.result, pending: false, used: Date.now() }); };
+    });
   }
 
   async function cacheDelete(entries) {
@@ -251,6 +258,25 @@
     await run([INFO, BLOB], 'readwrite', (tx) => {
       for (const e of entries) { tx.objectStore(INFO).delete(e.id); tx.objectStore(BLOB).delete(e.id); }
     });
+  }
+
+  // Batch eviction checks so a large download doesn't rescan the entire index on every file.
+  let evictTimer = null;
+  let evictWrites = 0;
+  function scheduleEvict() {
+    evictWrites++;
+    if (evictWrites >= 25) {
+      evictWrites = 0;
+      if (evictTimer) { root.clearTimeout(evictTimer); evictTimer = null; }
+      evict().catch(() => {});
+      return;
+    }
+    if (evictTimer) return;
+    evictTimer = root.setTimeout(() => {
+      evictTimer = null;
+      evictWrites = 0;
+      evict().catch(() => {});
+    }, 1500);
   }
 
   // Keeps this device's copies under the cap by dropping the ones used longest ago.
@@ -280,10 +306,27 @@
 
   // The master's full offline copy: pinned files are never dropped to make room.
   async function pin(noteId, name) {
-    const info = await infoGet(noteId, name);
-    if (info && !info.pinned) await run(INFO, 'readwrite', (tx) => { tx.objectStore(INFO).put({ ...info, pinned: true }); });
+    const id = idOf(noteId, name);
+    await run(INFO, 'readwrite', (tx) => {
+      const st = tx.objectStore(INFO);
+      const r = st.get(id);
+      r.onsuccess = () => { if (r.result && !r.result.pinned) st.put({ ...r.result, pinned: true }); };
+    });
   }
   async function allInfo() { return (await req(INFO, 'getAll')) || []; }
+  // Older copies were saved without saying what they are; the Offline copy section works it out once and records it.
+  async function setKinds(updates) {
+    if (!updates.length) return;
+    await run(INFO, 'readwrite', (tx) => {
+      const st = tx.objectStore(INFO);
+      for (const u of updates) {
+        const id = u.info && u.info.id;
+        if (!id) continue;
+        const r = st.get(id);
+        r.onsuccess = () => { if (r.result && !r.result.kind) st.put({ ...r.result, kind: u.kind }); };
+      }
+    });
+  }
   // Everything saved here for offline use, pinned or not, except files still waiting to upload.
   async function deleteSynced() {
     const gone = (await allInfo()).filter((i) => !i.pending);
@@ -427,11 +470,12 @@
     // Videos: each is already a list of parts on this device (video.js made them when it was added). All that
     // is left to do here is make sure they are in the right form - encrypted if the note is locked - and list
     // every part, so the save knows what to send and the bucket's cleanup knows what to keep.
+    const releaseBases = [];
     if (videoIds.length) {
       out.videos = {};
       for (const id of videoIds) {
         const v = await root.KSVideo.prepare(noteId, videos[id], {
-          locked, key, keyB64,
+          locked, key, keyB64, deferRelease: true, releaseBases,
           onProgress: (done, total) => { if (onPrepare) onPrepare(done, total, 'video'); },
         });
         out.videos[id] = v;
@@ -446,7 +490,7 @@
     }
     if (keyB64) out.mediaKey = keyB64;
     const counts = { photos: out.images.filter((s) => isRef(s)).length, clips: audioIds.length, videos: videoIds.length };
-    return { content: out, keep, kinds, sizes, bytes, counts };
+    return { content: out, keep, kinds, sizes, bytes, counts, releaseBases };
   }
 
   function notAvailableOffline(cause) {
@@ -476,37 +520,58 @@
       if (isRef(d)) names.add(refName(d));
     }
 
-    for (const name of names) {
-      const m = manifest[name];
-      if (!m) throw new Error('A photo or audio clip in this note has no record \u2014 the note looks damaged.');
-      let stored = await cacheGet(noteId, name).catch(() => null);
-      // A copy on this device that is the wrong size is damaged: drop it and fetch a fresh one
-      // (unless it is still waiting to upload - then it is the only copy there is).
-      if (stored && m.n && stored.length !== m.n) {
-        const info = await infoGet(noteId, name).catch(() => null);
-        if (info && info.pending) throw new Error('A photo or clip waiting to upload is damaged on this device.');
-        await cacheDelete([{ id: idOf(noteId, name) }]).catch(() => {});
-        stored = null;
-      }
-      if (!stored) {
-        if (!announced && o.onDownload) { announced = true; o.onDownload(); }
-        try { stored = await downloadBytes(noteId, name); } catch (e) {
-          if (e.isNetworkError) throw notAvailableOffline(e);
-          throw e;
+    const nameList = Array.from(names);
+    let nextIdx = 0;
+    const workerCount = Math.min(5, nameList.length);
+    await Promise.all(Array.from({ length: workerCount }, async () => {
+      while (nextIdx < nameList.length) {
+        const name = nameList[nextIdx++];
+        const entryMeta = manifest[name];
+        if (!entryMeta) throw new Error('A photo or audio clip in this note has no record \u2014 the note looks damaged.');
+        let stored = await cacheGet(noteId, name).catch(() => null);
+        let fromCache = !!stored;
+        // Verify size AND SHA-256 of cached media so bit-rot self-heals instead of bricking locked notes.
+        if (stored) {
+          const badSize = !!(entryMeta.n && stored.length !== entryMeta.n);
+          const badHash = !badSize && !!(entryMeta.h && (await sha256Hex(stored)) !== entryMeta.h);
+          if (badSize || badHash) {
+            const info = await infoGet(noteId, name).catch(() => null);
+            if (info && info.pending) throw new Error('A photo or clip waiting to upload is damaged on this device.');
+            await cacheDelete([{ id: idOf(noteId, name) }]).catch(() => {});
+            stored = null;
+            fromCache = false;
+          }
         }
-        if (m.n && stored.length !== m.n) throw new Error('A photo or audio clip came back the wrong size \u2014 try again.');
-        // Files saved by this version carry their SHA-256; a download that does not match is refused
-        // rather than shown (or, worse, saved back over the good copy).
-        if (m.h && await sha256Hex(stored) !== m.h) throw new Error('A photo or audio clip came back damaged \u2014 try again.');
-        await cachePut(noteId, name, stored, false, { sha: m.h || '' }).catch(() => {});
+        const fetchFresh = async () => {
+          if (!announced && o.onDownload) { announced = true; o.onDownload(); }
+          let bytes;
+          try { bytes = await downloadBytes(noteId, name); } catch (e) {
+            if (e.isNetworkError) throw notAvailableOffline(e);
+            throw e;
+          }
+          if (entryMeta.n && bytes.length !== entryMeta.n) throw new Error('A photo or audio clip came back the wrong size \u2014 try again.');
+          if (entryMeta.h && await sha256Hex(bytes) !== entryMeta.h) throw new Error('A photo or audio clip came back damaged \u2014 try again.');
+          await cachePut(noteId, name, bytes, false, { sha: entryMeta.h || '', kind: /^audio\//i.test(entryMeta.t || '') ? 'audio' : 'photo' }).catch(() => {});
+          return bytes;
+        };
+        if (!stored) stored = await fetchFresh();
+        let plain = stored;
+        if (entryMeta.iv) {
+          if (!key) throw new Error('This note\u2019s media is encrypted but its key is missing.');
+          try {
+            plain = await decryptBytes(key, entryMeta.iv, stored);
+          } catch (decErr) {
+            if (!fromCache) throw decErr;
+            const info = await infoGet(noteId, name).catch(() => null);
+            if (info && info.pending) throw decErr;
+            await cacheDelete([{ id: idOf(noteId, name) }]).catch(() => {});
+            stored = await fetchFresh();
+            plain = await decryptBytes(key, entryMeta.iv, stored);
+          }
+        }
+        dataByName[name] = { url: await bytesToDataUrl(plain, entryMeta.t), entry: { name, t: entryMeta.t, n: entryMeta.n, h: entryMeta.h || '', iv: entryMeta.iv || null, enc: !!entryMeta.iv, keyB64: entryMeta.iv ? content.mediaKey : null } };
       }
-      let plain = stored;
-      if (m.iv) {
-        if (!key) throw new Error('This note\u2019s media is encrypted but its key is missing.');
-        plain = await decryptBytes(key, m.iv, stored);
-      }
-      dataByName[name] = { url: await bytesToDataUrl(plain, m.t), entry: { name, t: m.t, n: m.n, h: m.h || '', iv: m.iv || null, enc: !!m.iv, keyB64: m.iv ? content.mediaKey : null } };
-    }
+    }));
 
     const idx = indexFor(noteId);
     if (content.mediaKey) noteKeys.set(noteId, content.mediaKey);
@@ -600,7 +665,7 @@
         if (remote && there !== undefined && (!want || there === want)) {
           if (info && info.pending) await markSynced(noteId, name);
         } else if (info && (remote || info.pending)) todoParts.push(info);
-        else if (!info) missing.push(name);
+        else if (remote && !info) missing.push(name);
         continue;
       }
       const want = info ? info.size : sizes[name];
@@ -641,6 +706,7 @@
       if (o.onFileDone) o.onFileDone({ name: info.name, kind, size: info.size, index: i, count: todo.length });
     }
     if (todoParts.length) await sendVideoParts(noteId, todoParts, o);
+    if (todo.length || todoParts.length) scheduleEvict();
     return todo.length + todoParts.length;
   }
 
@@ -652,6 +718,7 @@
   async function sendVideoParts(noteId, infos, o) {
     let queue = infos.slice();
     let sent = 0;
+    let started = 0;
     const total = infos.length;
     for (let round = 0; round < VERIFY_ROUNDS && queue.length; round++) {
       const failed = [];
@@ -670,7 +737,7 @@
       };
       for (let i = 0; i < queue.length; i++) {
         const info = queue[i];
-        if (o.onFileStart) o.onFileStart({ name: info.name, kind: 'video', size: info.size, index: sent, count: total });
+        if (o.onFileStart) o.onFileStart({ name: info.name, kind: 'video', size: info.size, index: Math.min(started++, total - 1), count: total });
         const blob = await cacheGetBlob(noteId, info.name);
         if (!blob) throw uploadError('A video part waiting to upload is missing from this device.');
         const bytes = new Uint8Array(await blobBytes(blob));
@@ -763,9 +830,13 @@
       bundle._videoNote = 'This note has ' + Math.round(vbytes / 1048576) + ' MB of video in Backblaze, kept as ' + videoItems.length + ' parts under media/' + noteId + '/ (each part is named <video>.<part number>). They are not included here.';
       items = items.filter((i) => !isPartName(i.name));
     }
+    if (bundle && bundle.content && bundle.content.media && typeof bundle.content.media === 'object') {
+      const validNames = new Set(Object.keys(bundle.content.media));
+      items = items.filter((i) => validNames.has(i.name));
+    }
     if (!items.length) return bundle;
     const total = items.reduce((n, i) => n + i.size, 0);
-    const limit = o.maxBytes || 200 * 1024 * 1024;
+    const limit = o.maxBytes || 50 * 1024 * 1024;
     if (total > limit) {
       bundle._mediaNote = 'This note has ' + Math.round(total / 1048576) + ' MB of photos and audio in Backblaze, too large to include here. They are in your bucket under media/' + noteId + '/.';
       return bundle;
@@ -774,6 +845,7 @@
     const media = {};
     for (const item of items) {
       let bytes = await cacheGet(noteId, item.name).catch(() => null);
+      if (bytes && item.size && bytes.length !== item.size) bytes = null;
       if (!bytes) bytes = await downloadBytes(noteId, item.name);
       media[item.name] = bytesToB64(bytes);
     }
@@ -791,7 +863,7 @@
     hold(base) { heldBases.add(base); }, release(base) { heldBases.delete(base); },
     // What video.js builds on: the local store of parts and the plumbing around it.
     store: {
-      cachePut, cacheGet, cacheGetBlob, infoGet, infoForNote, markSynced, cacheDelete, blobBytes, pin, allInfo, deleteSynced,
+      cachePut, cacheGet, cacheGetBlob, infoGet, infoForNote, markSynced, cacheDelete, blobBytes, pin, allInfo, setKinds, deleteSynced,
       sha256Hex, randomName, genKeyB64, importKey, encryptBytes, decryptBytes, downloadBytes, list, b64ToBytes,
     },
     _test: { setCap(n) { cacheCap = n; }, resetMemory() { indexes.clear(); noteKeys.clear(); }, parseDataURL, bytesToDataUrl, cachePut, cacheGet, infoGet, infoForNote, evict, indexes, noteKeys },
