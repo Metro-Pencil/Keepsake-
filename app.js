@@ -162,12 +162,15 @@ const API = {
       const hasVideo = !!(payload.mediaKinds && Object.values(payload.mediaKinds).includes('video'));
       if (hasVideo) KeepAwake.acquire();
       try {
-        await KSMedia.uploadPending(id, payload.mediaKeep, {
+        const up = await KSMedia.uploadPending(id, payload.mediaKeep, {
           sizes: payload.mediaSizes,
           onPlan: r.onPlan, onFileStart: r.onFileStart, onFileProgress: r.onFileProgress, onFileDone: r.onFileDone,
+          shouldYield: r.shouldYield,
         });
+        if (up && up.yielded) return { yielded: true };
       } finally { if (hasVideo) KeepAwake.release(); }
     }
+    if (r.shouldYield && r.shouldYield()) return { yielded: true };
     if (r.onText) r.onText('active', 0);
     const out = await KSB2.saveNote(id, payload, r.onText ? (f) => r.onText('active', f) : null);
     if (r.onText) r.onText('done', 1);
@@ -1122,7 +1125,7 @@ function announceSync(msg) {
 
 // `steps` (optional) = one row per kind of thing being sent - photos, audio, note text - each with
 // its own bar; see renderSyncSteps. Left out, the rows are hidden.
-function syncBarSet(label, fraction /* number 0..1, or null for indeterminate */, steps) {
+function syncBarSet(label, fraction /* number 0..1, or null for indeterminate */, steps, metaText, noteChips) {
   clearTimeout(syncBarHideTimer);
   const bar = document.getElementById('sync-bar');
   const wasShown = bar.classList.contains('show');
@@ -1130,7 +1133,10 @@ function syncBarSet(label, fraction /* number 0..1, or null for indeterminate */
   bar.classList.add('show');
   if (!wasShown && !syncSrAnnouncedStart) { syncSrAnnouncedStart = true; announceSync('Syncing changes'); }
   renderSyncSteps(steps);
+  renderSyncNotes(noteChips);
   document.getElementById('sync-bar-label').textContent = label;
+  const metaEl = document.getElementById('sync-bar-meta');
+  if (metaEl) metaEl.textContent = metaText || '';
   document.getElementById('sync-bar-retry').classList.add('hidden');
   const track = document.getElementById('sync-bar-track');
   const fill = document.getElementById('sync-bar-fill');
@@ -1142,15 +1148,39 @@ function syncBarSet(label, fraction /* number 0..1, or null for indeterminate */
   }
 }
 
+function renderSyncNotes(chips) {
+  const wrap = document.getElementById('sync-notes');
+  if (!wrap) return;
+  if (!chips || !chips.length) { wrap.hidden = true; wrap.textContent = ''; return; }
+  wrap.hidden = false;
+  wrap.textContent = '';
+  for (const c of chips) {
+    const span = document.createElement('span');
+    span.className = 'sync-note-chip';
+    span.dataset.state = c.active ? 'active' : 'queued';
+    const t = document.createElement('span');
+    t.className = 'sync-note-chip-title';
+    t.textContent = c.label;
+    const d = document.createElement('span');
+    d.className = 'sync-note-chip-detail';
+    d.textContent = c.detail;
+    span.append(t, d);
+    wrap.appendChild(span);
+  }
+}
+
 function syncBarHideSoon(delay = 1100) {
   clearTimeout(syncBarHideTimer);
   syncBarHideTimer = setTimeout(() => {
     document.getElementById('sync-bar').classList.remove('show');
+    const metaEl = document.getElementById('sync-bar-meta');
+    if (metaEl) metaEl.textContent = '';
+    renderSyncNotes(null);
   }, delay);
 }
 
 function syncBarSuccess(label = 'Saved', steps) {
-  syncBarSet(label, 1, steps);
+  syncBarSet(label, 1, steps, '', null);
   document.getElementById('sync-bar').classList.add('done'); // finished: stop the spinner
   syncSrAnnouncedStart = false;
   announceSync(label);
@@ -1163,6 +1193,8 @@ function syncBarError(label, onRetry) {
   bar.classList.remove('done');
   bar.classList.add('show', 'error');
   document.getElementById('sync-bar-label').textContent = label;
+  const metaEl = document.getElementById('sync-bar-meta');
+  if (metaEl) metaEl.textContent = '';
   syncSrAnnouncedStart = false;
   announceSync(label);
   const retryBtn = document.getElementById('sync-bar-retry');
@@ -1225,11 +1257,66 @@ const SyncJobs = new Map(); // note id -> job
 let syncRenderTimer = 0;
 let syncSummaryShown = false; // the bar is showing the reopen summary, not a live upload
 
+// Throughput & ETA estimator across the active upload session (tracks ONLY bytes sent in this
+// session so resuming mid-batch or appending new photos never skews speed or ETA).
+const SyncRate = { startedAt: 0, sentBytes: 0, lastSampleAt: 0, lastSampleBytes: 0, ewmaBps: 0 };
+
+function resetSyncRate() {
+  SyncRate.startedAt = 0;
+  SyncRate.sentBytes = 0;
+  SyncRate.lastSampleAt = 0;
+  SyncRate.lastSampleBytes = 0;
+  SyncRate.ewmaBps = 0;
+}
+
+function recordSyncBytes(deltaBytes) {
+  if (!(deltaBytes > 0)) return;
+  const now = Date.now();
+  if (!SyncRate.startedAt) {
+    SyncRate.startedAt = now;
+    SyncRate.lastSampleAt = now;
+    SyncRate.lastSampleBytes = 0;
+  }
+  SyncRate.sentBytes += deltaBytes;
+  const dt = (now - SyncRate.lastSampleAt) / 1000;
+  if (dt >= 0.4) {
+    const inst = (SyncRate.sentBytes - SyncRate.lastSampleBytes) / dt;
+    SyncRate.ewmaBps = SyncRate.ewmaBps > 0 ? (SyncRate.ewmaBps * 0.65 + inst * 0.35) : inst;
+    SyncRate.lastSampleAt = now;
+    SyncRate.lastSampleBytes = SyncRate.sentBytes;
+  }
+}
+
+function currentUploadBps() {
+  if (SyncRate.ewmaBps > 0) return SyncRate.ewmaBps;
+  if (!SyncRate.startedAt || SyncRate.sentBytes <= 0) return 0;
+  const elapsed = (Date.now() - SyncRate.startedAt) / 1000;
+  return elapsed >= 0.35 ? SyncRate.sentBytes / elapsed : 0;
+}
+
+function fmtEta(seconds) {
+  if (!isFinite(seconds) || seconds < 0) return '';
+  if (seconds < 1.5) return '~1s left';
+  const s = Math.round(seconds);
+  if (s < 60) return `~${s}s left`;
+  const m = Math.floor(s / 60);
+  const remS = s % 60;
+  if (m < 60) return remS ? `~${m}m ${remS}s left` : `~${m}m left`;
+  const h = Math.floor(m / 60);
+  const remM = m % 60;
+  return remM ? `~${h}h ${remM}m left` : `~${h}h left`;
+}
+
+function fmtRate(bps) {
+  if (!(bps > 0)) return '';
+  return formatBytes(bps) + '/s';
+}
+
 function newSyncJob(noteId, title) {
   return { noteId, title: title || '', files: {}, current: null, text: 'wait', textFraction: 0, prep: null };
 }
 
-// Fills a job's file list from what this device knows about them.
+// Fills a job's file list from what this device knows about them (merging without losing done files).
 async function fillJobFiles(job, batch) {
   const names = Object.keys(batch || {});
   if (!names.length || !window.KSMedia) return job;
@@ -1237,18 +1324,23 @@ async function fillJobFiles(job, batch) {
     const d = await KSMedia.describe(job.noteId, names, batch);
     for (const name of names) {
       const f = d[name];
-      job.files[name] = { kind: f ? f.kind : batch[name], size: f ? f.size : 0, done: !(f && f.pending) };
+      const prev = job.files[name];
+      const isDone = (prev && prev.done) || !(f && f.pending);
+      job.files[name] = { kind: f ? f.kind : batch[name], size: f ? f.size : (prev ? prev.size : 0), done: isDone };
     }
   } catch (e) { /* these numbers are only for display */ }
   return job;
 }
 
-async function syncJobBegin(noteId, title, batch, owner) {
-  const job = newSyncJob(noteId, title);
-  job.owner = owner || 'editor';
+async function syncJobBegin(noteId, title, batch, owner, existingJob) {
+  if (!SyncJobs.size) resetSyncRate();
+  const job = existingJob || SyncJobs.get(noteId) || newSyncJob(noteId, title);
+  if (title) job.title = title;
+  job.owner = owner || job.owner || 'editor';
   SyncJobs.set(noteId, job);
   syncSummaryShown = false;
   await fillJobFiles(job, batch);
+  refreshBootSyncBanner();
   scheduleSyncRender();
   return job;
 }
@@ -1259,37 +1351,50 @@ function scheduleSyncRender() {
 }
 
 // What a job is told as its upload goes (passed to API.saveNote).
-function jobReporter(noteId) {
+function jobReporter(noteId, state) {
   const job = () => SyncJobs.get(noteId);
   return {
+    shouldYield: state ? () => !!state.queued && !deletedNotes.has(noteId) : null,
     onPlan({ todo }) {
       const j = job(); if (!j) return;
       const sending = new Set(todo.map((t) => t.name));
       for (const name of Object.keys(j.files)) if (!sending.has(name)) j.files[name].done = true; // already in the bucket
-      for (const t of todo) j.files[t.name] = { kind: t.kind, size: t.size, done: false };
+      for (const t of todo) {
+        if (!j.files[t.name] || !j.files[t.name].done) {
+          j.files[t.name] = { kind: t.kind, size: t.size, done: false };
+        }
+      }
       scheduleSyncRender();
     },
     onFileStart(f) {
       const j = job(); if (!j) return;
-      j.current = { name: f.name, kind: f.kind, size: f.size, fraction: 0, index: f.index, count: f.count };
+      j.current = { name: f.name, kind: f.kind, size: f.size, loaded: 0, fraction: 0, index: f.index, count: f.count };
       j.prep = null;
       scheduleSyncRender();
     },
     onFileProgress(p) {
       const j = job(); if (!j || !j.current) return;
-      j.current.fraction = p.total ? Math.min(1, p.loaded / p.total) : 0;
+      const loaded = Math.max(0, Math.min(p.total || j.current.size || p.loaded || 0, p.loaded || 0));
+      const delta = loaded - (j.current.loaded || 0);
+      if (delta > 0) recordSyncBytes(delta);
+      j.current.loaded = loaded;
+      j.current.fraction = p.total ? Math.min(1, loaded / p.total) : 0;
       scheduleSyncRender();
     },
     onFileDone(f) {
       const j = job(); if (!j) return;
+      if (j.current && j.current.name === f.name) {
+        const rem = (f.size || 0) - (j.current.loaded || 0);
+        if (rem > 0) recordSyncBytes(rem);
+      }
       const e = j.files[f.name];
       if (e) e.done = true; else j.files[f.name] = { kind: f.kind, size: f.size, done: true };
       j.current = null;
       scheduleSyncRender();
     },
-    onText(state, frac) {
+    onText(st, frac) {
       const j = job(); if (!j) return;
-      j.text = state; j.textFraction = frac;
+      j.text = st; j.textFraction = frac;
       scheduleSyncRender();
     },
   };
@@ -1303,11 +1408,12 @@ function summarizeJobs(jobs) {
     photo: { total: 0, done: 0, bytes: 0, bytesDone: 0 },
     audio: { total: 0, done: 0, bytes: 0, bytesDone: 0 },
     video: { total: 0, done: 0, bytes: 0, bytesDone: 0 }, // each part of a video counts as one file
-    notes: 0, textDone: 0, textFrac: 0, current: null, preparing: null, titles: [],
+    notes: 0, textDone: 0, textFrac: 0, current: null, currentJob: null, preparing: null, preparingJob: null, titles: [], jobs: [],
   };
   for (const j of jobs) {
     sum.notes++;
     sum.titles.push(j.title);
+    sum.jobs.push(j);
     for (const f of Object.values(j.files)) {
       const k = kindBucket(sum, f.kind);
       k.total++; k.bytes += f.size || 0;
@@ -1317,9 +1423,10 @@ function summarizeJobs(jobs) {
       const k = kindBucket(sum, j.current.kind);
       k.bytesDone += (j.current.size || 0) * j.current.fraction;
       sum.current = j.current;
+      sum.currentJob = j;
     }
-    if (j.prep) sum.preparing = j.prep;
-    if (j.text === 'done') { sum.textDone++; sum.textFrac += 1; } else if (j.text === 'active') sum.textFrac += j.textFraction || 0;
+    if (j.prep) { sum.preparing = j.prep; sum.preparingJob = j; }
+    if (j.text === 'done') { sum.textDone++; sum.textFrac += 1; } else if (j.text === 'active') { sum.textFrac += j.textFraction || 0; if (!sum.currentJob) sum.currentJob = j; }
   }
   return sum;
 }
@@ -1328,7 +1435,13 @@ function stepFromKind(key, label, k, active) {
   const frac = k.bytes > 0 ? k.bytesDone / k.bytes : (k.total ? k.done / k.total : 0);
   const finished = k.total > 0 && k.done >= k.total;
   const state = finished ? 'done' : (active || k.done > 0 || k.bytesDone > 0) ? 'active' : 'wait';
-  const count = state === 'done' ? 'done' : state === 'wait' ? 'pending' : `${k.done} / ${k.total}`;
+  const sizePart = k.bytes > 0 ? ` \u00b7 ${formatBytes(Math.min(k.bytes, Math.round(k.bytesDone)))} / ${formatBytes(k.bytes)}` : '';
+  const left = Math.max(0, k.total - k.done);
+  const count = state === 'done'
+    ? `${k.total} / ${k.total} done`
+    : state === 'wait'
+      ? `0 / ${k.total} pending`
+      : `${k.done} / ${k.total} (${left} left)${sizePart}`;
   const noun = key === 'audio' ? (k.total === 1 ? 'clip' : 'clips') : key === 'video' ? (k.total === 1 ? 'video part' : 'video parts') : (k.total === 1 ? 'photo' : 'photos');
   return { key, label, frac: finished ? 1 : frac, state, count, aria: state === 'wait' ? `${k.total} ${noun} pending` : `${k.done} of ${k.total} ${noun} uploaded` };
 }
@@ -1345,11 +1458,11 @@ function stepsFromSummary(sum) {
   const textActive = !textDone && textFrac > 0;
   steps.push({
     key: 'text',
-    label: sum.notes > 1 ? 'Notes' : 'Note text',
+    label: sum.notes > 1 ? 'Note text' : 'Note text',
     frac: textDone ? 1 : textFrac,
     state: textDone ? 'done' : textActive ? 'active' : 'wait',
-    count: textDone ? 'done' : textActive ? (sum.notes > 1 ? `${sum.textDone} / ${sum.notes}` : `${Math.round(textFrac * 100)}%`) : 'pending',
-    aria: textDone ? 'saved' : 'waiting until the photos and audio are up',
+    count: textDone ? 'saved' : textActive ? (sum.notes > 1 ? `${sum.textDone} / ${sum.notes}` : `${Math.round(textFrac * 100)}%`) : 'waiting for media',
+    aria: textDone ? 'saved' : 'waiting until media finishes uploading',
   });
   return steps;
 }
@@ -1363,25 +1476,74 @@ function overallFraction(sum) {
   return Math.min(1, mediaFrac * 0.97 + textFrac * 0.03);
 }
 
+function jobLabelTitle(title) {
+  const clean = String(title || '').trim();
+  return clean ? `\u201c${clean.slice(0, 32)}${clean.length > 32 ? '\u2026' : ''}\u201d` : 'Untitled note';
+}
+
 function jobHeadline(sum) {
-  const only = sum.notes === 1 && sum.titles[0] ? `\u201c${sum.titles[0].slice(0, 28)}\u201d` : '';
+  const activeJob = sum.currentJob || sum.preparingJob || sum.jobs[0] || null;
+  const noteName = activeJob ? jobLabelTitle(activeJob.title) : '';
+  const extraQueue = sum.notes > 1 ? ` (+${sum.notes - 1} queued)` : '';
   const hasMedia = sum.photo.total + sum.audio.total + sum.video.total > 0;
   if (sum.current) {
     const c = sum.current;
-    const k = kindBucket(sum, c.kind); // same figures as the rows below, not just this run's share
+    const k = kindBucket(sum, c.kind);
     const noun = c.kind === 'audio' ? 'audio clip' : c.kind === 'video' ? 'video part' : 'photo';
-    return `Uploading ${noun} ${Math.min(k.total, k.done + 1)} of ${k.total} \u00b7 ${Math.round((overallFraction(sum) || 0) * 100)}%`;
+    return `Uploading ${noun} ${Math.min(k.total, k.done + 1)} of ${k.total} from ${noteName}${extraQueue}`;
   }
-  if (sum.preparing) return `Getting ${sum.preparing.what} ready \u00b7 ${sum.preparing.done} of ${sum.preparing.total}`;
-  if (hasMedia && sum.textFrac > 0) return 'Saving the note itself\u2026';
-  if (hasMedia) return sum.notes > 1 ? `Uploading ${sum.notes} notes\u2026` : `Uploading${only ? ' ' + only : ''}\u2026`;
-  return only ? `Saving ${only}\u2026` : 'Saving\u2026';
+  if (sum.preparing) return `Preparing ${sum.preparing.what} for ${noteName} \u00b7 ${sum.preparing.done} of ${sum.preparing.total}`;
+  if (hasMedia && sum.textFrac > 0) return `Saving note text for ${noteName}${extraQueue}\u2026`;
+  if (hasMedia) return `Uploading ${noteName}${extraQueue}\u2026`;
+  return noteName ? `Saving ${noteName}${extraQueue}\u2026` : 'Saving\u2026';
+}
+
+function jobMetaText(sum) {
+  const totalFiles = sum.photo.total + sum.audio.total + sum.video.total;
+  if (!totalFiles) return '';
+  const totalBytes = sum.photo.bytes + sum.audio.bytes + sum.video.bytes;
+  const doneBytes = Math.min(totalBytes, Math.round(sum.photo.bytesDone + sum.audio.bytesDone + sum.video.bytesDone));
+  const remBytes = Math.max(0, totalBytes - doneBytes);
+  const pct = Math.round((overallFraction(sum) || 0) * 100);
+  const parts = [`${pct}%`];
+  if (totalBytes > 0) parts.push(`${formatBytes(doneBytes)} / ${formatBytes(totalBytes)}`);
+  const bps = currentUploadBps();
+  if (bps > 0 && remBytes > 0) {
+    parts.push(fmtRate(bps));
+    const eta = fmtEta(remBytes / bps);
+    if (eta) parts.push(eta);
+  } else if (sum.current && remBytes > 0) {
+    parts.push('Estimating time\u2026');
+  }
+  return parts.join(' \u00b7 ');
+}
+
+function noteChipsFromSummary(sum) {
+  const totalFiles = sum.photo.total + sum.audio.total + sum.video.total;
+  if (!totalFiles || !sum.jobs.length) return null;
+  const activeId = (sum.currentJob || sum.preparingJob || sum.jobs[0]).noteId;
+  return sum.jobs.map((j) => {
+    const vals = Object.values(j.files);
+    const total = vals.length;
+    const done = vals.filter((f) => f.done).length;
+    const bytes = vals.reduce((n, f) => n + (f.size || 0), 0);
+    const isActive = j.noteId === activeId;
+    const title = String(j.title || '').trim() || 'Untitled note';
+    let detail = '';
+    if (total > 0) {
+      detail = `${done}/${total} files` + (bytes > 0 ? ` \u00b7 ${formatBytes(bytes)}` : '');
+      if (isActive && j.current && j.current.size) detail += ` \u00b7 current ${formatBytes(j.current.size)}`;
+    } else {
+      detail = j.text === 'active' ? 'saving text' : 'queued';
+    }
+    return { active: isActive, label: (isActive ? 'Now: ' : 'Next: ') + title, detail };
+  });
 }
 
 function renderSyncJobs() {
   if (!SyncJobs.size) return;
   const sum = summarizeJobs(SyncJobs.values());
-  syncBarSet(jobHeadline(sum), overallFraction(sum), stepsFromSummary(sum));
+  syncBarSet(jobHeadline(sum), overallFraction(sum), stepsFromSummary(sum), jobMetaText(sum), noteChipsFromSummary(sum));
 }
 
 let pendingSyncBatchError = null;
@@ -1396,6 +1558,8 @@ function syncJobEnd(noteId, outcome /* 'ok' | 'offline' | 'error' */, message, r
     pendingSyncBatchError = { message: message || 'Couldn\u2019t save \u2014 tap to retry', retry: retry || (() => flushOutbox({ manual: true })) };
   }
   if (SyncJobs.size) { renderSyncJobs(); return; }
+  resetSyncRate();
+  refreshBootSyncBanner();
   if (pendingSyncBatchError) {
     const err = pendingSyncBatchError;
     pendingSyncBatchError = null;
@@ -1459,6 +1623,7 @@ function updateSyncStatusUI() {
     badge.textContent = '';
     badge.className = 'sync-status hidden';
   }
+  refreshBootSyncBanner();
 }
 
 function setOnline(value) {
@@ -1550,7 +1715,14 @@ async function flushOutbox(opts) {
             continue;
           }
           if (!payload) { await clearOutbox(item.id); syncJobEnd(item.id, 'offline'); continue; } // genuinely missing
-          result = await API.saveNote(item.id, payload, jobReporter(item.id));
+          result = await API.saveNote(item.id, payload, jobReporter(item.id, st));
+          if (result && result.yielded) {
+            // A mid-upload edit arrived for this note: keep its SyncJobs entry alive so syncRunOne
+            // continues seamlessly from the already-uploaded files without resetting to zero.
+            const j = SyncJobs.get(item.id);
+            if (j) j.owner = 'editor';
+            continue;
+          }
         }
         setOnline(true);
         // If the note was edited again while this request was in flight, a
@@ -1755,8 +1927,11 @@ const Boot = (() => {
     const sub = $('boot-sub');
     if (settled === all.length) {
       finished = true;
-      box.dataset.state = failed ? 'attention' : 'done';
-      title.textContent = failed ? 'Ready — ' + plural(failed, 'step needs', 'steps need') + ' attention' : 'Everything is up to date';
+      const busySync = (SyncJobs.size > 0 || outboxCount > 0);
+      box.dataset.state = failed ? 'attention' : (busySync ? 'working' : 'done');
+      title.textContent = failed
+        ? 'Ready — ' + plural(failed, 'step needs', 'steps need') + ' attention'
+        : (busySync ? 'Notes loaded — uploading pending changes' : 'Everything is up to date');
       sub.textContent = settled + ' steps · finished in ' + fmt(clock());
       // Always stay collapsed until the user explicitly taps the bar or Details.
     } else if (localDone) {
@@ -1792,8 +1967,22 @@ const Boot = (() => {
     fail: (id, detail) => set(id, 'error', detail || ''),
     // Everything not yet finished is marked skipped (this device was not allowed in, or the app was not set up).
     skipRest(reason) { for (const s of steps.values()) if (s.status === 'pending' || s.status === 'running') { s.status = 'skipped'; s.detail = reason || ''; } paint(); },
+    refreshSyncState() {
+      if (!finished) return;
+      const anyFailed = Array.from(steps.values()).some((st) => st.status === "error");
+      if (anyFailed) return;
+      const box = $('boot');
+      const title = $('boot-title');
+      if (!box || !title) return;
+      const busySync = (SyncJobs.size > 0 || outboxCount > 0);
+      box.dataset.state = busySync ? 'working' : 'done';
+      title.textContent = busySync ? 'Notes loaded — uploading pending changes' : 'Everything is up to date';
+    },
   };
 })();
+function refreshBootSyncBanner() {
+  if (typeof Boot !== 'undefined' && Boot && Boot.refreshSyncState) Boot.refreshSyncState();
+}
 
 /* ---------------------------------------------------------------------
  * Rendering
@@ -2328,33 +2517,137 @@ function addPhotoToBatch(batch, dataUrl) {
   return id;
 }
 
+let allowExplicitMediaRemoval = false;
+
 function removePhoto(id) {
-  delete editorPhotos[id];
-  document.querySelectorAll(`#editor-body ks-photo[data-id="${id}"]`).forEach((el) => {
-    const wrap = el.parentNode;
-    el.remove();
-    if (wrap && wrap.id !== 'editor-body' && wrap.tagName === 'DIV' && !wrap.childNodes.length) wrap.remove();
-  });
+  allowExplicitMediaRemoval = true;
+  try {
+    delete editorPhotos[id];
+    document.querySelectorAll(`#editor-body ks-photo[data-id="${id}"]`).forEach((el) => {
+      const wrap = el.parentNode;
+      el.remove();
+      if (wrap && wrap.id !== 'editor-body' && wrap.tagName === 'DIV' && !wrap.childNodes.length) wrap.remove();
+    });
+  } finally {
+    allowExplicitMediaRemoval = false;
+  }
   labelPhotoTiles();
   updateSizeMeter();
   onEditorContentChanged();
 }
 
-// Backspace/Delete right next to a photo must not quietly take it out of the note.
-function photoNextToCaret(backward) {
+function isMediaNode(node) {
+  return !!(node && node.nodeType === 1 && (node.tagName === 'KS-PHOTO' || node.tagName === 'KS-VIDEO'));
+}
+
+function nodeHasMedia(node) {
+  return isMediaNode(node) || !!(node && node.nodeType === 1 && node.querySelector('ks-photo, ks-video'));
+}
+
+// True if a non-collapsed selection intersects or contains any photo or video tile.
+function selectionTouchesMedia() {
+  const body = document.getElementById('editor-body');
   const sel = window.getSelection();
-  if (!sel.rangeCount || !sel.isCollapsed) return false;
+  if (!body || !sel || !sel.rangeCount || sel.isCollapsed) return false;
   const r = sel.getRangeAt(0);
-  const node = r.startContainer;
-  let target = null;
-  if (node.nodeType === 3) {
-    if (backward && r.startOffset === 0) target = node.previousSibling;
-    else if (!backward && r.startOffset === node.nodeValue.length) target = node.nextSibling;
-  } else {
-    target = backward ? node.childNodes[r.startOffset - 1] : node.childNodes[r.startOffset];
+  const media = body.querySelectorAll('ks-photo, ks-video');
+  for (let i = 0; i < media.length; i++) {
+    try { if (r.intersectsNode(media[i])) return true; } catch (e) { /* ignore */ }
   }
-  while (target && target.nodeType === 3 && !target.nodeValue) target = backward ? target.previousSibling : target.nextSibling;
-  return !!(target && target.nodeType === 1 && (target.tagName === 'KS-PHOTO' || target.tagName === 'KS-VIDEO'));
+  return false;
+}
+
+// Finds the nearest meaningful leaf/element inside a container on the side facing the caret.
+function boundaryChild(container, backward) {
+  let cur = backward ? container.lastChild : container.firstChild;
+  while (cur) {
+    if (cur.nodeType === 3) {
+      if (cur.nodeValue && cur.nodeValue.replace(/[\u200B\uFEFF]/g, '').length > 0) return cur;
+    } else if (cur.nodeType === 1) {
+      if (isMediaNode(cur)) return cur;
+      if (cur.tagName === 'BR') {
+        const next = backward ? cur.previousSibling : cur.nextSibling;
+        if (!next) return cur;
+      } else {
+        const inner = boundaryChild(cur, backward);
+        if (inner) return inner;
+      }
+    }
+    cur = backward ? cur.previousSibling : cur.nextSibling;
+  }
+  return null;
+}
+
+// Backspace/Delete right next to a photo/video (including across <div> line boundaries,
+// inside empty lines after a photo grid, or with a selection spanning photos) must NEVER
+// quietly delete photos or videos from the note.
+function photoNextToCaret(backward) {
+  const body = document.getElementById('editor-body');
+  const sel = window.getSelection();
+  if (!body || !sel || !sel.rangeCount) return false;
+  if (!sel.isCollapsed) return selectionTouchesMedia();
+  const r = sel.getRangeAt(0);
+  let node = r.startContainer;
+  if (!body.contains(node)) return false;
+
+  // If caret/focus is somehow inside a ks-photo or ks-video wrapper itself, block deletion.
+  const hostEl = node.nodeType === 1 ? node : node.parentElement;
+  if (hostEl && hostEl.closest && hostEl.closest('ks-photo, ks-video')) return true;
+
+  // If inside a text node with non-empty characters between caret and the boundary, safe to delete text.
+  if (node.nodeType === 3) {
+    const val = node.nodeValue || '';
+    const slice = backward ? val.slice(0, r.startOffset) : val.slice(r.startOffset);
+    if (slice.replace(/[\u200B\uFEFF]/g, '').length > 0) return false;
+  }
+
+  // Walk outward from the caret position up to #editor-body looking for the adjacent sibling.
+  let cur = node;
+  let offset = r.startOffset;
+  while (cur && cur !== body) {
+    let sib = null;
+    if (cur.nodeType === 1 && cur === node) {
+      sib = backward ? cur.childNodes[offset - 1] : cur.childNodes[offset];
+    } else {
+      sib = backward ? cur.previousSibling : cur.nextSibling;
+    }
+    while (sib) {
+      if (sib.nodeType === 3) {
+        if (sib.nodeValue && sib.nodeValue.replace(/[\u200B\uFEFF]/g, '').length > 0) return false;
+      } else if (sib.nodeType === 1) {
+        if (isMediaNode(sib)) return true;
+        if (nodeHasMedia(sib)) {
+          const edge = boundaryChild(sib, backward);
+          if (isMediaNode(edge)) return true;
+          return false;
+        }
+        if (sib.tagName !== 'BR') return false;
+      }
+      sib = backward ? sib.previousSibling : sib.nextSibling;
+    }
+    // Check if cur itself is at the edge of its parent; keep walking up to check the parent's sibling.
+    cur = cur.parentNode;
+  }
+
+  // Also check when caret is directly inside #editor-body at an element offset.
+  if (node === body) {
+    let sib = backward ? body.childNodes[r.startOffset - 1] : body.childNodes[r.startOffset];
+    while (sib) {
+      if (sib.nodeType === 3) {
+        if (sib.nodeValue && sib.nodeValue.replace(/[\u200B\uFEFF]/g, '').length > 0) return false;
+      } else if (sib.nodeType === 1) {
+        if (isMediaNode(sib)) return true;
+        if (nodeHasMedia(sib)) {
+          const edge = boundaryChild(sib, backward);
+          if (isMediaNode(edge)) return true;
+          return false;
+        }
+        if (sib.tagName !== 'BR') return false;
+      }
+      sib = backward ? sib.previousSibling : sib.nextSibling;
+    }
+  }
+  return false;
 }
 
 /* ---------------------------------------------------------------------
@@ -2502,14 +2795,19 @@ function addVideoToBatch(batch, id, entry) {
 }
 
 function removeVideo(id) {
-  const v = editorVideos[id];
-  if (v && window.KSMedia) KSMedia.release(v.base); // its parts on this device are cleaned up at the next save
-  delete editorVideos[id];
-  document.querySelectorAll(`#editor-body ks-video[data-id="${id}"]`).forEach((el) => {
-    const wrap = el.parentNode;
-    el.remove();
-    if (wrap && wrap.id !== 'editor-body' && wrap.tagName === 'DIV' && !wrap.childNodes.length) wrap.remove();
-  });
+  allowExplicitMediaRemoval = true;
+  try {
+    const v = editorVideos[id];
+    if (v && window.KSMedia) KSMedia.release(v.base); // its parts on this device are cleaned up at the next save
+    delete editorVideos[id];
+    document.querySelectorAll(`#editor-body ks-video[data-id="${id}"]`).forEach((el) => {
+      const wrap = el.parentNode;
+      el.remove();
+      if (wrap && wrap.id !== 'editor-body' && wrap.tagName === 'DIV' && !wrap.childNodes.length) wrap.remove();
+    });
+  } finally {
+    allowExplicitMediaRemoval = false;
+  }
   updateSizeMeter();
   onEditorContentChanged();
 }
@@ -2805,8 +3103,7 @@ async function addOneVideo(item, mode, index, count, noteId, batch) {
     }
     if (VPrep.cancelled || !editorShowing(noteId)) return { cancelled: true };
 
-    const locked = lockIsActive();
-    const nk = locked ? await KSMedia.noteKey(noteId, true) : null;
+    const nk = await KSMedia.noteKey(noteId, true);
     const base = usedMode === 'compressed' ? 0.9 : 0;
     const entry = await KSVideo.ingest(source, {
       name: file.name, type: usedMode === 'compressed' ? source.type : (file.type || guessVideoType(file.name)),
@@ -3054,7 +3351,8 @@ function openEditorWithContent(meta, content, opts) {
 
   document.getElementById('editor-heading').textContent = isExisting ? 'Edit note' : 'New note';
   setDrawMode(false);
-  setEditorContent(content);
+  allowExplicitMediaRemoval = true;
+  try { setEditorContent(content); } finally { allowExplicitMediaRemoval = false; }
   if (isExisting && meta.lockType && meta.lockType !== 'none') setLockedTitle(meta.id, String(content.title || ''));
   setExistingNoteButtons(noteExistsOnServer);
 
@@ -3110,7 +3408,8 @@ async function maybeOfferDraftRestore(noteId, serverContent) {
     'This note has changes from an earlier session that never made it to the server. Restore them?',
     async () => {
       if (editingNoteId !== noteId) return;
-      setEditorContent(draft);
+      allowExplicitMediaRemoval = true;
+      try { setEditorContent(draft); } finally { allowExplicitMediaRemoval = false; }
       Object.values(editorVideos).forEach((v) => { if (window.KSMedia) KSMedia.hold(v.base); });
       onEditorContentChanged();
       toast('Draft restored');
@@ -3286,7 +3585,12 @@ function runSync(noteId, snapshot) {
   if (!state) { state = { inFlight: false, queued: null }; syncStateByNote.set(noteId, state); }
 
   if (state.inFlight) {
-    state.queued = snapshot; // latest wins — no point sending a stale mid-typing snapshot
+    state.queued = snapshot; // latest wins — picked up cooperatively right after the current file
+    const activeJob = SyncJobs.get(noteId);
+    if (activeJob && snapshot && typeof snapshot.title === 'string') {
+      activeJob.title = snapshot.title;
+      scheduleSyncRender();
+    }
     return;
   }
   state.inFlight = true;
@@ -3298,12 +3602,13 @@ function editorShowing(noteId) {
   return noteId === editingNoteId && !document.getElementById('overlay-editor').classList.contains('hidden');
 }
 
-async function syncRunOne(noteId, snapshot, state) {
+async function syncRunOne(noteId, snapshot, state, inheritedJob) {
   const editing = () => editorShowing(noteId);
   let releaseBases = [];
+  let handoffJob = null;
   try {
     if (deletedNotes.has(noteId)) return;
-    const job = await syncJobBegin(noteId, snapshot.title, {}, 'editor');
+    const job = await syncJobBegin(noteId, snapshot.title, {}, 'editor', inheritedJob || SyncJobs.get(noteId));
 
     // 1. Turn photos/audio into stored files (encrypting them first for a locked note). Each one is
     //    saved on this device as it is made, so this is also where "100 photos" is worked through
@@ -3370,7 +3675,12 @@ async function syncRunOne(noteId, snapshot, state) {
         offlineErr.isNetworkError = true;
         throw offlineErr;
       }
-      const { note } = await API.saveNote(noteId, payload, jobReporter(noteId));
+      const res = await API.saveNote(noteId, payload, jobReporter(noteId, state));
+      if (res && res.yielded) {
+        handoffJob = job;
+        return;
+      }
+      const { note } = res;
       if (deletedNotes.has(noteId)) {
         API.deleteNote(noteId).catch(() => {});
         SyncJobs.delete(noteId);
@@ -3389,8 +3699,12 @@ async function syncRunOne(noteId, snapshot, state) {
         lastAutosavedJSON = snapshotKey(snapshot);
       }
       await applySavedNote(noteId, note, payload, snapshot.title, queuedAt);
-      syncJobEnd(noteId, 'ok');
-      flushOutbox(); // a working connection is the moment to drain anything else that's queued
+      if (state.queued && !deletedNotes.has(noteId)) {
+        handoffJob = job;
+      } else {
+        syncJobEnd(noteId, 'ok');
+        flushOutbox(); // a working connection is the moment to drain anything else that's queued
+      }
     } catch (e) {
       if (e.isNetworkError) {
         setOnline(false);
@@ -3419,16 +3733,16 @@ async function syncRunOne(noteId, snapshot, state) {
       for (const base of releaseBases) KSMedia.release(base);
     }
     state.inFlight = false;
-    maybeContinueQueued(noteId, state);
+    maybeContinueQueued(noteId, state, handoffJob);
   }
 }
 
-function maybeContinueQueued(noteId, state) {
+function maybeContinueQueued(noteId, state, inheritedJob) {
   if (state.queued) {
     const next = state.queued;
     state.queued = null;
     state.inFlight = true;
-    syncRunOne(noteId, next, state);
+    syncRunOne(noteId, next, state, inheritedJob || SyncJobs.get(noteId));
   }
 }
 
@@ -6038,14 +6352,91 @@ function setupRichText() {
     onEditorContentChanged();
   });
 
-  // Backspace/Delete beside a photo does nothing: photos are removed from the photo viewer, on purpose.
-  body.addEventListener('beforeinput', (e) => {
-    const back = e.inputType === 'deleteContentBackward';
-    if ((back || e.inputType === 'deleteContentForward') && photoNextToCaret(back)) {
-      e.preventDefault();
+  // Backspace/Delete/Cut/Selection edits must NEVER quietly delete a photo or video.
+  // Photos and videos are only removed intentionally from their viewer.
+  let lastMediaGuardToastAt = 0;
+  function warnMediaProtected() {
+    const now = Date.now();
+    if (now - lastMediaGuardToastAt > 1800) {
+      lastMediaGuardToastAt = now;
       toast('Open the photo or video to remove it');
     }
+  }
+
+  body.addEventListener('beforeinput', (e) => {
+    const t = e.inputType || '';
+    const isBack = t === 'deleteContentBackward' || t === 'deleteWordBackward' || t === 'deleteSoftLineBackward' || t === 'deleteHardLineBackward';
+    const isFwd = t === 'deleteContentForward' || t === 'deleteWordForward' || t === 'deleteSoftLineForward' || t === 'deleteHardLineForward';
+    const isAnyDelete = t.startsWith('delete') || t === 'insertReplacementText';
+    if (selectionTouchesMedia() && (isAnyDelete || t.startsWith('insert'))) {
+      e.preventDefault();
+      warnMediaProtected();
+      return;
+    }
+    if ((isBack && photoNextToCaret(true)) || (isFwd && photoNextToCaret(false))) {
+      e.preventDefault();
+      warnMediaProtected();
+    }
   });
+
+  body.addEventListener('keydown', (e) => {
+    const isCut = (e.ctrlKey || e.metaKey) && (e.key === 'x' || e.key === 'X');
+    if (isCut && selectionTouchesMedia()) {
+      e.preventDefault();
+      warnMediaProtected();
+      return;
+    }
+    if (e.key === 'Backspace' && (selectionTouchesMedia() || photoNextToCaret(true))) {
+      e.preventDefault();
+      warnMediaProtected();
+      return;
+    }
+    if (e.key === 'Delete' && (selectionTouchesMedia() || photoNextToCaret(false))) {
+      e.preventDefault();
+      warnMediaProtected();
+    }
+  });
+
+  // Failsafe MutationObserver: if any browser contenteditable quirk (IME, mobile keyboard,
+  // drag, Ctrl+A replace) ever removes a <ks-photo> or <ks-video> without going through
+  // removePhoto()/removeVideo(), immediately restore it so media can never vanish by accident.
+  if (typeof MutationObserver === 'function') {
+    const mediaGuard = new MutationObserver((mutations) => {
+      if (allowExplicitMediaRemoval) return;
+      const overlay = document.getElementById('overlay-editor');
+      if (!overlay || overlay.classList.contains('hidden')) return;
+      let restored = false;
+      for (const m of mutations) {
+        if (m.type !== 'childList' || !m.removedNodes || !m.removedNodes.length) continue;
+        for (const removed of m.removedNodes) {
+          const mediaEls = [];
+          if (isMediaNode(removed)) mediaEls.push(removed);
+          else if (removed && removed.nodeType === 1 && removed.querySelectorAll) {
+            removed.querySelectorAll('ks-photo, ks-video').forEach((n) => mediaEls.push(n));
+          }
+          for (const el of mediaEls) {
+            const id = el.getAttribute('data-id');
+            const stillExists = (el.tagName === 'KS-PHOTO' && editorPhotos[id]) || (el.tagName === 'KS-VIDEO' && editorVideos[id]);
+            if (!stillExists || body.contains(el)) continue;
+            // Re-insert into its original parent if still connected, otherwise into a fresh wrapper in body.
+            if (m.target && body.contains(m.target)) {
+              m.target.insertBefore(el, m.nextSibling && m.target.contains(m.nextSibling) ? m.nextSibling : null);
+            } else {
+              const wrap = document.createElement('div');
+              wrap.appendChild(el);
+              body.appendChild(wrap);
+            }
+            restored = true;
+          }
+        }
+      }
+      if (restored) {
+        labelPhotoTiles();
+        warnMediaProtected();
+      }
+    });
+    mediaGuard.observe(body, { childList: true, subtree: true });
+  }
 
   // Paste as plain text so formatting from other apps can't sneak in.
   body.addEventListener('paste', (e) => {

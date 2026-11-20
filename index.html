@@ -96,6 +96,8 @@
     --shadow-lg: 0 12px 28px rgba(35,36,31,0.14), 0 4px 10px rgba(35,36,31,0.07);
     --gutter-l: max(20px, env(safe-area-inset-left, 0px));
     --gutter-r: max(20px, env(safe-area-inset-right, 0px));
+    --shell-max: 1040px;
+    --editor-max: 1120px;
     color-scheme: light;
   }
 
@@ -179,16 +181,28 @@
 
   .sync-bar-inner {
     width: 100%; /* auto margins otherwise shrink-wrap, collapsing the track */
-    max-width: 980px;
+    max-width: var(--shell-max);
     margin: 0 auto;
-    padding: 8px var(--gutter-r) 8px var(--gutter-l);
+    padding: 9px var(--gutter-r) 7px var(--gutter-l);
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
-    gap: 10px;
-    font-size: 0.7812rem;
+    gap: 6px 10px;
+    font-size: 0.8125rem;
     font-weight: 500;
     color: var(--ink-soft);
   }
+
+  .sync-bar-meta {
+    margin-inline-start: auto;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--pine);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .sync-bar-meta:empty { display: none; }
+  .sync-bar.error .sync-bar-meta { color: var(--amber); }
 
   .sync-bar.error .sync-bar-inner { color: var(--amber); }
 
@@ -255,9 +269,9 @@
 
   .sync-steps {
     width: 100%;
-    max-width: 980px;
+    max-width: var(--shell-max);
     margin: 0 auto;
-    padding: 0 var(--gutter-r) 10px var(--gutter-l);
+    padding: 0 var(--gutter-r) 8px var(--gutter-l);
     display: grid;
     gap: 6px;
   }
@@ -265,13 +279,61 @@
   .sync-step {
     --f: 0;
     display: grid;
-    grid-template-columns: 5.25rem minmax(0, 1fr) 4.5rem;
+    grid-template-columns: 5.5rem minmax(80px, 1fr) auto;
     align-items: center;
     gap: 10px;
     font-size: 0.75rem;
     line-height: 1.3;
     color: var(--ink-soft);
     font-variant-numeric: tabular-nums;
+  }
+
+  .sync-notes {
+    width: 100%;
+    max-width: var(--shell-max);
+    margin: 0 auto;
+    padding: 0 var(--gutter-r) 9px var(--gutter-l);
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 12px;
+    font-size: 0.75rem;
+    line-height: 1.35;
+    color: var(--ink-soft);
+    font-variant-numeric: tabular-nums;
+  }
+  .sync-notes[hidden] { display: none; }
+  .sync-note-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 9px;
+    border-radius: 999px;
+    background: var(--card);
+    border: 1px solid var(--line);
+    color: var(--ink);
+    max-width: 100%;
+  }
+  .sync-note-chip[data-state="active"] {
+    border-color: color-mix(in oklab, var(--pine) 35%, var(--line));
+    background: var(--ok-bg);
+    color: var(--pine);
+    font-weight: 600;
+  }
+  .sync-note-chip-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 24ch;
+  }
+  .sync-note-chip-detail {
+    color: var(--ink-soft);
+    font-weight: 500;
+    white-space: nowrap;
+  }
+  .sync-note-chip[data-state="active"] .sync-note-chip-detail {
+    color: var(--pine);
+    opacity: 0.88;
   }
 
   .sync-step-name { font-weight: 600; color: var(--ink); }
@@ -327,12 +389,13 @@
   }
 
   .top-inner {
-    max-width: 980px;
+    max-width: var(--shell-max);
     margin: 0 auto;
     padding: 14px var(--gutter-r) 14px var(--gutter-l);
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
-    gap: 12px;
+    gap: 10px 12px;
   }
 
   .brand {
@@ -436,7 +499,7 @@
   /* ---------- Composer ---------- */
 
   main {
-    max-width: 980px;
+    max-width: var(--shell-max);
     margin: 0 auto;
     padding: 24px var(--gutter-r) 60px var(--gutter-l);
   }
@@ -446,8 +509,8 @@
     width: 100%;
     min-height: 48px;
     text-align: left;
-    max-width: 620px;
-    margin: 0 auto 32px;
+    max-width: 720px;
+    margin: 0 auto 28px;
     background: var(--card);
     border: 1px solid var(--line);
     border-radius: var(--radius);
@@ -859,7 +922,7 @@
     display: flex;
     flex-direction: column;
     width: 100%;
-    max-width: 72ch;
+    max-width: var(--editor-max);
     margin-inline: auto;
   }
 
@@ -1040,7 +1103,10 @@
      and there is nothing on the tile that deletes it (that is in the photo viewer). */
   .rich-body { --photo-cols: 3; --photo-gap: 8px; }
   @media (max-width: 359px) { .rich-body { --photo-cols: 2; } }
-  @media (min-width: 720px) { .rich-body { --photo-cols: 4; } }
+  @media (min-width: 600px) { .rich-body { --photo-cols: 4; } }
+  @media (min-width: 860px) { .rich-body { --photo-cols: 5; --photo-gap: 10px; } }
+  @media (min-width: 1120px) { .rich-body { --photo-cols: 6; --photo-gap: 10px; } }
+  @media (min-width: 1380px) { .rich-body { --photo-cols: 7; --photo-gap: 12px; } }
 
   ks-photo,
   ks-video {
@@ -2081,7 +2147,82 @@
   p, .card-preview, .hint { text-wrap: pretty; }
   .brand-mark { font-size: clamp(1.25rem, 1.1rem + 0.6vw, 1.5rem); }
   .card, .modal, .editor-sheet, .boot { overflow-wrap: break-word; }
-  .rich-body { line-height: 1.65; max-width: 68ch; }
+  .rich-body { line-height: 1.65; max-width: none; }
+
+  /* ---------- Windowed & desktop display optimization ---------- */
+  @media (min-width: 900px) {
+    :root { --shell-max: 1180px; }
+    .modal { max-width: 620px; }
+    .modal.narrow { max-width: 440px; }
+  }
+  @media (min-width: 1240px) {
+    :root { --shell-max: 1380px; }
+  }
+  @media (min-width: 1580px) {
+    :root { --shell-max: 1560px; }
+  }
+
+  /* On tablet/windowed/desktop screens, frame the editor as a spacious paper sheet and align
+     the topbar and toolbars with the sheet edges so controls never feel stranded at screen corners. */
+  @media (min-width: 820px) {
+    .editor-screen { background: var(--paper); }
+    .editor-topbar {
+      background: var(--card);
+      padding-inline: max(22px, calc((100% - var(--editor-max)) / 2));
+    }
+    .editor-scroll {
+      background: var(--paper);
+      padding: 20px var(--gutter-r) 28px var(--gutter-l);
+    }
+    .editor-sheet {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow-sm);
+      padding: 26px 32px 36px;
+      min-height: 100%;
+    }
+    .title-input {
+      font-size: 1.45rem;
+      margin-bottom: 12px;
+    }
+    .editor-lock-status {
+      background: var(--card);
+      padding-inline: max(22px, calc((100% - var(--editor-max)) / 2));
+    }
+    .tool-row {
+      background: var(--card);
+      padding-inline: max(18px, calc((100% - var(--editor-max)) / 2));
+    }
+    .editor-toolbar {
+      background: var(--card);
+      padding-inline: max(18px, calc((100% - var(--editor-max)) / 2));
+    }
+  }
+
+  /* Compact vertical rhythm for short / half-height desktop windows */
+  @media (max-height: 640px) and (min-width: 640px) {
+    .top-inner { padding-block: 10px; }
+    main { padding-top: 16px; }
+    .composer { margin-bottom: 18px; }
+    .editor-topbar { padding-block: 8px; }
+    .editor-scroll { padding-block: 12px 16px; }
+    .editor-sheet { padding-block: 18px 24px; }
+    .editor-toolbar { padding-block: 4px; }
+    .tool-row { padding-block: 2px; }
+  }
+
+  /* Narrow split-screen / tiled desktop windows */
+  @media (max-width: 520px) {
+    .sync-step {
+      grid-template-columns: 4.5rem minmax(60px, 1fr) auto;
+      gap: 8px;
+    }
+    .sync-bar-meta {
+      width: 100%;
+      margin-inline-start: 22px;
+    }
+  }
   .version-badge, .size-figure, .size-text, .vprep-pct, .vp-time, .mp-time {
     font-variant-numeric: tabular-nums;
   }
@@ -2235,7 +2376,7 @@
   <div class="top-inner">
     <div class="brand">
       <span class="brand-mark">Keepsake</span>
-      <span class="version-badge" id="version-badge">v1.15.5</span>
+      <span class="version-badge" id="version-badge">v1.16.0</span>
       <span class="sync-status hidden" id="sync-status" role="status" aria-live="polite"></span>
       <button class="storage-pill" id="storage-pill" type="button" data-zone="heavy" hidden>
         <span class="storage-pill-icon" id="storage-pill-icon" aria-hidden="true"></span>
@@ -2262,11 +2403,14 @@
       <div class="sync-bar-inner">
         <span class="sync-bar-spin" aria-hidden="true"></span>
         <span class="sync-bar-label" id="sync-bar-label">Saved</span>
+        <span class="sync-bar-meta" id="sync-bar-meta"></span>
         <div class="sync-bar-track" id="sync-bar-track"><div class="sync-bar-fill" id="sync-bar-fill"></div></div>
         <button class="sync-bar-retry hidden" id="sync-bar-retry">Retry</button>
       </div>
       <!-- One row per kind of thing being sent (photos, audio, note text), each with its own bar. -->
       <div class="sync-steps" id="sync-steps" hidden></div>
+      <!-- Per-note upload details: active note + queued notes -->
+      <div class="sync-notes" id="sync-notes" hidden></div>
     </div>
   </div>
 </header>

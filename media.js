@@ -194,7 +194,19 @@
     let sha = x.sha || '';
     if (!sha && pending) sha = await sha256Hex(blobIn ? new Uint8Array(await blobBytes(bytes)) : bytes);
     const prev = await req(INFO, 'get', id).catch(() => null);
-    const info = { id, noteId, name, size, used: Date.now(), pending: !!pending, kind: x.kind || (prev && prev.kind) || '', sha: sha || (prev && prev.size === size ? prev.sha : '') || '' };
+    const info = {
+      id, noteId, name, size, used: Date.now(), pending: !!pending,
+      kind: x.kind || (prev && prev.kind) || '',
+      sha: sha || (prev && prev.size === size ? prev.sha : '') || '',
+    };
+    const plainSha = x.plainSha || (prev && prev.plainSha) || '';
+    if (plainSha) info.plainSha = plainSha;
+    const mime = x.t || (prev && prev.t) || '';
+    if (mime) info.t = mime;
+    const iv = x.iv !== undefined ? x.iv : (prev && prev.iv);
+    if (iv) info.iv = iv;
+    const keyB64 = x.keyB64 !== undefined ? x.keyB64 : (prev && prev.keyB64);
+    if (keyB64) info.keyB64 = keyB64;
     if (x.pinned || (prev && prev.pinned)) info.pinned = true;
     const write = (value) => run([INFO, BLOB], 'readwrite', (tx) => {
       tx.objectStore(BLOB).put({ id, bytes: value });
@@ -239,9 +251,32 @@
 
   async function infoGet(noteId, name) { return (await req(INFO, 'get', idOf(noteId, name))) || null; }
 
+  const isKeyRecord = (i) => i && i.kind === 'key';
+  const keyRecordId = (noteId) => noteId + '/_key';
+
   async function infoForNote(noteId) {
     const all = (await req(INFO, 'getAll')) || [];
-    return all.filter((i) => i.noteId === noteId);
+    return all.filter((i) => i.noteId === noteId && !isKeyRecord(i));
+  }
+
+  async function saveNoteKey(noteId, keyB64) {
+    if (!noteId || !keyB64) return;
+    noteKeys.set(noteId, keyB64);
+    try {
+      await run(INFO, 'readwrite', (tx) => {
+        tx.objectStore(INFO).put({ id: keyRecordId(noteId), noteId, name: '_key', size: 0, used: Date.now(), pending: false, kind: 'key', keyB64 });
+      });
+    } catch (e) { /* best-effort persistence */ }
+  }
+
+  async function loadNoteKey(noteId) {
+    let keyB64 = noteKeys.get(noteId) || null;
+    if (keyB64) return keyB64;
+    try {
+      const rec = await req(INFO, 'get', keyRecordId(noteId));
+      if (rec && rec.keyB64) { noteKeys.set(noteId, rec.keyB64); return rec.keyB64; }
+    } catch (e) { /* best-effort */ }
+    return null;
   }
 
   async function markSynced(noteId, name) {
@@ -282,7 +317,7 @@
   // Keeps this device's copies under the cap by dropping the ones used longest ago.
   // Files still waiting to upload are never dropped.
   async function evict() {
-    const all = ((await req(INFO, 'getAll')) || []).filter((i) => !i.pinned);   // the full offline copy is outside the caps
+    const all = ((await req(INFO, 'getAll')) || []).filter((i) => !i.pinned && !isKeyRecord(i));   // the full offline copy is outside the caps
     // Photos/audio and video parts have a cap each, so a few big videos never push the photos out.
     const trim = (items, cap) => {
       let total = items.reduce((n, i) => n + i.size, 0);
@@ -301,7 +336,7 @@
 
   async function cacheBytesUsed() {
     const all = (await req(INFO, 'getAll')) || [];
-    return all.filter((i) => i.kind !== 'video' && !i.pinned).reduce((n, i) => n + i.size, 0);
+    return all.filter((i) => !isKeyRecord(i) && i.kind !== 'video' && !i.pinned).reduce((n, i) => n + i.size, 0);
   }
 
   // The master's full offline copy: pinned files are never dropped to make room.
@@ -313,7 +348,7 @@
       r.onsuccess = () => { if (r.result && !r.result.pinned) st.put({ ...r.result, pinned: true }); };
     });
   }
-  async function allInfo() { return (await req(INFO, 'getAll')) || []; }
+  async function allInfo() { return ((await req(INFO, 'getAll')) || []).filter((i) => !isKeyRecord(i)); }
   // Older copies were saved without saying what they are; the Offline copy section works it out once and records it.
   async function setKinds(updates) {
     if (!updates.length) return;
@@ -358,20 +393,34 @@
 
   /* ----------------------------------------------- references <-> data URLs */
 
-  // For each note, remember which data URL was uploaded as which file, so saving the
-  // same photo again is free. Only the last couple of notes are kept (the strings are big).
+  // For each note, remember which data URL (and plaintext SHA-256) was uploaded as which file,
+  // so renaming a note, adding new photos, or locking/unlocking never re-uploads existing files.
   const indexes = new Map();   // noteId -> Map(dataUrl -> entry)
-  const noteKeys = new Map();  // noteId -> base64 AES key (locked notes only)
+  const shaIndexes = new Map(); // noteId -> Map(plainSha -> entry)
+  const noteKeys = new Map();  // noteId -> base64 AES key
 
   function indexFor(noteId) {
     let idx = indexes.get(noteId);
     if (!idx) {
       idx = new Map();
       indexes.set(noteId, idx);
-      while (indexes.size > 2) indexes.delete(indexes.keys().next().value);
+      while (indexes.size > 20) {
+        const oldest = indexes.keys().next().value;
+        indexes.delete(oldest);
+        shaIndexes.delete(oldest);
+      }
     } else {
       indexes.delete(noteId);
       indexes.set(noteId, idx);
+    }
+    return idx;
+  }
+
+  function shaIndexFor(noteId) {
+    let idx = shaIndexes.get(noteId);
+    if (!idx) {
+      idx = new Map();
+      shaIndexes.set(noteId, idx);
     }
     return idx;
   }
@@ -393,31 +442,71 @@
     const audioIds = Object.keys(audio).filter((id) => audio[id] && parseDataURL(audio[id].data));
     if (!wantsImage && !audioIds.length && !videoIds.length) return none;
 
-    // A locked note's media is encrypted with a key kept inside the note's own encrypted content. A video
-    // that was encrypted once stays encrypted (even if the lock is taken off later), so its key has to keep
-    // travelling with the note.
+    // Every note gets a persistent per-note mediaKey from its first media save, so all new media is
+    // encrypted at rest from the start. Locking or unlocking a note later only re-writes the small
+    // note JSON (wrapping or unwrapping mediaKey) and NEVER re-encrypts or re-uploads media files.
     const anyEncVideo = videoIds.some((id) => videos[id].enc);
-    let keyB64 = null;
-    if (locked || anyEncVideo) {
-      keyB64 = noteKeys.get(noteId) || null;
-      if (!keyB64) {
-        if (!locked) throw uploadError('A video in this note is encrypted, but its key isn\u2019t on this device \u2014 close the note and open it again.', { userMessage: true });
-        keyB64 = await genKeyB64(); noteKeys.set(noteId, keyB64);
+    let keyB64 = await loadNoteKey(noteId);
+    if (!keyB64) {
+      if (!locked && anyEncVideo) {
+        throw uploadError('A video in this note is encrypted, but its key isn\u2019t on this device \u2014 close the note and open it again.', { userMessage: true });
       }
+      keyB64 = await genKeyB64();
+      await saveNoteKey(noteId, keyB64);
     }
     const key = keyB64 ? await importKey(keyB64) : null;
     const idx = indexFor(noteId);
-    const manifest = {};
+    const sIdx = shaIndexFor(noteId);
+    // Hydrate plainSha index from local IndexedDB INFO records so reloads or cache evictions never
+    // lose track of already-prepared or already-uploaded files for this note.
+    try {
+      const existingInfos = await infoForNote(noteId);
+      for (const inf of existingInfos) {
+        if (!inf || !inf.plainSha || isPartName(inf.name)) continue;
+        if (!sIdx.has(inf.plainSha)) {
+          sIdx.set(inf.plainSha, {
+            name: inf.name,
+            t: inf.t || (inf.kind === 'audio' ? 'audio/mpeg' : 'image/jpeg'),
+            n: inf.size,
+            h: inf.sha || '',
+            iv: inf.iv || null,
+            enc: !!inf.iv,
+            keyB64: inf.iv ? (inf.keyB64 || keyB64) : null,
+            plainSha: inf.plainSha,
+          });
+        }
+      }
+    } catch (e) { /* best-effort */ }
 
+    const manifest = {};
     const kinds = {};
     const sizes = {};
+    let usedKey = false;
     async function refFor(dataUrl, kind) {
       let e = idx.get(dataUrl);
-      if (!(e && e.enc === locked && (!locked || e.keyB64 === keyB64))) {
-        const { type, bytes } = await dataUrlToBytes(dataUrl);
-        let stored = bytes;
-        let iv = null;
-        if (locked) { const enc = await encryptBytes(key, bytes); stored = enc.bytes; iv = enc.iv; }
+      let decoded = null;
+      let plainSha = e && e.plainSha ? e.plainSha : '';
+      // If not found by exact dataUrl string, match by plaintext SHA-256 (survives reloads,
+      // drafts, renames, lock toggles, and mid-upload edits without ever re-uploading).
+      if (!e) {
+        decoded = await dataUrlToBytes(dataUrl);
+        plainSha = await sha256Hex(decoded.bytes);
+        const bySha = sIdx.get(plainSha);
+        if (bySha && (!bySha.enc || !bySha.keyB64 || bySha.keyB64 === keyB64)) {
+          e = bySha;
+          idx.set(dataUrl, e);
+        }
+      }
+      // Reuse any existing valid reference (including already-uploaded legacy plaintext files
+      // when locking mid-upload/later) so locking/unlocking/renaming/adding photos NEVER restarts
+      // from zero. Brand-new files are always encrypted with the note's persistent key.
+      const reusable = !!(e && (!e.enc || !e.keyB64 || e.keyB64 === keyB64));
+      if (!reusable) {
+        const { type, bytes } = decoded || await dataUrlToBytes(dataUrl);
+        if (!plainSha) plainSha = await sha256Hex(bytes);
+        const enc = await encryptBytes(key, bytes);
+        const stored = enc.bytes;
+        const iv = enc.iv;
         if (stored.length > MAX_ITEM_BYTES) {
           const err = new Error('A photo or audio clip is over the 90 MB limit');
           err.tooBig = true;
@@ -425,19 +514,22 @@
         }
         const name = randomName();
         const sha = await sha256Hex(stored);
-        await cachePut(noteId, name, stored, true, { kind, sha });
-        e = { name, t: type, n: stored.length, h: sha, iv, enc: locked, keyB64: locked ? keyB64 : null };
+        await cachePut(noteId, name, stored, true, { kind, sha, plainSha, t: type, iv, keyB64 });
+        e = { name, t: type, n: stored.length, h: sha, iv, enc: true, keyB64, plainSha };
         idx.set(dataUrl, e);
+        sIdx.set(plainSha, e);
       } else if (!(await infoGet(noteId, e.name))) {
         // An earlier save already made this file, but this device no longer holds a copy (it was
         // cleaned up, or dropped to stay under the size cap). Put one back, byte for byte - same key,
         // same iv, same plaintext gives the same stored bytes - so that if the bucket has lost the
         // file too, uploadPending can send it again instead of the note pointing at nothing.
-        const { bytes } = await dataUrlToBytes(dataUrl);
+        const { type, bytes } = decoded || await dataUrlToBytes(dataUrl);
+        if (!plainSha) plainSha = await sha256Hex(bytes);
         let stored = bytes;
-        if (locked && e.iv) stored = new Uint8Array(await root.crypto.subtle.encrypt({ name: 'AES-GCM', iv: b64ToBytes(e.iv) }, key, bytes));
-        if (stored.length === e.n) await cachePut(noteId, e.name, stored, false, { kind, sha: e.h || '' });
+        if (e.iv) stored = new Uint8Array(await root.crypto.subtle.encrypt({ name: 'AES-GCM', iv: b64ToBytes(e.iv) }, key, bytes));
+        if (stored.length === e.n) await cachePut(noteId, e.name, stored, false, { kind, sha: e.h || '', plainSha, t: e.t || type, iv: e.iv || null, keyB64: e.iv ? keyB64 : null });
       }
+      if (e.iv) usedKey = true;
       // n = size and h = SHA-256 of the stored bytes: checked again whenever the file is downloaded.
       const entry = { t: e.t, n: e.n };
       if (e.h) entry.h = e.h;
@@ -488,7 +580,7 @@
         });
       }
     }
-    if (keyB64) out.mediaKey = keyB64;
+    if (keyB64 && (locked || usedKey || anyEncVideo || Object.values(out.videos || {}).some((v) => v && v.enc))) out.mediaKey = keyB64;
     const counts = { photos: out.images.filter((s) => isRef(s)).length, clips: audioIds.length, videos: videoIds.length };
     return { content: out, keep, kinds, sizes, bytes, counts, releaseBases };
   }
@@ -505,7 +597,7 @@
   // with media quietly missing: saving that would lose the media for good.
   async function inflate(noteId, content, opts) {
     // The key is remembered first: a note with only videos has no photo manifest but still needs it to play.
-    if (content && content.mediaKey) noteKeys.set(noteId, content.mediaKey);
+    if (content && content.mediaKey) await saveNoteKey(noteId, content.mediaKey);
     const manifest = content && content.media;
     if (!manifest || typeof manifest !== 'object') return content;
     const o = opts || {};
@@ -569,17 +661,20 @@
             plain = await decryptBytes(key, entryMeta.iv, stored);
           }
         }
-        dataByName[name] = { url: await bytesToDataUrl(plain, entryMeta.t), entry: { name, t: entryMeta.t, n: entryMeta.n, h: entryMeta.h || '', iv: entryMeta.iv || null, enc: !!entryMeta.iv, keyB64: entryMeta.iv ? content.mediaKey : null } };
+        const plainSha = await sha256Hex(plain);
+        dataByName[name] = { url: await bytesToDataUrl(plain, entryMeta.t), entry: { name, t: entryMeta.t, n: entryMeta.n, h: entryMeta.h || '', iv: entryMeta.iv || null, enc: !!entryMeta.iv, keyB64: entryMeta.iv ? content.mediaKey : null, plainSha } };
       }
     }));
 
     const idx = indexFor(noteId);
-    if (content.mediaKey) noteKeys.set(noteId, content.mediaKey);
+    const sIdx = shaIndexFor(noteId);
+    if (content.mediaKey) await saveNoteKey(noteId, content.mediaKey);
     const pick = (s) => {
       if (!isRef(s)) return s;
       const d = dataByName[refName(s)];
       if (!d) throw new Error('A photo or audio clip in this note could not be found.');
       idx.set(d.url, d.entry);
+      if (d.entry.plainSha) sIdx.set(d.entry.plainSha, d.entry);
       return d.url;
     };
 
@@ -689,7 +784,9 @@
     }
     if (o.onPlan) o.onPlan({ todo: todo.concat(todoParts).map((i) => ({ name: i.name, size: i.size, kind: i.kind || 'photo' })) });
 
+    let uploadedCount = 0;
     for (let i = 0; i < todo.length; i++) {
+      if (o.shouldYield && o.shouldYield()) return { uploaded: uploadedCount, yielded: true };
       const info = todo[i];
       const kind = info.kind || 'photo';
       if (o.onFileStart) o.onFileStart({ name: info.name, kind, size: info.size, index: i, count: todo.length });
@@ -703,9 +800,14 @@
       });
       await root.KSB2.verifyStored(root.KSB2.mediaKey(noteId, info.name), bytes.length);
       await markSynced(noteId, info.name);
+      uploadedCount++;
       if (o.onFileDone) o.onFileDone({ name: info.name, kind, size: info.size, index: i, count: todo.length });
+      if (o.shouldYield && o.shouldYield()) return { uploaded: uploadedCount, yielded: true };
     }
-    if (todoParts.length) await sendVideoParts(noteId, todoParts, o);
+    if (todoParts.length) {
+      const vr = await sendVideoParts(noteId, todoParts, o);
+      if (vr && vr.yielded) return { uploaded: uploadedCount + (vr.uploaded || 0), yielded: true };
+    }
     if (todo.length || todoParts.length) scheduleEvict();
     return todo.length + todoParts.length;
   }
@@ -736,6 +838,7 @@
         batch = [];
       };
       for (let i = 0; i < queue.length; i++) {
+        if (o.shouldYield && o.shouldYield()) { await check(); return { uploaded: sent, yielded: true }; }
         const info = queue[i];
         if (o.onFileStart) o.onFileStart({ name: info.name, kind: 'video', size: info.size, index: Math.min(started++, total - 1), count: total });
         const blob = await cacheGetBlob(noteId, info.name);
@@ -749,6 +852,7 @@
         });
         batch.push(info);
         if (batch.length >= VERIFY_EVERY) await check();
+        if (o.shouldYield && o.shouldYield()) { await check(); return { uploaded: sent, yielded: true }; }
       }
       await check();
       queue = failed;
@@ -777,17 +881,19 @@
     return stray.length;
   }
 
-  // The note's media key (kept in memory while the note is open), made on the spot if asked.
+  // The note's media key (persisted in IndexedDB), made on the spot if asked.
   async function noteKey(noteId, create) {
-    let keyB64 = noteKeys.get(noteId) || null;
-    if (!keyB64 && create) { keyB64 = await genKeyB64(); noteKeys.set(noteId, keyB64); }
+    let keyB64 = await loadNoteKey(noteId);
+    if (!keyB64 && create) { keyB64 = await genKeyB64(); await saveNoteKey(noteId, keyB64); }
     return keyB64 ? { keyB64, key: await importKey(keyB64) } : null;
   }
 
   async function dropNote(noteId) {
     indexes.delete(noteId);
+    shaIndexes.delete(noteId);
     noteKeys.delete(noteId);
     const mine = await infoForNote(noteId);
+    mine.push({ id: keyRecordId(noteId) });
     await cacheDelete(mine);
   }
 
@@ -866,6 +972,6 @@
       cachePut, cacheGet, cacheGetBlob, infoGet, infoForNote, markSynced, cacheDelete, blobBytes, pin, allInfo, setKinds, deleteSynced,
       sha256Hex, randomName, genKeyB64, importKey, encryptBytes, decryptBytes, downloadBytes, list, b64ToBytes,
     },
-    _test: { setCap(n) { cacheCap = n; }, resetMemory() { indexes.clear(); noteKeys.clear(); }, parseDataURL, bytesToDataUrl, cachePut, cacheGet, infoGet, infoForNote, evict, indexes, noteKeys },
+    _test: { setCap(n) { cacheCap = n; }, resetMemory() { indexes.clear(); shaIndexes.clear(); noteKeys.clear(); }, parseDataURL, bytesToDataUrl, cachePut, cacheGet, infoGet, infoForNote, evict, indexes, shaIndexes, noteKeys },
   };
 })(typeof window !== 'undefined' ? window : globalThis);

@@ -6,6 +6,14 @@ All notable changes to this project are recorded here, following
 small — gets a version bump. If the version number hasn't moved,
 nothing changed; that's the whole point of keeping one.
 
+## v1.16.0 — 2026-11-20
+
+- **Windowed and desktop display optimization.** Expanded the main shell and notes grid across wider desktop/windowed viewports (up to 1560px), framed the note editor as a spacious centered paper sheet with aligned top and bottom toolbars, scaled the inline photo grid from 2 up to 7 columns on wide screens, and tightened vertical padding for short/split desktop windows.
+- **Detailed upload progress bar.** Shows the active note title, queued note count, per-kind file counts and remaining files, bytes transferred vs. total size, live upload speed, estimated time remaining (ETA), and per-note queue chips. The startup banner no longer claims "Everything is up to date" while uploads are actively running.
+- **Incremental, never-restart-from-zero media uploads.** Adding new photos, renaming a note, or locking/unlocking a note mid-upload or later never restarts uploads from zero or re-uploads already-uploaded files. Media now uses a persistent per-note encryption key and SHA-256 index in IndexedDB, and active uploads cooperatively hand off mid-flight edits seamlessly without resetting progress.
+- **Protected photos and videos from accidental Backspace/Delete.** Fixed Backspace/Delete (including across `<div>` line breaks below a photo grid, word/line deletes, Cut, and selections spanning photos) from instantly deleting photos or videos, backed by a DOM restoration guard.
+- Service worker cache v31.
+
 ## v1.15.1 — 2026-11-18
 
 - **A device a master has restricted can still make notes of that type.** Restricting is about what a device SHOWS, not
