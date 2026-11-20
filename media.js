@@ -438,7 +438,8 @@
     const audio = content.audio || {};
     const videos = content.videos || {};
     const videoIds = Object.keys(videos).filter((id) => videos[id] && Array.isArray(videos[id].parts));
-    const wantsImage = images.some((s) => parseDataURL(s));
+    const existingManifest = (content._lazyManifest && typeof content._lazyManifest === 'object') ? content._lazyManifest : ((content.media && typeof content.media === 'object') ? content.media : null);
+    const wantsImage = images.some((s) => parseDataURL(s) || isRef(s));
     const audioIds = Object.keys(audio).filter((id) => audio[id] && parseDataURL(audio[id].data));
     if (!wantsImage && !audioIds.length && !videoIds.length) return none;
 
@@ -541,12 +542,31 @@
     }
 
     const out = { ...content };
+    delete out._lazyManifest;
+    delete out._lazyMediaKey;
     out.images = [];
     let prepared = 0;
     const prepTotal = images.filter((s) => parseDataURL(s)).length + audioIds.length;
     const tick = () => { prepared++; if (onPrepare) onPrepare(prepared, prepTotal); };
     for (const s of images) {
-      if (parseDataURL(s)) { out.images.push(await refFor(s, 'photo')); tick(); } else out.images.push(s);
+      if (parseDataURL(s)) {
+        out.images.push(await refFor(s, 'photo'));
+        tick();
+      } else if (isRef(s)) {
+        const name = refName(s);
+        const em = existingManifest && existingManifest[name];
+        if (em) {
+          const entry = { t: em.t, n: em.n };
+          if (em.h) entry.h = em.h;
+          if (em.iv) { entry.iv = em.iv; usedKey = true; }
+          manifest[name] = entry;
+          kinds[name] = 'photo';
+          sizes[name] = em.n;
+        }
+        out.images.push(s);
+      } else {
+        out.images.push(s);
+      }
     }
     if (Object.keys(audio).length) {
       out.audio = {};
@@ -689,6 +709,104 @@
         out.audio[id] = clip && isRef(clip.data) ? { ...clip, data: pick(clip.data) } : clip;
       }
     }
+    return out;
+  }
+
+  // Deduplicates concurrent lazy loads of the same photo while scrolling.
+  const inFlightLoads = new Map();
+
+  // Loads and decrypts ONE media item on demand (from local cache if available, otherwise from B2).
+  // Returns { blob, type, bytes, entry } so the UI can display a fast blob: URL without bloating RAM.
+  async function loadOne(noteId, name, entryMeta, keyB64) {
+    if (!entryMeta) throw new Error('A photo or audio clip in this note has no record \u2014 the note looks damaged.');
+    const flightKey = noteId + '/' + name;
+    if (inFlightLoads.has(flightKey)) return inFlightLoads.get(flightKey);
+    const p = (async () => {
+      const kB64 = keyB64 || await loadNoteKey(noteId);
+      const key = entryMeta.iv ? (kB64 ? await importKey(kB64) : null) : null;
+      if (entryMeta.iv && !key) throw new Error('This note\u2019s media is encrypted but its key is missing.');
+      let stored = await cacheGet(noteId, name).catch(() => null);
+      let fromCache = !!stored;
+      if (stored) {
+        const badSize = !!(entryMeta.n && stored.length !== entryMeta.n);
+        const badHash = !badSize && !!(entryMeta.h && (await sha256Hex(stored)) !== entryMeta.h);
+        if (badSize || badHash) {
+          const info = await infoGet(noteId, name).catch(() => null);
+          if (info && info.pending) throw new Error('A photo or clip waiting to upload is damaged on this device.');
+          await cacheDelete([{ id: idOf(noteId, name) }]).catch(() => {});
+          stored = null;
+          fromCache = false;
+        }
+      }
+      const fetchFresh = async () => {
+        let bytes;
+        try { bytes = await downloadBytes(noteId, name); } catch (e) {
+          if (e.isNetworkError) throw notAvailableOffline(e);
+          throw e;
+        }
+        if (entryMeta.n && bytes.length !== entryMeta.n) throw new Error('A photo or audio clip came back the wrong size \u2014 try again.');
+        if (entryMeta.h && await sha256Hex(bytes) !== entryMeta.h) throw new Error('A photo or audio clip came back damaged \u2014 try again.');
+        await cachePut(noteId, name, bytes, false, { sha: entryMeta.h || '', kind: /^audio\//i.test(entryMeta.t || '') ? 'audio' : 'photo', t: entryMeta.t || '', iv: entryMeta.iv || null, keyB64: entryMeta.iv ? kB64 : null }).catch(() => {});
+        return bytes;
+      };
+      if (!stored) stored = await fetchFresh();
+      let plain = stored;
+      if (entryMeta.iv) {
+        try {
+          plain = await decryptBytes(key, entryMeta.iv, stored);
+        } catch (decErr) {
+          if (!fromCache) throw decErr;
+          const info = await infoGet(noteId, name).catch(() => null);
+          if (info && info.pending) throw decErr;
+          await cacheDelete([{ id: idOf(noteId, name) }]).catch(() => {});
+          stored = await fetchFresh();
+          plain = await decryptBytes(key, entryMeta.iv, stored);
+        }
+      }
+      const type = entryMeta.t || 'image/jpeg';
+      const blob = new root.Blob([plain], { type });
+      return { blob, type, size: plain.length };
+    })().finally(() => { inFlightLoads.delete(flightKey); });
+    inFlightLoads.set(flightKey, p);
+    return p;
+  }
+
+  // Instant-open inflation: keeps photos as lightweight "ks-media:<name>" refs so notes with
+  // dozens/hundreds of photos (especially locked notes) open immediately and load photos only as
+  // they scroll into view. Audio clips (small, few) are still inflated upfront.
+  async function inflateLazy(noteId, content, opts) {
+    if (content && content.mediaKey) await saveNoteKey(noteId, content.mediaKey);
+    const manifest = content && content.media;
+    if (!manifest || typeof manifest !== 'object') return content;
+    const out = { ...content };
+    const keyB64 = content.mediaKey || null;
+    // Inflate any audio clips immediately (usually 0-3 clips), leave photos lazy.
+    if (content.audio && Object.keys(content.audio).length) {
+      out.audio = {};
+      const idx = indexFor(noteId);
+      const sIdx = shaIndexFor(noteId);
+      for (const id of Object.keys(content.audio)) {
+        const clip = content.audio[id];
+        if (clip && isRef(clip.data)) {
+          const name = refName(clip.data);
+          const em = manifest[name];
+          const loaded = await loadOne(noteId, name, em, keyB64);
+          const bytes = new Uint8Array(await blobBytes(loaded.blob));
+          const url = await bytesToDataUrl(bytes, em.t);
+          const plainSha = await sha256Hex(bytes);
+          const entry = { name, t: em.t, n: em.n, h: em.h || '', iv: em.iv || null, enc: !!em.iv, keyB64: em.iv ? keyB64 : null, plainSha };
+          idx.set(url, entry);
+          sIdx.set(plainSha, entry);
+          out.audio[id] = { ...clip, data: url };
+        } else {
+          out.audio[id] = clip;
+        }
+      }
+    }
+    out._lazyManifest = { ...manifest };
+    out._lazyMediaKey = keyB64;
+    delete out.media;
+    delete out.mediaKey;
     return out;
   }
 
@@ -963,7 +1081,7 @@
   root.KSMedia = {
     REF_PREFIX, NAME_RE, MAX_ITEM_BYTES, CACHE_CAP_BYTES, VIDEO_CACHE_CAP_BYTES,
     available, enabled,
-    externalize, inflate, uploadPending, pendingKinds, describe, reconcile, dropNote,
+    isRef, refName, loadOne, inflateLazy, externalize, inflate, uploadPending, pendingKinds, describe, reconcile, dropNote,
     prefetchNote, attachToBundle, cacheBytesUsed,
     sweepOrphans, noteKey,
     hold(base) { heldBases.add(base); }, release(base) { heldBases.delete(base); },

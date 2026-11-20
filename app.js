@@ -386,8 +386,21 @@ function snapshotKey(snapshot) {
 // Precise-enough byte size of one compressed photo, straight from its
 // base64 data URL — used both for the per-photo size shown under each
 // thumbnail/in the lightbox, and (summed) for the 25MB ceiling check above.
-function estimateImageBytes(dataUrl) { // works for any base64 data: URL, audio included
+let editorMediaManifest = {};
+let editorMediaKey = null;
+const lazyPhotoUrls = new Map(); // ks-media:<name> -> full-res blob: URL
+
+function isLazyPhotoRef(s) {
+  return !!(window.KSMedia && KSMedia.isRef && KSMedia.isRef(s));
+}
+
+function estimateImageBytes(dataUrl) { // works for base64 data: URLs AND lazy ks-media: refs
   dataUrl = String(dataUrl || '');
+  if (isLazyPhotoRef(dataUrl)) {
+    const name = KSMedia.refName(dataUrl);
+    const meta = editorMediaManifest && editorMediaManifest[name];
+    return meta && Number.isFinite(meta.n) ? meta.n : 0;
+  }
   const len = dataUrl.length - (dataUrl.indexOf(',') + 1);
   const padding = dataUrl.endsWith('==') ? 2 : dataUrl.endsWith('=') ? 1 : 0;
   return Math.max(0, Math.round((len * 3) / 4) - padding);
@@ -2406,40 +2419,78 @@ function clearThumbUrls() {
   if (thumbObserver) { thumbObserver.disconnect(); thumbObserver = null; }
   for (const url of thumbUrls.values()) if (url.startsWith('blob:')) URL.revokeObjectURL(url);
   thumbUrls.clear();
+  for (const url of lazyPhotoUrls.values()) if (url.startsWith('blob:')) URL.revokeObjectURL(url);
+  lazyPhotoUrls.clear();
 }
 
-async function makeThumbURL(src) {
+async function resolveLazyBlob(src, noteId) {
+  const name = KSMedia.refName(src);
+  const meta = editorMediaManifest && editorMediaManifest[name];
+  const loaded = await KSMedia.loadOne(noteId, name, meta, editorMediaKey);
+  if (!lazyPhotoUrls.has(src)) lazyPhotoUrls.set(src, URL.createObjectURL(loaded.blob));
+  return { blob: loaded.blob, fullUrl: lazyPhotoUrls.get(src) };
+}
+
+async function makeThumbURL(src, noteId) {
   const sig = mediaSig(src);
   if (thumbUrls.has(sig)) return thumbUrls.get(sig);
-  let url = src; // fallback: the photo itself
-  try {
-    const blob = await (await fetch(src)).blob();
-    let bitmap;
-    try { bitmap = await createImageBitmap(blob, { resizeWidth: 360, resizeQuality: 'medium' }); }
-    catch (e) { bitmap = await createImageBitmap(blob); }
-    const scale = Math.min(1, 360 / Math.max(bitmap.width, bitmap.height));
-    const canvas = document.createElement('canvas');
-    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
-    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
-    const ctx = canvas.getContext('2d');
-    ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-    if (bitmap.close) bitmap.close();
-    const small = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.8));
-    if (small) url = URL.createObjectURL(small);
-  } catch (e) { /* keep the fallback */ }
+  let blob = null;
+  let fallbackUrl = src;
+  if (isLazyPhotoRef(src)) {
+    const resolved = await resolveLazyBlob(src, noteId);
+    blob = resolved.blob;
+    fallbackUrl = resolved.fullUrl;
+  } else {
+    try { blob = await (await fetch(src)).blob(); } catch (e) { blob = null; }
+  }
+  let url = fallbackUrl;
+  if (blob) {
+    try {
+      let bitmap;
+      try { bitmap = await createImageBitmap(blob, { resizeWidth: 360, resizeQuality: 'medium' }); }
+      catch (e) { bitmap = await createImageBitmap(blob); }
+      const scale = Math.min(1, 360 / Math.max(bitmap.width, bitmap.height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+      canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      if (bitmap.close) bitmap.close();
+      const small = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.8));
+      if (small) url = URL.createObjectURL(small);
+    } catch (e) { /* keep fullUrl fallback */ }
+  }
   thumbUrls.set(sig, url);
   return url;
 }
 
 function pumpThumbs() {
-  while (thumbActive < 2 && thumbQueue.length) {
+  while (thumbActive < 4 && thumbQueue.length) {
     const job = thumbQueue.shift();
-    if (!job.img.isConnected) continue;
+    if (!job.img.isConnected || job.noteId !== editingNoteId) continue;
     thumbActive++;
-    makeThumbURL(job.src)
-      .then((url) => { if (job.img.isConnected) job.img.src = url; })
+    const tile = job.img.closest('.photo-tile');
+    makeThumbURL(job.src, job.noteId)
+      .then((url) => {
+        if (!job.img.isConnected || job.noteId !== editingNoteId) return;
+        job.img.src = url;
+        if (tile) { tile.classList.remove('is-loading', 'is-error'); }
+      })
+      .catch(() => {
+        if (!job.img.isConnected || job.noteId !== editingNoteId) return;
+        if (tile) {
+          tile.classList.remove('is-loading');
+          tile.classList.add('is-error');
+          if (!tile.querySelector('.photo-err-msg')) {
+            const msg = document.createElement('span');
+            msg.className = 'photo-err-msg';
+            msg.textContent = 'Tap to load';
+            tile.appendChild(msg);
+          }
+        }
+      })
       .finally(() => { thumbActive--; pumpThumbs(); });
   }
 }
@@ -2447,9 +2498,15 @@ function pumpThumbs() {
 function wantThumb(img) {
   const src = editorPhotos[img.dataset.photoId];
   if (!src) return;
+  const tile = img.closest('.photo-tile');
   const cached = thumbUrls.get(mediaSig(src));
-  if (cached) { img.src = cached; return; }
-  thumbQueue.push({ img, src });
+  if (cached) {
+    img.src = cached;
+    if (tile) tile.classList.remove('is-loading', 'is-error');
+    return;
+  }
+  if (tile && isLazyPhotoRef(src)) tile.classList.add('is-loading');
+  thumbQueue.push({ img, src, noteId: editingNoteId });
   pumpThumbs();
 }
 
@@ -2481,6 +2538,7 @@ function hydratePhotos(root) {
       el.appendChild(tile);
       return;
     }
+    if (isLazyPhotoRef(src) && !thumbUrls.has(mediaSig(src))) tile.classList.add('is-loading');
     const img = document.createElement('img');
     img.alt = '';
     img.draggable = false;
@@ -3205,9 +3263,24 @@ function renderLightbox() {
   const src = editorPhotos[lightboxIds[lightboxIndex]];
   const imgEl = document.getElementById('lightbox-img');
   const thumb = thumbUrls.get(mediaSig(src));
-  if (thumb && thumb !== src) {
+  const targetIdx = lightboxIndex;
+  const targetNoteId = editingNoteId;
+  if (isLazyPhotoRef(src)) {
+    const readyFull = lazyPhotoUrls.get(src);
+    if (readyFull) {
+      imgEl.src = readyFull;
+    } else {
+      if (thumb) imgEl.src = thumb; else imgEl.removeAttribute('src');
+      resolveLazyBlob(src, targetNoteId).then(({ fullUrl }) => {
+        if (lightboxIndex === targetIdx && editingNoteId === targetNoteId && !document.getElementById('overlay-lightbox').classList.contains('hidden')) {
+          imgEl.src = fullUrl;
+        }
+      }).catch((e) => {
+        if (lightboxIndex === targetIdx) toast((e && e.message) || 'Could not load photo');
+      });
+    }
+  } else if (thumb && thumb !== src) {
     imgEl.src = thumb;
-    const targetIdx = lightboxIndex;
     const fullImg = new Image();
     fullImg.onload = () => { if (lightboxIndex === targetIdx) imgEl.src = src; };
     fullImg.src = src;
@@ -3333,11 +3406,14 @@ function setEditorContent(content) {
     const el = document.createElement('ks-video'); el.setAttribute('data-id', id); videoWrap.appendChild(el);
   }
   hydrateVideos(bodyEl);
-  // Only real data: URLs ever reach the <img> markup.
+  editorMediaManifest = (content._lazyManifest && typeof content._lazyManifest === 'object') ? { ...content._lazyManifest } : {};
+  editorMediaKey = content._lazyMediaKey || null;
+  clearThumbUrls();
+  // Accept both data:image/... URLs and lazy ks-media:<name> references (loaded on scroll).
   editorPhotos = {};
   const loose = [];
   (content.images || []).forEach((s, i) => {
-    if (typeof s !== 'string' || !/^data:image\//.test(s)) return;
+    if (typeof s !== 'string' || (!/^data:image\//.test(s) && !isLazyPhotoRef(s))) return;
     const given = Array.isArray(content.imageIds) ? content.imageIds[i] : '';
     const id = PHOTO_ID_RE.test(given || '') && !editorPhotos[given] ? given : newPhotoId();
     editorPhotos[id] = s;
@@ -3484,6 +3560,8 @@ function captureSnapshot() {
     audio: snapshotAudio(html),
     videos: snapshotVideos(html),
     drawing: inkGetData(),
+    _lazyManifest: editorMediaManifest,
+    _lazyMediaKey: editorMediaKey,
     lock: resolveLockForSnapshot(),
     baseRev: editingBaseRev,
     baseUpdatedAt: editingBaseUpdatedAt,
@@ -3525,6 +3603,8 @@ async function buildSavePayload(snapshot, noteId, onPrepare) {
   if (Object.keys(audio).length) content.audio = audio;
   const hasVideos = !!(snapshot.videos && Object.keys(snapshot.videos).length);
   if (hasVideos) content.videos = snapshot.videos;
+  if (snapshot._lazyManifest && Object.keys(snapshot._lazyManifest).length) content._lazyManifest = snapshot._lazyManifest;
+  if (snapshot._lazyMediaKey) content._lazyMediaKey = snapshot._lazyMediaKey;
   if (drawing) content.drawing = drawing;
 
   // With Backblaze set up, photos and audio leave the note here \u2014 before any locking, so a
@@ -4192,6 +4272,7 @@ async function fetchNoteContent(meta) {
 // a note with something missing, if a file can't be fetched \u2014 saving that would lose it.
 function inflateForOpen(meta, content) {
   if (!window.KSMedia) return content;
+  if (KSMedia.inflateLazy) return KSMedia.inflateLazy(meta.id, content);
   return KSMedia.inflate(meta.id, content, { onDownload: () => toast('Loading photos and audio\u2026') });
 }
 
@@ -5664,7 +5745,7 @@ async function compressSavedPhoto() {
   closeLightbox();
   syncBarSet(`${label} \u00b7 0%`, null);
   try {
-    const blob = await (await fetch(src)).blob();
+    const blob = isLazyPhotoRef(src) ? (await resolveLazyBlob(src, targetNoteId)).blob : await (await fetch(src)).blob();
     const out = await fileToCompressedDataURL(blob, q.maxDim, q.quality);
     const after = estimateImageBytes(out);
     syncBarSet(`${label} \u00b7 100%`, 1);
@@ -7021,6 +7102,109 @@ function init() {
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js').catch(() => { /* offline shell is a nice-to-have */ });
   }
+  setupVersionChecker();
+}
+
+/* ---------------------------------------------------------------------
+ * Automatic version checker — polls version.js every few minutes while
+ * online and shows a non-intrusive popup when a newer version is live.
+ * ------------------------------------------------------------------- */
+
+const VERSION_CHECK_INTERVAL_MS = 3 * 60 * 1000; // every 3 minutes
+const VERSION_CHECK_INITIAL_MS = 15 * 1000;      // 15s after startup
+let lastVersionCheckAt = 0;
+let dismissedUpdateVersion = '';
+let detectedUpdateVersion = '';
+
+function compareSemver(a, b) {
+  const pa = String(a || '').replace(/^v/i, '').split('.').map((n) => parseInt(n, 10) || 0);
+  const pb = String(b || '').replace(/^v/i, '').split('.').map((n) => parseInt(n, 10) || 0);
+  const len = Math.max(pa.length, pb.length, 3);
+  for (let i = 0; i < len; i++) {
+    const da = pa[i] || 0;
+    const db = pb[i] || 0;
+    if (da !== db) return da > db ? 1 : -1;
+  }
+  return 0;
+}
+
+function showUpdatePopup(nextVersion) {
+  if (!nextVersion || nextVersion === dismissedUpdateVersion) return;
+  detectedUpdateVersion = nextVersion;
+  const pop = document.getElementById('update-popup');
+  const ver = document.getElementById('update-popup-ver');
+  const msg = document.getElementById('update-popup-msg');
+  if (!pop || !ver || !msg) return;
+  const cur = window.KEEPSAKE_VERSION || '';
+  ver.textContent = cur ? `v${cur} \u2192 v${nextVersion}` : `v${nextVersion}`;
+  msg.textContent = SyncJobs.size > 0
+    ? 'A newer version of Keepsake is ready. Your upload progress is saved — refresh now or once the upload finishes.'
+    : 'A newer version of Keepsake is ready. Refresh to switch to the latest version.';
+  pop.classList.remove('hidden');
+}
+
+async function checkForAppUpdate(force) {
+  if (!navigator.onLine) return null;
+  if (!force && document.visibilityState === 'hidden') return null;
+  const now = Date.now();
+  if (!force && now - lastVersionCheckAt < 90 * 1000) return null;
+  lastVersionCheckAt = now;
+  try {
+    const res = await fetch('./version.js?_vcheck=' + now, { cache: 'no-store' });
+    if (!res.ok) return null;
+    const text = await res.text();
+    const m = /KEEPSAKE_VERSION\s*=\s*["']([^"']+)["']/.exec(text);
+    if (!m || !m[1]) return null;
+    const remoteVer = m[1].trim();
+    const localVer = String(window.KEEPSAKE_VERSION || '').trim();
+    if (localVer && compareSemver(remoteVer, localVer) > 0) {
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.getRegistration().then((r) => { if (r) r.update().catch(() => {}); }).catch(() => {});
+      }
+      showUpdatePopup(remoteVer);
+      return remoteVer;
+    }
+  } catch (e) { /* offline or transient error — ignore quietly */ }
+  return null;
+}
+
+async function applyAppUpdate() {
+  const btn = document.getElementById('btn-update-now');
+  if (btn) { btn.disabled = true; btn.textContent = 'Refreshing\u2026'; }
+  try {
+    if ('serviceWorker' in navigator) {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map((r) => r.unregister()));
+    }
+    if (window.caches) {
+      const keys = await caches.keys();
+      await Promise.all(keys.map((k) => caches.delete(k)));
+    }
+    await Promise.all(SHELL_FILES.map((u) => fetch(u, { cache: 'reload' }).catch(() => {})));
+  } catch (e) { /* proceed to reload */ }
+  const url = new URL(location.href);
+  url.searchParams.set('_r', String(Date.now()));
+  location.replace(url.toString());
+}
+
+function setupVersionChecker() {
+  const laterBtn = document.getElementById('btn-update-later');
+  const nowBtn = document.getElementById('btn-update-now');
+  if (laterBtn) {
+    laterBtn.addEventListener('click', () => {
+      dismissedUpdateVersion = detectedUpdateVersion;
+      const pop = document.getElementById('update-popup');
+      if (pop) pop.classList.add('hidden');
+    });
+  }
+  if (nowBtn) {
+    nowBtn.addEventListener('click', () => { applyAppUpdate(); });
+  }
+  setTimeout(() => { checkForAppUpdate(false); }, VERSION_CHECK_INITIAL_MS);
+  setInterval(() => { checkForAppUpdate(false); }, VERSION_CHECK_INTERVAL_MS);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') checkForAppUpdate(false);
+  });
 }
 
 document.addEventListener('DOMContentLoaded', init);

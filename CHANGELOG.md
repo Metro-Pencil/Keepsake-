@@ -6,6 +6,17 @@ All notable changes to this project are recorded here, following
 small — gets a version bump. If the version number hasn't moved,
 nothing changed; that's the whole point of keeping one.
 
+## v1.16.3 — 2026-11-20
+
+- **Automatic update checker and refresh popup.** Polls `version.js` every 3 minutes (and when returning to the tab) bypassing the service worker cache, and displays a bottom-right "Update available" popup with the old → new version and a **Refresh now** button that clears stale caches and reloads into the new release (plus **Later** to dismiss for that version).
+- Service worker cache v34.
+
+## v1.16.2 — 2026-11-20
+
+- **Fixed editor card cutting off mid-way through long photo grids.** Updated `.editor-sheet` (`flex: 1 0 auto; height: auto`) and added float containment on `.rich-body` and photo grid blocks so the white paper sheet extends cleanly past the last row of photos at any scroll length.
+- **Instant note opening & scroll-driven lazy loading for photos.** Opening a note (including locked notes with dozens or hundreds of encrypted photos) no longer downloads and decrypts every photo upfront before opening. Notes open immediately and fetch/decrypt only the photos currently scrolling into view, while saving mid-scroll preserves all unloaded photos safely with zero re-uploads.
+- Service worker cache v33.
+
 ## v1.16.1 — 2026-11-20
 
 - **Fixed false "Text over 25 MB" limit error on photo-heavy notes.** `noteSizeBreakdown()` previously measured `body.innerHTML`, which included hydrated `<img src="data:...">` thumbnails inside `<ks-photo>` and `<ks-video>` tiles and double-counted megabytes of photos as text. It now measures only actual text and markup, skipping hydrated media DOM.

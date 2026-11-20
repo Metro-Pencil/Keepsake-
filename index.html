@@ -918,7 +918,7 @@
      top of exactly that area and scroll with it. */
   .editor-sheet {
     position: relative;
-    flex: 1;
+    flex: 1 0 auto;
     display: flex;
     flex-direction: column;
     width: 100%;
@@ -927,7 +927,7 @@
   }
 
   .rich-body {
-    flex: 1;
+    flex: 1 0 auto;
     min-height: 40dvh;
     font-family: var(--font-display);
     font-size: 1.03rem;
@@ -1123,6 +1123,10 @@
   /* Each batch of photos starts a fresh grid below the one before it, never in its gap. */
   ks-photo:first-child,
   ks-video:first-child { clear: both; }
+  /* Ensure floated photo/video tiles are always enclosed by their wrapper and .rich-body so the
+     white .editor-sheet card never cuts off above the bottom of a long photo grid. */
+  .rich-body::after { content: ""; display: block; clear: both; }
+  .rich-body > div:has(> ks-photo, > ks-video) { display: flow-root; }
   /* A blank line has no text to make it wait for room, so beside a grid it would squeeze into the 1px
      sliver at the right of the first row and the cursor would sit there. Giving it a minimum width
      (which a plain block must have beside a float) puts it where the text will go: in the empty cells
@@ -1145,6 +1149,16 @@
   .photo-tile img { display: block; width: 100%; height: 100%; object-fit: cover; -webkit-user-drag: none; }
   .photo-tile:active img { opacity: 0.85; }
   .photo-tile.is-missing { display: grid; place-items: center; padding: 8px; color: var(--brick); font-size: 0.75rem; text-align: center; cursor: default; }
+  .photo-tile.is-loading {
+    background: linear-gradient(110deg, var(--card-2) 25%, var(--paper) 45%, var(--card-2) 65%);
+    background-size: 220% 100%;
+    animation: photo-shimmer 1.3s ease-in-out infinite;
+  }
+  .photo-tile.is-loading img { opacity: 0; }
+  .photo-tile img { transition: opacity 0.18s ease; }
+  @keyframes photo-shimmer { 0% { background-position: 100% 0; } 100% { background-position: -100% 0; } }
+  .photo-tile.is-error { display: grid; place-items: center; padding: 8px; color: var(--amber); background: var(--amber-bg); font-size: 0.72rem; font-weight: 600; text-align: center; }
+  .photo-tile.is-error img { display: none; }
 
   .photo-size {
     position: absolute;
@@ -2181,6 +2195,7 @@
       box-shadow: var(--shadow-sm);
       padding: 26px 32px 36px;
       min-height: 100%;
+      height: auto;
     }
     .title-input {
       font-size: 1.45rem;
@@ -2367,6 +2382,77 @@
       transition-duration: 0.01ms !important;
     }
   }
+  /* ---------- App update popup ---------- */
+  .update-popup {
+    position: fixed;
+    right: max(16px, env(safe-area-inset-right, 0px));
+    bottom: max(16px, env(safe-area-inset-bottom, 0px));
+    z-index: calc(var(--z-toast) - 10);
+    width: min(360px, calc(100vw - 32px));
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-left: 4px solid var(--pine);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-lg);
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    animation: update-pop-in 0.22s var(--ease-out);
+  }
+  .update-popup.hidden { display: none; }
+  @keyframes update-pop-in {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .update-popup-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .update-popup-title {
+    font-family: var(--font-display);
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--ink);
+    margin: 0;
+  }
+  .update-popup-ver {
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: var(--pine);
+    background: var(--ok-bg);
+    border: 1px solid color-mix(in oklab, var(--pine) 25%, var(--line));
+    border-radius: 999px;
+    padding: 2px 8px;
+    font-variant-numeric: tabular-nums;
+  }
+  .update-popup-msg {
+    margin: 0;
+    font-size: 0.8125rem;
+    line-height: 1.45;
+    color: var(--ink-soft);
+  }
+  .update-popup-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+  .update-popup-actions .btn {
+    min-height: 38px;
+    padding: 7px 14px;
+    font-size: 0.8125rem;
+  }
+  @media (max-width: 520px) {
+    .update-popup {
+      left: 16px;
+      right: 16px;
+      width: auto;
+    }
+  }
+
 </style>
 </head>
 <body>
@@ -2376,7 +2462,7 @@
   <div class="top-inner">
     <div class="brand">
       <span class="brand-mark">Keepsake</span>
-      <span class="version-badge" id="version-badge">v1.16.1</span>
+      <span class="version-badge" id="version-badge">v1.16.3</span>
       <span class="sync-status hidden" id="sync-status" role="status" aria-live="polite"></span>
       <button class="storage-pill" id="storage-pill" type="button" data-zone="heavy" hidden>
         <span class="storage-pill-icon" id="storage-pill-icon" aria-hidden="true"></span>
@@ -2995,6 +3081,18 @@
       <button type="button" class="vp-btn" id="vp-full" aria-label="Full screen"></button>
     </div>
   </footer>
+</div>
+
+<div class="update-popup hidden" id="update-popup" role="dialog" aria-live="polite" aria-labelledby="update-popup-title">
+  <div class="update-popup-head">
+    <h3 class="update-popup-title" id="update-popup-title">Update available</h3>
+    <span class="update-popup-ver" id="update-popup-ver"></span>
+  </div>
+  <p class="update-popup-msg" id="update-popup-msg">A newer version of Keepsake is ready. Refresh to switch to the latest version.</p>
+  <div class="update-popup-actions">
+    <button type="button" class="btn btn-ghost" id="btn-update-later">Later</button>
+    <button type="button" class="btn btn-primary" id="btn-update-now">Refresh now</button>
+  </div>
 </div>
 
 <div class="toast" id="toast" role="status" aria-live="polite"></div>

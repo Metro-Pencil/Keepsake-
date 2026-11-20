@@ -4,7 +4,7 @@
 // stuck on an old cached version forever. See the "Force refresh" button
 // in Settings for a manual way out of that if a deploy forgets to.
 const CACHE_PREFIX = 'keepsake-shell-';
-const CACHE_NAME = CACHE_PREFIX + 'v32';
+const CACHE_NAME = CACHE_PREFIX + 'v34';
 const CRITICAL_FILES = [
   './',
   './index.html',
@@ -61,6 +61,8 @@ self.addEventListener('fetch', (event) => {
   if (event.request.method !== 'GET') return;
   const url = new URL(event.request.url);
   if (url.origin !== self.location.origin) return;
+  // Always let version-check probes hit the network directly.
+  if (url.searchParams.has('_vcheck')) return;
   event.respondWith(
     caches.match(event.request, { cacheName: CACHE_NAME }).then((cached) => {
       if (cached) return cached;
