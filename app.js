@@ -278,7 +278,30 @@ function noteSizeZone(total, content) {
 // than its contents: the encrypted bytes are stored as base64 text.
 function noteSizeBreakdown() {
   const body = document.getElementById('editor-body');
-  const text = utf8Len(document.getElementById('editor-title').value) + utf8Len(body.innerHTML) * 2; // html + its plain-text copy
+  // Measure only the written text and markup — never the hydrated <img src="data:..."> thumbnails
+  // inside <ks-photo>, <ks-video>, or <ks-audio>, which are stripped to tiny tags on save.
+  function measureBodyWrittenBytes(root) {
+    let bytes = 0;
+    const stack = [root];
+    while (stack.length) {
+      const node = stack.pop();
+      for (let c = node.firstChild; c; c = c.nextSibling) {
+        if (c.nodeType === 3) {
+          bytes += utf8Len(c.nodeValue) * 2; // html + plain-text copy
+        } else if (c.nodeType === 1) {
+          const tag = c.tagName;
+          if (tag === "KS-PHOTO" || tag === "KS-VIDEO" || tag === "KS-AUDIO") {
+            bytes += 44; // serialized as <ks-photo data-id="..."></ks-photo>
+          } else {
+            bytes += tag.length * 2 + 5;
+            if (c.firstChild) stack.push(c);
+          }
+        }
+      }
+    }
+    return bytes;
+  }
+  const text = utf8Len(document.getElementById('editor-title').value) + measureBodyWrittenBytes(body);
   // Photos and audio: their real size (what the bucket stores). Only a short reference to each stays in the note itself.
   let photos = 0;
   const photoIds = photoIdsInBody();

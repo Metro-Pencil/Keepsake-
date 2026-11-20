@@ -6,6 +6,11 @@ All notable changes to this project are recorded here, following
 small — gets a version bump. If the version number hasn't moved,
 nothing changed; that's the whole point of keeping one.
 
+## v1.16.1 — 2026-11-20
+
+- **Fixed false "Text over 25 MB" limit error on photo-heavy notes.** `noteSizeBreakdown()` previously measured `body.innerHTML`, which included hydrated `<img src="data:...">` thumbnails inside `<ks-photo>` and `<ks-video>` tiles and double-counted megabytes of photos as text. It now measures only actual text and markup, skipping hydrated media DOM.
+- Service worker cache v32.
+
 ## v1.16.0 — 2026-11-20
 
 - **Windowed and desktop display optimization.** Expanded the main shell and notes grid across wider desktop/windowed viewports (up to 1560px), framed the note editor as a spacious centered paper sheet with aligned top and bottom toolbars, scaled the inline photo grid from 2 up to 7 columns on wide screens, and tightened vertical padding for short/split desktop windows.
