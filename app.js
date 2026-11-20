@@ -1705,7 +1705,7 @@ const Boot = (() => {
   const steps = new Map(STEPS.map(([id, label]) => [id, { id, label, status: 'pending', detail: '', at: 0, ms: 0 }]));
   const clock = () => (window.performance && performance.now ? performance.now() : Date.now());
   const ICON = { pending: '○', running: '', done: '✓', skipped: '–', error: '!' };
-  const fmt = (ms) => (ms < 1000 ? Math.max(1, Math.round(ms)) + ' ms' : (ms / 1000).toFixed(1) + ' s');
+  const fmt = (ms) => (ms < 1000 ? Math.max(1, Math.round(ms)) + '\u00a0ms' : (ms / 1000).toFixed(1) + '\u00a0s');
   let built = false;
   let finished = false;
   let readyAt = 0;
@@ -1721,7 +1721,17 @@ const Boot = (() => {
     ol.innerHTML = STEPS.map(([id, label]) =>
       `<li class="boot-step" id="boot-step-${id}" data-state="pending"><span class="boot-step-icon" aria-hidden="true"></span><span class="boot-step-main"><span class="boot-step-name">${label}</span><span class="boot-step-detail"></span></span><span class="boot-step-time"></span></li>`).join('');
     const t = $('boot-toggle');
-    if (t) t.addEventListener('click', () => { userOpen = !(($('boot').dataset.open) === 'true'); $('boot').dataset.open = String(userOpen); t.setAttribute('aria-expanded', String(userOpen)); });
+    const head = $('boot-head');
+    const toggleOpen = () => {
+      userOpen = !($('boot').dataset.open === 'true');
+      $('boot').dataset.open = String(userOpen);
+      if (t) {
+        t.setAttribute('aria-expanded', String(userOpen));
+        t.textContent = userOpen ? 'Hide' : 'Details';
+      }
+    };
+    if (t) t.addEventListener('click', (e) => { e.stopPropagation(); toggleOpen(); });
+    if (head) head.addEventListener('click', toggleOpen);
   }
 
   function paint() {
@@ -1748,16 +1758,11 @@ const Boot = (() => {
       box.dataset.state = failed ? 'attention' : 'done';
       title.textContent = failed ? 'Ready — ' + plural(failed, 'step needs', 'steps need') + ' attention' : 'Everything is up to date';
       sub.textContent = settled + ' steps · finished in ' + fmt(clock());
-      if (userOpen === null) {
-        clearTimeout(foldTimer);
-        // Folds away by itself unless something needs a look, or the person opened it themselves.
-        foldTimer = setTimeout(() => { if (userOpen === null && !failed) { box.dataset.open = 'false'; $('boot-toggle').setAttribute('aria-expanded', 'false'); } }, 1600);
-        if (failed) { box.dataset.open = 'true'; $('boot-toggle').setAttribute('aria-expanded', 'true'); }
-      }
+      // Always stay collapsed until the user explicitly taps the bar or Details.
     } else if (localDone) {
       box.dataset.state = 'working';
       title.textContent = 'Your notes are ready';
-      sub.textContent = 'On screen in ' + fmt(readyAt || clock()) + ' · still checking for changes (' + settled + ' of ' + all.length + ' steps done)';
+      sub.textContent = 'Checking for changes · ' + settled + '/' + all.length + ' steps';
     } else {
       box.dataset.state = 'starting';
       title.textContent = 'Opening your notes…';
@@ -6565,7 +6570,7 @@ function init() {
   setupRichText();
   setupMedia();
   setupInk();
-  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.15.4');
+  document.getElementById('version-badge').textContent = 'v' + (window.KEEPSAKE_VERSION || '1.15.5');
 
   // Connectivity: react the moment the browser notices, and keep retrying
   // on a timer since navigator.onLine can't see a connection that's up but

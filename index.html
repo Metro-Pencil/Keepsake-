@@ -2153,6 +2153,59 @@
   .dev-strength[data-level="strong"] { color: var(--pine); }
   .dev-strength[data-level="strong"]::before { content: "✓ "; }
 
+  /* Compact, click-to-expand Boot status bar (~35% shorter when collapsed) */
+  .boot {
+    padding: 8px 14px;
+    margin-block-end: 12px;
+  }
+  .boot-head {
+    gap: 10px;
+    min-block-size: 40px;
+    cursor: pointer;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .boot-icon {
+    inline-size: 22px;
+    block-size: 22px;
+    font-size: 0.75rem;
+  }
+  .boot-text { gap: 1px; }
+  .boot-title {
+    font-size: 0.9375rem;
+    line-height: 1.25;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .boot-sub {
+    font-size: 0.75rem;
+    line-height: 1.3;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .boot-toggle {
+    position: relative;
+    padding: 6px 12px;
+    min-block-size: 32px;
+    font-size: 0.8125rem;
+    flex-shrink: 0;
+  }
+  .boot-toggle::after {
+    content: "";
+    position: absolute;
+    inset: -6px -4px;
+  }
+  .boot-track {
+    block-size: 6px;
+    margin-block: 10px 0;
+  }
+  .boot-steps { margin-top: 8px; }
+  @media (min-width: 640px) {
+    .boot { padding: 10px 16px; }
+  }
+
   @media (prefers-contrast: more) {
     :root {
       --line: #6F6D62;
@@ -2182,7 +2235,7 @@
   <div class="top-inner">
     <div class="brand">
       <span class="brand-mark">Keepsake</span>
-      <span class="version-badge" id="version-badge">v1.15.4</span>
+      <span class="version-badge" id="version-badge">v1.15.5</span>
       <span class="sync-status hidden" id="sync-status" role="status" aria-live="polite"></span>
       <button class="storage-pill" id="storage-pill" type="button" data-zone="heavy" hidden>
         <span class="storage-pill-icon" id="storage-pill-icon" aria-hidden="true"></span>
@@ -2221,17 +2274,16 @@
 <main id="main-content">
   <!-- Start-up panel (app.js: Boot). It is part of the page itself, so it is on screen from the very first paint,
        before any script has run; the steps are filled in as the app works through them. -->
-  <section class="boot" id="boot" data-state="starting" data-open="true" aria-label="Start-up progress">
-    <div class="boot-head">
+  <section class="boot" id="boot" data-state="starting" data-open="false" aria-label="Start-up progress">
+    <div class="boot-head" id="boot-head">
       <span class="boot-icon" aria-hidden="true"></span>
       <div class="boot-text">
         <b class="boot-title" id="boot-title" role="status">Opening your notes…</b>
         <span class="boot-sub" id="boot-sub">Starting up</span>
       </div>
-      <button type="button" class="boot-toggle" id="boot-toggle" aria-expanded="true" aria-controls="boot-steps">Details</button>
+      <button type="button" class="boot-toggle" id="boot-toggle" aria-expanded="false" aria-controls="boot-steps">Details</button>
     </div>
-    <div class="boot-track" aria-hidden="true"><i id="boot-fill"></i></div>
-    <div class="boot-body"><div class="boot-body-inner"><ol class="boot-steps" id="boot-steps"></ol></div></div>
+    <div class="boot-body"><div class="boot-body-inner"><div class="boot-track" aria-hidden="true"><i id="boot-fill"></i></div><ol class="boot-steps" id="boot-steps"></ol></div></div>
   </section>
 
   <div class="draft-banner hidden" id="draft-banner">
