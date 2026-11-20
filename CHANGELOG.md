@@ -6,6 +6,11 @@ All notable changes to this project are recorded here, following
 small — gets a version bump. If the version number hasn't moved,
 nothing changed; that's the whole point of keeping one.
 
+## v1.16.4 — 2026-11-20
+
+- **Fixed vertical single-letter text wrapping across all screen sizes and aspect ratios.** Replaced fragile `auto 1fr` + `overflow-wrap: anywhere` grid tracks in Offline Copy steps (`.off-step`), device details (`.dev-facts`), storage inventory (`.off-have`), startup steps (`.boot-step`), and upload progress rows (`.sync-step`) with safe `minmax(0, 1fr)` tracks and clean 2-line stacking on narrow portrait/split windows.
+- Service worker cache v35.
+
 ## v1.16.3 — 2026-11-20
 
 - **Automatic update checker and refresh popup.** Polls `version.js` every 3 minutes (and when returning to the tab) bypassing the service worker cache, and displays a bottom-right "Update available" popup with the old → new version and a **Refresh now** button that clears stale caches and reloads into the new release (plus **Later** to dismiss for that version).

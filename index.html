@@ -220,7 +220,7 @@
 
   @keyframes sync-spin { to { transform: rotate(360deg); } }
 
-  .sync-bar-label { flex: 1 1 10rem; min-width: 0; line-height: 1.3; overflow-wrap: anywhere; }
+  .sync-bar-label { flex: 1 1 10rem; min-width: 0; line-height: 1.3; overflow-wrap: break-word; }
 
   .sync-bar-track {
     flex: 0 1 140px;
@@ -730,9 +730,9 @@
   .dev-ev-top { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 4px 8px; }
   .dev-ev time { font-size: 0.8125rem; color: var(--ink-soft); }
   .dev-ev .hint { margin-top: 2px; overflow-wrap: anywhere; }
-  .dev-facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; margin: 10px 0; font-size: 0.8125rem; }
-  .dev-facts dt { color: var(--ink-soft); }
-  .dev-facts dd { margin: 0; overflow-wrap: anywhere; }
+  .dev-facts { display: grid; grid-template-columns: minmax(0, max-content) minmax(0, 1fr); gap: 4px 12px; margin: 10px 0; font-size: 0.8125rem; }
+  .dev-facts dt { color: var(--ink-soft); overflow-wrap: break-word; }
+  .dev-facts dd { margin: 0; min-width: 0; overflow-wrap: break-word; }
   .dev-err { color: var(--brick); }
   .dev-check { display: flex; align-items: flex-start; gap: 8px; min-height: 44px; margin: 10px 0 4px; cursor: pointer; }
   .dev-check input { margin-top: 3px; width: 18px; height: 18px; flex: none; }
@@ -2006,11 +2006,11 @@
   .boot[data-open="false"] .boot-track { margin-block-end: 0; }
   .boot-body-inner { overflow: hidden; min-block-size: 0; }
   .boot-steps { list-style: none; margin: var(--space-3) 0 0; padding: 0; display: grid; gap: var(--space-1); }
-  .boot-step { display: grid; grid-template-columns: 24px 1fr auto; align-items: start; gap: var(--space-2); padding-block: var(--space-1); font-size: 0.8125rem; line-height: 1.4; color: var(--ink-soft); }
+  .boot-step { display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; align-items: start; gap: var(--space-2); padding-block: var(--space-1); font-size: 0.8125rem; line-height: 1.4; color: var(--ink-soft); }
   .boot-step-icon { inline-size: 24px; text-align: center; font-weight: 700; color: var(--ink-faint); }
   .boot-step-main { min-inline-size: 0; display: flex; flex-direction: column; }
-  .boot-step-name { color: var(--ink); font-weight: 500; }
-  .boot-step-detail { overflow-wrap: anywhere; }
+  .boot-step-name { color: var(--ink); font-weight: 500; overflow-wrap: break-word; }
+  .boot-step-detail { overflow-wrap: break-word; }
   .boot-step-detail:empty { display: none; }
   .boot-step-time { font-variant-numeric: tabular-nums; color: var(--ink-soft); white-space: nowrap; }
   .boot-step[data-state="running"] .boot-step-icon::before {
@@ -2059,21 +2059,22 @@
   .off-status[data-state="error"] .off-dot { background: var(--brick); }
   .off-track { block-size: 8px; margin-block: var(--space-3) var(--space-1); border-radius: 999px; background: var(--card); border: 1px solid var(--line); overflow: hidden; }
   .off-fill { display: block; block-size: 100%; inline-size: 100%; background: var(--pine); transform: scaleX(0); transform-origin: left center; transition: transform 0.3s var(--ease-out); }
-  .off-cur { overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+  .off-cur { overflow-wrap: break-word; font-variant-numeric: tabular-nums; }
   .off-cur:empty { display: none; }
-  .off-steps { list-style: none; margin: var(--space-2) 0 0; padding: 0; display: grid; gap: var(--space-1); }
-  .off-step { display: grid; grid-template-columns: 24px auto 1fr; align-items: baseline; gap: var(--space-1) var(--space-2); font-size: 0.8125rem; line-height: 1.4; color: var(--ink-soft); }
+  .off-steps { list-style: none; margin: var(--space-2) 0 0; padding: 0; display: grid; gap: var(--space-2); }
+  .off-step { display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; align-items: baseline; gap: 2px var(--space-2); font-size: 0.8125rem; line-height: 1.4; color: var(--ink-soft); }
   .off-step-icon { text-align: center; font-weight: 700; }
-  .off-step-name { color: var(--ink); font-weight: 500; }
-  .off-step-detail { text-align: end; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+  .off-step-name { color: var(--ink); font-weight: 500; min-width: 0; overflow-wrap: break-word; }
+  .off-step-detail { text-align: end; font-variant-numeric: tabular-nums; white-space: nowrap; overflow-wrap: break-word; }
+  .off-step-detail:empty { display: none; }
   .off-step[data-state="running"] .off-step-icon::before { content: ""; display: inline-block; inline-size: 12px; block-size: 12px; border-radius: 50%; border: 2px solid var(--line); border-block-start-color: var(--pine-light); animation: ks-spin 0.9s linear infinite; vertical-align: -1px; }
   .off-step[data-state="done"] .off-step-icon { color: var(--pine); }
   .off-step[data-state="paused"] .off-step-icon { color: var(--amber); }
   .off-step[data-state="pending"] .off-step-name { color: var(--ink-soft); font-weight: 400; }
   .off-h { margin: var(--space-4) 0 var(--space-2); padding: 0; font-family: var(--font-display); font-size: 1rem; font-weight: 600; }
-  .off-have { display: grid; grid-template-columns: max-content 1fr; gap: var(--space-1) var(--space-3); margin: 0 0 var(--space-2); font-size: 0.875rem; font-variant-numeric: tabular-nums; }
-  .off-have dt { color: var(--ink-soft); }
-  .off-have dd { margin: 0; overflow-wrap: anywhere; }
+  .off-have { display: grid; grid-template-columns: minmax(0, max-content) minmax(0, 1fr); gap: var(--space-1) var(--space-3); margin: 0 0 var(--space-2); font-size: 0.875rem; font-variant-numeric: tabular-nums; }
+  .off-have dt { color: var(--ink-soft); overflow-wrap: break-word; }
+  .off-have dd { margin: 0; min-width: 0; overflow-wrap: break-word; }
   .off-have + .hint { margin-block-end: var(--space-3); }
   .off-pick { margin: 0; padding: 0; border: 0; min-inline-size: 0; }
   .off-pick legend { float: none; }
@@ -2227,15 +2228,48 @@
     .tool-row { padding-block: 2px; }
   }
 
-  /* Narrow split-screen / tiled desktop windows */
+  /* Narrow portrait phones & split-screen / tiled windows: stack detail readouts cleanly
+     so no column ever squeezes into single-letter vertical wrapping at any aspect ratio. */
   @media (max-width: 520px) {
+    .off-step {
+      grid-template-columns: 24px minmax(0, 1fr);
+    }
+    .off-step-detail {
+      grid-column: 2;
+      text-align: start;
+      white-space: normal;
+      font-size: 0.7812rem;
+    }
     .sync-step {
-      grid-template-columns: 4.5rem minmax(60px, 1fr) auto;
-      gap: 8px;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 4px 10px;
+    }
+    .sync-step-track {
+      grid-column: 1 / -1;
+      order: 3;
+    }
+    .sync-step-count {
+      text-align: end;
+      white-space: normal;
+      overflow-wrap: break-word;
     }
     .sync-bar-meta {
       width: 100%;
       margin-inline-start: 22px;
+      white-space: normal;
+    }
+  }
+  @media (max-width: 360px) {
+    .dev-facts, .off-have {
+      grid-template-columns: 1fr;
+      gap: 2px;
+    }
+    .dev-facts dd, .off-have dd {
+      margin-bottom: 6px;
+    }
+    .size-rows li {
+      grid-template-columns: minmax(0, 1fr) 48px auto;
+      gap: 8px;
     }
   }
   .version-badge, .size-figure, .size-text, .vprep-pct, .vp-time, .mp-time {
@@ -2462,7 +2496,7 @@
   <div class="top-inner">
     <div class="brand">
       <span class="brand-mark">Keepsake</span>
-      <span class="version-badge" id="version-badge">v1.16.3</span>
+      <span class="version-badge" id="version-badge">v1.16.4</span>
       <span class="sync-status hidden" id="sync-status" role="status" aria-live="polite"></span>
       <button class="storage-pill" id="storage-pill" type="button" data-zone="heavy" hidden>
         <span class="storage-pill-icon" id="storage-pill-icon" aria-hidden="true"></span>
