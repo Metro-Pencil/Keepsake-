@@ -140,6 +140,7 @@ const KeepAwake = {
     if (!this.count && this.lock) { const l = this.lock; this.lock = null; l.release().catch(() => {}); }
   },
 };
+window.KeepAwake = KeepAwake;
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') KeepAwake.request(); });
 
 // The app's whole view of storage. Everything lives in your Backblaze B2 bucket (see b2.js);
@@ -198,6 +199,7 @@ function loadImageFromFile(file) {
 async function fileToCompressedDataURL(file, maxDim = 1600, quality = 0.82) {
   const img = await loadImageFromFile(file);
   let { width, height } = img;
+  if (!width || !height) throw new Error('Image has no valid dimensions');
   if (width > maxDim || height > maxDim) {
     const scale = maxDim / Math.max(width, height);
     width = Math.round(width * scale);
@@ -379,7 +381,7 @@ function snapshotKey(snapshot) {
     const v = snapshot.videos[id];
     videos[id] = `${v.base}|${v.parts.length}|${v.enc ? 1 : 0}|${v.name}`;
   }
-  const { baseRev, baseUpdatedAt, forceOverwrite, ...contentSnap } = snapshot;
+  const { baseRev, baseUpdatedAt, forceOverwrite, _lazyManifest, _lazyMediaKey, ...contentSnap } = snapshot;
   return JSON.stringify({ ...contentSnap, images: (snapshot.images || []).map(mediaSig), audio, videos });
 }
 
@@ -529,16 +531,27 @@ function openKeepsakeDB() {
       db.onclose = () => { dbPromise = null; };
       resolve(db);
     };
+    req.onblocked = () => { dbPromise = null; reject(new Error('IndexedDB blocked by another tab')); };
     req.onerror = () => { dbPromise = null; reject(req.error); };
   });
   return dbPromise;
 }
 
 // Runs fn(tx) in one transaction and resolves when it has committed.
-function idbRun(db, stores, mode, fn) {
+function idbRun(db, stores, mode, fn, _retried) {
   return new Promise((resolve, reject) => {
     let tx;
-    try { tx = db.transaction(stores, mode); } catch (e) { reject(e); return; }
+    try {
+      tx = db.transaction(stores, mode);
+    } catch (e) {
+      if (!_retried && e && e.name === 'InvalidStateError') {
+        dbPromise = null;
+        openKeepsakeDB().then((freshDb) => idbRun(freshDb, stores, mode, fn, true)).then(resolve, reject);
+        return;
+      }
+      reject(e);
+      return;
+    }
     let result;
     try { result = fn(tx); } catch (e) { try { tx.abort(); } catch (e2) { /* already done */ } reject(e); return; }
     tx.oncomplete = () => resolve(result);
@@ -560,9 +573,20 @@ function idbDeleteMany(db, entries) {
   });
 }
 
-function idbRequest(db, store, method, arg) {
+function idbRequest(db, store, method, arg, _retried) {
   return new Promise((resolve, reject) => {
-    const tx = db.transaction(store, 'readonly');
+    let tx;
+    try {
+      tx = db.transaction(store, 'readonly');
+    } catch (e) {
+      if (!_retried && e && e.name === 'InvalidStateError') {
+        dbPromise = null;
+        openKeepsakeDB().then((freshDb) => idbRequest(freshDb, store, method, arg, true)).then(resolve, reject);
+        return;
+      }
+      reject(e);
+      return;
+    }
     const req = tx.objectStore(store)[method](arg);
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -724,10 +748,18 @@ async function cacheNoteMetaOnly(meta) {
 async function setLockedTitle(id, title) {
   try {
     const db = await openKeepsakeDB();
-    const existing = await idbGet(db, NOTE_CACHE_STORE, id);
-    if (!existing || existing.lockedTitle === title) return;
-    await idbPut(db, NOTE_CACHE_STORE, { ...existing, lockedTitle: title });
-    await rerenderFromLocal();
+    let changed = false;
+    await idbRun(db, NOTE_CACHE_STORE, 'readwrite', (tx) => {
+      const st = tx.objectStore(NOTE_CACHE_STORE);
+      const req = st.get(id);
+      req.onsuccess = () => {
+        const existing = req.result;
+        if (!existing || existing.lockedTitle === title) return;
+        changed = true;
+        st.put({ ...existing, lockedTitle: title });
+      };
+    });
+    if (changed) await rerenderFromLocal();
   } catch (e) { /* best-effort */ }
 }
 
@@ -745,13 +777,19 @@ function learnServerTitleSupport(metas) {
 async function cacheVault(id, password2, forUpdatedAt) {
   try {
     const db = await openKeepsakeDB();
-    const existing = await idbGet(db, NOTE_CACHE_STORE, id);
-    if (!existing) return; // no meta for this note yet — nothing to attach it to
-    await idbPut(db, NOTE_CACHE_STORE, {
-      ...existing,
-      vault: password2,
-      vaultUpdatedAt: forUpdatedAt != null ? forUpdatedAt : (existing.meta ? existing.meta.updatedAt : undefined),
-      cachedAt: Date.now(),
+    await idbRun(db, NOTE_CACHE_STORE, 'readwrite', (tx) => {
+      const st = tx.objectStore(NOTE_CACHE_STORE);
+      const req = st.get(id);
+      req.onsuccess = () => {
+        const existing = req.result;
+        if (!existing) return; // no meta for this note yet — nothing to attach it to
+        st.put({
+          ...existing,
+          vault: password2,
+          vaultUpdatedAt: forUpdatedAt != null ? forUpdatedAt : (existing.meta ? existing.meta.updatedAt : undefined),
+          cachedAt: Date.now(),
+        });
+      };
     });
   } catch (e) { /* best-effort */ }
 }
@@ -978,10 +1016,14 @@ function toast(msg) {
 
 const dialogStack = [];
 const dialogOpeners = new Map();
+let overlayHistoryDepth = 0;
+let ignorePopstateCount = 0;
+let confirmCancelHandler = null;
 const FOCUSABLE_SEL = 'a[href], button:not([disabled]):not([tabindex="-1"]), input:not([disabled]):not([type="hidden"]):not([tabindex="-1"]), select:not([disabled]):not([tabindex="-1"]), textarea:not([disabled]):not([tabindex="-1"]), [tabindex]:not([tabindex="-1"])';
 
 function updateBackgroundInert() {
   const hasModal = dialogStack.length > 0;
+  document.body.classList.toggle('modal-open', hasModal);
   const topEl = document.querySelector('header.top');
   const mainEl = document.querySelector('main');
   if (topEl) topEl.inert = hasModal;
@@ -1013,6 +1055,17 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
+function syncOverlayHistoryOnClose() {
+  // Defer to a microtask so synchronous hide(a) -> show(b) transitions do not churn history.
+  queueMicrotask(() => {
+    if (dialogStack.length === 0 && overlayHistoryDepth > 0) {
+      overlayHistoryDepth--;
+      ignorePopstateCount++;
+      try { history.back(); } catch (e) { ignorePopstateCount = Math.max(0, ignorePopstateCount - 1); }
+    }
+  });
+}
+
 function show(id) {
   const el = document.getElementById(id);
   if (!el) return;
@@ -1025,6 +1078,12 @@ function show(id) {
   const idx = dialogStack.indexOf(id);
   if (idx >= 0) dialogStack.splice(idx, 1);
   dialogStack.push(id);
+  if (id !== 'ks-ov-lock' && overlayHistoryDepth === 0) {
+    try {
+      history.pushState({ ksOverlay: id }, '');
+      overlayHistoryDepth = 1;
+    } catch (e) { /* history API unavailable */ }
+  }
   updateBackgroundInert();
   applyViewportFix();
   // Move focus inside modal dialogs (skip auto-focusing inputs inside editor so mobile keyboard stays closed)
@@ -1039,13 +1098,22 @@ function hide(id) {
   el.classList.add('hidden');
   el.inert = false;
   const idx = dialogStack.indexOf(id);
-  if (idx >= 0) dialogStack.splice(idx, 1);
+  const wasInStack = idx >= 0;
+  if (wasInStack) dialogStack.splice(idx, 1);
   updateBackgroundInert();
   if (id === 'overlay-record') recorderTeardown();
   if (id === 'overlay-clip') pauseClipPreview();
+  if (id === 'overlay-dupes') dupesScanToken++;
+  if (id === 'overlay-unlock') openSeq++;
+  if (id === 'overlay-confirm' && confirmCancelHandler) {
+    const onCancel = confirmCancelHandler;
+    confirmCancelHandler = null;
+    try { onCancel(); } catch (e) { /* ignore cancel handler errors */ }
+  }
   if (id === 'overlay-editor') { clearAudioUrls(); clearThumbUrls(); closeVideoPlayer(); stopVideoStatusTimer(); }
   setPasswordsHidden(el); // never leave a password showing behind a closed dialog
   applyViewportFix();
+  if (wasInStack && dialogStack.length === 0 && overlayHistoryDepth > 0) syncOverlayHistoryOnClose();
   const opener = dialogOpeners.get(id);
   dialogOpeners.delete(id);
   if (opener && opener.isConnected && !opener.closest('[inert]') && opener.focus) {
@@ -1087,7 +1155,7 @@ function enhancePasswordInputs(root) {
     btn.className = 'pw-toggle';
     setPasswordVisible(input, btn, false);
     // Keep focus (and the on-screen keyboard) in the field while toggling.
-    btn.addEventListener('mousedown', (e) => e.preventDefault());
+    btn.addEventListener('pointerdown', (e) => e.preventDefault());
     btn.addEventListener('click', () => setPasswordVisible(input, btn, input.type === 'password'));
     wrap.appendChild(btn);
   });
@@ -1117,8 +1185,14 @@ function setPasswordsHidden(root) {
 
 function applyViewportFix() {
   const vv = window.visualViewport;
+  const isUnzoomed = !!(vv && Math.abs((vv.scale || 1) - 1) < 0.02);
+  const kbOffset = isUnzoomed
+    ? Math.max(0, Math.round(window.innerHeight - vv.height - vv.offsetTop))
+    : 0;
+  document.documentElement.style.setProperty('--kb-offset', kbOffset + 'px');
+  const clearInline = !isUnzoomed || vv.height >= window.innerHeight - 1;
   document.querySelectorAll('#overlay-editor, .overlay').forEach((el) => {
-    if (!vv || el.classList.contains('hidden')) {
+    if (clearInline || el.classList.contains('hidden')) {
       el.style.top = '';
       el.style.height = '';
       return;
@@ -1584,6 +1658,21 @@ function renderSyncJobs() {
 
 let pendingSyncBatchError = null;
 
+// Safely removes a job from SyncJobs and ensures the sync bar & boot spinner never stay stuck.
+function syncJobDrop(noteId) {
+  SyncJobs.delete(noteId);
+  clearTimeout(syncRenderTimer); syncRenderTimer = 0;
+  if (SyncJobs.size) {
+    renderSyncJobs();
+  } else {
+    pendingSyncBatchError = null;
+    resetSyncRate();
+    refreshBootSyncBanner();
+    syncSrAnnouncedStart = false;
+    syncBarHideSoon(250);
+  }
+}
+
 // A job is over. If it was the last one, close the bar out.
 function syncJobEnd(noteId, outcome /* 'ok' | 'offline' | 'error' */, message, retry) {
   refreshVideoStatus();
@@ -1688,6 +1777,7 @@ function syncStateOf(noteId) {
 }
 
 const flushErrorSeen = new Map(); // note id -> last error shown, so a retry timer doesn't re-raise the same one
+const flushBlockedIds = new Set(); // note ids paused from automatic 30s retries after a permanent error (cleared on edit or manual Retry)
 
 // Pushes every queued save/delete to the server, oldest first, ONE note at a time and - inside a
 // note - one photo or clip at a time. Whatever the bucket already has is skipped, so after the app
@@ -1697,13 +1787,18 @@ const flushErrorSeen = new Map(); // note id -> last error shown, so a retry tim
 async function flushOutbox(opts) {
   if (window.KSDevices && KSDevices.locked()) return;
   if (isFlushing || !navigator.onLine) return;
-  if (opts && opts.manual) flushErrorSeen.clear();
+  const isManual = !!(opts && opts.manual);
+  const forceOverwriteId = (opts && opts.forceOverwriteId) || '';
+  if (isManual) { flushErrorSeen.clear(); flushBlockedIds.clear(); }
   isFlushing = true;
   const mine = []; // jobs this flush opened (an editor's own job for the same note is never touched)
   try {
-    const items = (await getOutbox()).sort((a, b) => a.queuedAt - b.queuedAt);
+    const allItems = (await getOutbox()).sort((a, b) => a.queuedAt - b.queuedAt);
+    // Automatic background retries skip notes that failed with a permanent error until edited or manually retried.
+    const items = isManual ? allItems : allItems.filter((it) => !flushBlockedIds.has(it.id));
     if (!items.length) {
       if (syncSummaryShown) { syncSummaryShown = false; syncBarHideSoon(300); }
+      refreshBootSyncBanner();
       return;
     }
     // Register every queued save first, so the bar shows the whole queue as one piece of work.
@@ -1727,7 +1822,7 @@ async function flushOutbox(opts) {
       // A live editor/background save is already handling this note - let it. Marking the note
       // in flight also makes the editor queue any new edit instead of racing this upload.
       const st = syncStateOf(item.id);
-      if (st.inFlight) { if (mine.includes(item.id)) SyncJobs.delete(item.id); continue; }
+      if (st.inFlight) { if (mine.includes(item.id)) syncJobDrop(item.id); continue; }
       st.inFlight = true;
       try {
         let result = null;
@@ -1751,6 +1846,7 @@ async function flushOutbox(opts) {
             continue;
           }
           if (!payload) { await clearOutbox(item.id); syncJobEnd(item.id, 'offline'); continue; } // genuinely missing
+          if (forceOverwriteId && forceOverwriteId === item.id) payload = { ...payload, forceOverwrite: true };
           result = await API.saveNote(item.id, payload, jobReporter(item.id, st));
           if (result && result.yielded) {
             // A mid-upload edit arrived for this note: keep its SyncJobs entry alive so syncRunOne
@@ -1766,7 +1862,7 @@ async function flushOutbox(opts) {
         // one (and its cached copy) alone; the next flush sends it.
         // Atomically clear outbox ONLY if no newer edit replaced this exact queuedAt token.
         const stillCurrent = await clearOutboxIfCurrent(item.id, item.queuedAt);
-        if (!stillCurrent) { SyncJobs.delete(item.id); continue; }
+        if (!stillCurrent) { syncJobDrop(item.id); continue; }
         if (item.op === 'delete') {
           await removeCachedNote(item.id);
         } else {
@@ -1777,16 +1873,29 @@ async function flushOutbox(opts) {
           await keepIfAllowed(result.note);
         }
         flushErrorSeen.delete(item.id);
+        flushBlockedIds.delete(item.id);
         if (item.op === 'save') syncJobEnd(item.id, 'ok');
       } catch (e) {
         if (e.isNetworkError) { setOnline(false); break; }
-        // Real server error for this one item — leave it queued, keep going.
-        // (Deletes of missing notes are handled above and never land here.)
+        // Real server error for this one item — pause automatic 30s retries so sync never loops endlessly.
         if (item.op === 'save') {
+          flushBlockedIds.add(item.id);
           const fresh = flushErrorSeen.get(item.id) !== e.message;
           flushErrorSeen.set(item.id, e.message);
-          if (fresh) { toast(e.message || 'Couldn\u2019t finish saving.'); syncJobEnd(item.id, 'error', 'Couldn\u2019t finish saving \u2014 kept on this device, tap to retry', () => flushOutbox({ manual: true })); }
-          else syncJobEnd(item.id, 'offline');
+          if (e.conflict) {
+            if (fresh) toast('This note was edited on another device. Tap Retry to overwrite.');
+            syncJobEnd(item.id, 'error', 'Conflict: edited on another device \u2014 tap Retry to overwrite', () => flushOutbox({ manual: true, forceOverwriteId: item.id }));
+          } else if (fresh) {
+            toast(e.message || 'Couldn\u2019t finish saving.');
+            syncJobEnd(item.id, 'error', 'Couldn\u2019t finish saving \u2014 kept on this device, tap to retry', () => flushOutbox({ manual: true }));
+          } else {
+            syncJobEnd(item.id, 'offline');
+          }
+        } else if (item.op === 'delete') {
+          flushBlockedIds.add(item.id);
+          const fresh = flushErrorSeen.get(item.id) !== e.message;
+          flushErrorSeen.set(item.id, e.message);
+          if (fresh) toast(e.message || 'Couldn\u2019t finish deleting note.');
         }
       } finally {
         st.inFlight = false;
@@ -1798,7 +1907,9 @@ async function flushOutbox(opts) {
     // Anything this flush opened and did not finish (connection lost) goes quiet; it is still queued.
     let dropped = false;
     for (const id of mine) { const j = SyncJobs.get(id); if (j && j.owner === 'flush') { SyncJobs.delete(id); dropped = true; } }
-    if (dropped && !SyncJobs.size) syncBarHideSoon(300);
+    if (!SyncJobs.size) pendingSyncBatchError = null;
+    if (dropped && !SyncJobs.size) { resetSyncRate(); syncSrAnnouncedStart = false; syncBarHideSoon(300); }
+    refreshBootSyncBanner();
     await rerenderFromLocal();
   }
 }
@@ -1963,11 +2074,19 @@ const Boot = (() => {
     const sub = $('boot-sub');
     if (settled === all.length) {
       finished = true;
-      const busySync = (SyncJobs.size > 0 || outboxCount > 0);
-      box.dataset.state = failed ? 'attention' : (busySync ? 'working' : 'done');
+      const activeUpload = SyncJobs.size > 0;
+      const hasBlocked = outboxCount > 0 && flushBlockedIds.size > 0;
+      const offlinePending = outboxCount > 0 && !isOnline;
+      box.dataset.state = (failed || hasBlocked || offlinePending) ? 'attention' : (activeUpload ? 'working' : 'done');
       title.textContent = failed
         ? 'Ready — ' + plural(failed, 'step needs', 'steps need') + ' attention'
-        : (busySync ? 'Notes loaded — uploading pending changes' : 'Everything is up to date');
+        : activeUpload
+          ? 'Notes loaded — uploading pending changes'
+          : offlinePending
+            ? 'Notes loaded — waiting for connection to sync'
+            : hasBlocked
+              ? 'Notes loaded — some changes need attention'
+              : 'Everything is up to date';
       sub.textContent = settled + ' steps · finished in ' + fmt(clock());
       // Always stay collapsed until the user explicitly taps the bar or Details.
     } else if (localDone) {
@@ -2005,14 +2124,22 @@ const Boot = (() => {
     skipRest(reason) { for (const s of steps.values()) if (s.status === 'pending' || s.status === 'running') { s.status = 'skipped'; s.detail = reason || ''; } paint(); },
     refreshSyncState() {
       if (!finished) return;
-      const anyFailed = Array.from(steps.values()).some((st) => st.status === "error");
+      const anyFailed = Array.from(steps.values()).some((st) => st.status === 'error');
       if (anyFailed) return;
       const box = $('boot');
       const title = $('boot-title');
       if (!box || !title) return;
-      const busySync = (SyncJobs.size > 0 || outboxCount > 0);
-      box.dataset.state = busySync ? 'working' : 'done';
-      title.textContent = busySync ? 'Notes loaded — uploading pending changes' : 'Everything is up to date';
+      const activeUpload = SyncJobs.size > 0;
+      const hasBlocked = outboxCount > 0 && flushBlockedIds.size > 0;
+      const offlinePending = outboxCount > 0 && !isOnline;
+      box.dataset.state = (hasBlocked || offlinePending) ? 'attention' : (activeUpload ? 'working' : 'done');
+      title.textContent = activeUpload
+        ? 'Notes loaded — uploading pending changes'
+        : offlinePending
+          ? 'Notes loaded — waiting for connection to sync'
+          : hasBlocked
+            ? 'Notes loaded — some changes need attention'
+            : 'Everything is up to date';
     },
   };
 })();
@@ -2157,8 +2284,33 @@ async function onAccessChanged() {
 window.addEventListener('ks-access-changed', () => { onAccessChanged(); });
 window.addEventListener('ks-master-changed', () => { onAccessChanged(); });
 
-// Locked cards show a live countdown — cheap to just re-render locked view periodically.
-setInterval(() => { if (notesCache.some((m) => m.lockType === 'time')) renderLocked(); }, 60000);
+// Locked cards show a live countdown — update text nodes in place when locked view is visible.
+setInterval(() => {
+  if (document.hidden || currentView !== 'locked' || dialogStack.length > 0) return;
+  if (!notesCache.some((m) => m.lockType === 'time')) return;
+  const grid = document.getElementById('grid-locked');
+  if (!grid) return;
+  let needsFullRender = false;
+  for (const m of notesCache) {
+    if (m.lockType !== 'time') continue;
+    const openEl = grid.querySelector(`.card-open[data-id="${CSS.escape(m.id)}"]`);
+    const pill = openEl && openEl.querySelector('.lock-pill.time');
+    if (!pill) { needsFullRender = true; break; }
+    const left = fmtCountdown(m.unlockAt);
+    const nextText = left ? left + ' left' : 'Ready to open';
+    const textNode = Array.from(pill.childNodes).find((n) => n.nodeType === 3);
+    if (textNode) {
+      if (textNode.nodeValue !== nextText) textNode.nodeValue = nextText;
+    } else {
+      pill.appendChild(document.createTextNode(nextText));
+    }
+    const snippetEl = openEl.querySelector('.card-snippet');
+    if (snippetEl && !left) {
+      snippetEl.textContent = 'Its time lock has ended \u2014 open it with your password.';
+    }
+  }
+  if (needsFullRender) renderLocked();
+}, 60000);
 
 // Records a note that just reached the server: refreshes its cached copy
 // (metadata + content, and the vault password for time locks), drops any
@@ -2234,17 +2386,16 @@ function synthesizeMeta(id, payload) {
 // upload simply carries on from where it stopped the next time. Resolves with the outbox stamp (0 if
 // the note was deleted meanwhile and nothing was written).
 async function persistLocalFirst(noteId, payload, title, info) {
-  const pending = await getOutboxItem(noteId);
-  if (deletedNotes.has(noteId) || (pending && pending.op === 'delete')) return 0; // deleted meanwhile - don't resurrect it
+  if (deletedNotes.has(noteId)) return 0; // deleted meanwhile - don't resurrect it
+  const queuedAt = await queueOutbox(noteId, 'save', payload, { title, batch: (info && info.batch) || {} });
+  if (!queuedAt) return 0; // a queued 'delete' took precedence or outbox write failed
   const meta = synthesizeMeta(noteId, payload);
   await cacheNote(meta, payload.content, lockedTitleFor(payload, title));
   if (payload.lockType === 'time' && payload.password2 && payload.unlockAt && lockNow() >= payload.unlockAt) {
     await cacheVault(noteId, payload.password2, meta.updatedAt);
   }
-  const queuedAt = await queueOutbox(noteId, 'save', payload, { title, batch: (info && info.batch) || {} });
   if (payload.mediaKeep && window.KSMedia) { try { await KSMedia.reconcile(noteId, payload.mediaKeep); } catch (e) { /* best-effort */ } }
-  // Only drop the draft once the outbox write actually succeeded.
-  if (queuedAt > 0) await clearLocalDraft(noteId);
+  await clearLocalDraft(noteId);
   return queuedAt;
 }
 
@@ -2291,7 +2442,7 @@ async function _syncFromServerImpl() {
   lastListErrorMessage = null;
   lastServerSyncAt = Date.now();
   setOnline(true);
-  Boot.done('list', plural(notes.length, 'note') + ' in your bucket');
+  Boot.done('list', plural(notes.length, 'note', 'notes') + ' in your bucket');
   learnServerTitleSupport(notes);
   // A time-locked note exists: make sure the server clock is current (a no-op while Date headers keep it fresh).
   if (window.KSB2 && notes.some((n) => n && n.lockType === 'time')) KSB2.clock.ensureFresh(30 * 60 * 1000).catch(() => {});
@@ -2413,9 +2564,34 @@ const thumbUrls = new Map(); // fingerprint -> object URL
 const thumbQueue = [];
 let thumbActive = 0;
 let thumbObserver = null;
+const thumbPending = new Map(); // sig -> Promise<string>
+const LAZY_PHOTO_LRU_MAX = 8;
+
+function getLazyPhotoUrl(src) {
+  const url = lazyPhotoUrls.get(src);
+  if (!url) return null;
+  lazyPhotoUrls.delete(src);
+  lazyPhotoUrls.set(src, url);
+  return url;
+}
+
+function setLazyPhotoUrl(src, blob) {
+  const existing = getLazyPhotoUrl(src);
+  if (existing) return existing;
+  const url = URL.createObjectURL(blob);
+  lazyPhotoUrls.set(src, url);
+  while (lazyPhotoUrls.size > LAZY_PHOTO_LRU_MAX) {
+    const oldestKey = lazyPhotoUrls.keys().next().value;
+    const oldestUrl = lazyPhotoUrls.get(oldestKey);
+    lazyPhotoUrls.delete(oldestKey);
+    if (oldestUrl && oldestUrl.startsWith('blob:')) URL.revokeObjectURL(oldestUrl);
+  }
+  return url;
+}
 
 function clearThumbUrls() {
   thumbQueue.length = 0;
+  thumbPending.clear();
   if (thumbObserver) { thumbObserver.disconnect(); thumbObserver = null; }
   for (const url of thumbUrls.values()) if (url.startsWith('blob:')) URL.revokeObjectURL(url);
   thumbUrls.clear();
@@ -2427,43 +2603,53 @@ async function resolveLazyBlob(src, noteId) {
   const name = KSMedia.refName(src);
   const meta = editorMediaManifest && editorMediaManifest[name];
   const loaded = await KSMedia.loadOne(noteId, name, meta, editorMediaKey);
-  if (!lazyPhotoUrls.has(src)) lazyPhotoUrls.set(src, URL.createObjectURL(loaded.blob));
-  return { blob: loaded.blob, fullUrl: lazyPhotoUrls.get(src) };
+  const fullUrl = setLazyPhotoUrl(src, loaded.blob);
+  return { blob: loaded.blob, fullUrl };
 }
 
 async function makeThumbURL(src, noteId) {
   const sig = mediaSig(src);
   if (thumbUrls.has(sig)) return thumbUrls.get(sig);
-  let blob = null;
-  let fallbackUrl = src;
-  if (isLazyPhotoRef(src)) {
-    const resolved = await resolveLazyBlob(src, noteId);
-    blob = resolved.blob;
-    fallbackUrl = resolved.fullUrl;
-  } else {
-    try { blob = await (await fetch(src)).blob(); } catch (e) { blob = null; }
-  }
-  let url = fallbackUrl;
-  if (blob) {
-    try {
-      let bitmap;
-      try { bitmap = await createImageBitmap(blob, { resizeWidth: 360, resizeQuality: 'medium' }); }
-      catch (e) { bitmap = await createImageBitmap(blob); }
-      const scale = Math.min(1, 360 / Math.max(bitmap.width, bitmap.height));
-      const canvas = document.createElement('canvas');
-      canvas.width = Math.max(1, Math.round(bitmap.width * scale));
-      canvas.height = Math.max(1, Math.round(bitmap.height * scale));
-      const ctx = canvas.getContext('2d');
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-      if (bitmap.close) bitmap.close();
-      const small = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.8));
-      if (small) url = URL.createObjectURL(small);
-    } catch (e) { /* keep fullUrl fallback */ }
-  }
-  thumbUrls.set(sig, url);
-  return url;
+  if (thumbPending.has(sig)) return thumbPending.get(sig);
+  const pending = (async () => {
+    let blob = null;
+    if (isLazyPhotoRef(src)) {
+      const name = KSMedia.refName(src);
+      const meta = editorMediaManifest && editorMediaManifest[name];
+      const loaded = await KSMedia.loadOne(noteId, name, meta, editorMediaKey);
+      blob = loaded.blob;
+    } else {
+      try { blob = await (await fetch(src)).blob(); } catch (e) { blob = null; }
+    }
+    let url = src;
+    let createdBlobUrl = false;
+    if (blob) {
+      try {
+        const bitmap = await createImageBitmap(blob);
+        const scale = Math.min(1, 360 / Math.max(bitmap.width, bitmap.height));
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+        canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+        if (bitmap.close) bitmap.close();
+        const small = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.8));
+        if (small) { url = URL.createObjectURL(small); createdBlobUrl = true; }
+      } catch (e) {
+        if (isLazyPhotoRef(src)) { url = URL.createObjectURL(blob); createdBlobUrl = true; }
+      }
+    }
+    if (editingNoteId !== noteId || thumbUrls.has(sig)) {
+      if (createdBlobUrl && url.startsWith('blob:')) URL.revokeObjectURL(url);
+      return thumbUrls.get(sig) || url;
+    }
+    thumbUrls.set(sig, url);
+    return url;
+  })().finally(() => { thumbPending.delete(sig); });
+  thumbPending.set(sig, pending);
+  return pending;
 }
 
 function pumpThumbs() {
@@ -2599,19 +2785,46 @@ function addPhotoToBatch(batch, dataUrl) {
 }
 
 let allowExplicitMediaRemoval = false;
+let mediaGuardObserver = null;
 
-function removePhoto(id) {
+function runAllowingMediaRemoval(fn) {
   allowExplicitMediaRemoval = true;
   try {
+    return fn();
+  } finally {
+    // Synchronously drain queued MutationRecords BEFORE clearing the flag so the async
+    // MutationObserver microtask never sees intentional removals or note reloads.
+    if (mediaGuardObserver) mediaGuardObserver.takeRecords();
+    allowExplicitMediaRemoval = false;
+  }
+}
+
+// Ensures there is always a clean editable line after a trailing photo/video block so the user
+// can always click/tap below photos and type text immediately.
+function ensureTrailingEditableLine(bodyEl) {
+  if (!bodyEl) return;
+  // Remove empty non-br wrapper divs left behind by photo removals
+  Array.from(bodyEl.children).forEach((ch) => {
+    if (ch.tagName === 'DIV' && !ch.childNodes.length) ch.remove();
+  });
+  const last = bodyEl.lastElementChild;
+  if (last && (last.tagName === 'KS-PHOTO' || last.tagName === 'KS-VIDEO' || last.querySelector('ks-photo, ks-video'))) {
+    const line = document.createElement('div');
+    line.appendChild(document.createElement('br'));
+    bodyEl.appendChild(line);
+  }
+}
+
+function removePhoto(id) {
+  runAllowingMediaRemoval(() => {
     delete editorPhotos[id];
     document.querySelectorAll(`#editor-body ks-photo[data-id="${id}"]`).forEach((el) => {
       const wrap = el.parentNode;
       el.remove();
       if (wrap && wrap.id !== 'editor-body' && wrap.tagName === 'DIV' && !wrap.childNodes.length) wrap.remove();
     });
-  } finally {
-    allowExplicitMediaRemoval = false;
-  }
+    ensureTrailingEditableLine(document.getElementById('editor-body'));
+  });
   labelPhotoTiles();
   updateSizeMeter();
   onEditorContentChanged();
@@ -2876,8 +3089,7 @@ function addVideoToBatch(batch, id, entry) {
 }
 
 function removeVideo(id) {
-  allowExplicitMediaRemoval = true;
-  try {
+  runAllowingMediaRemoval(() => {
     const v = editorVideos[id];
     if (v && window.KSMedia) KSMedia.release(v.base); // its parts on this device are cleaned up at the next save
     delete editorVideos[id];
@@ -2886,9 +3098,8 @@ function removeVideo(id) {
       el.remove();
       if (wrap && wrap.id !== 'editor-body' && wrap.tagName === 'DIV' && !wrap.childNodes.length) wrap.remove();
     });
-  } finally {
-    allowExplicitMediaRemoval = false;
-  }
+    ensureTrailingEditableLine(document.getElementById('editor-body'));
+  });
   updateSizeMeter();
   onEditorContentChanged();
 }
@@ -2913,9 +3124,28 @@ function openVideo(id) {
   });
 }
 
+let lastVideoDownloadUrl = null;
+function revokeLastVideoDownloadUrl() {
+  if (lastVideoDownloadUrl) {
+    URL.revokeObjectURL(lastVideoDownloadUrl);
+    lastVideoDownloadUrl = null;
+  }
+}
+window.addEventListener('pagehide', revokeLastVideoDownloadUrl);
+
 async function downloadVideo(id) {
   const v = editorVideos[id];
   if (!v) return;
+  const filename = videoFileName(v);
+  let fileHandle = null;
+  if (typeof window.showSaveFilePicker === 'function') {
+    try {
+      fileHandle = await window.showSaveFilePicker({ suggestedName: filename });
+    } catch (e) {
+      if (e && e.name === 'AbortError') return; // user cancelled save dialog
+      fileHandle = null; // fall back to <a download>
+    }
+  }
   try {
     let blob = KSPlayer.isOpen() ? KSPlayer.currentBlob() : null;
     if (!blob) {
@@ -2926,12 +3156,20 @@ async function downloadVideo(id) {
       blob = src.blob; src.revoke();
       syncBarHideSoon(300);
     }
+    if (fileHandle) {
+      const writable = await fileHandle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      toast('Saved');
+      return;
+    }
+    revokeLastVideoDownloadUrl();
     const url = URL.createObjectURL(blob);
+    lastVideoDownloadUrl = url;
     const a = document.createElement('a');
-    a.href = url; a.download = videoFileName(v);
+    a.href = url; a.download = filename;
     document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 120000);
-    toast('Downloaded');
+    toast('Download started');
   } catch (e) {
     syncBarHideSoon(300);
     toast(e && e.userMessage ? e.message : 'Couldn\u2019t download this video');
@@ -2970,7 +3208,9 @@ async function compressSavedVideo(id) {
         if (!out || out.size >= KSVideo.storedBytes(v) * 0.98) { vprepClose(); toast('Kept the original \u2014 compressing wouldn\u2019t have made it smaller'); return; }
         if (editingNoteId !== noteId || !editorVideos[id]) { vprepClose(); return; }
         const nk = lockIsActive() || v.enc ? await KSMedia.noteKey(noteId, true) : null;
-        const entry = await KSVideo.ingest(out, { name: v.name, type: out.type, dur: v.dur, w: v.w, h: v.h, poster: v.poster, mode: 'compressed' }, {
+        const outSizeFn = KSVideo.outputSize || (KSVideo._test && KSVideo._test.outputSize);
+        const outDim = outSizeFn ? outSizeFn({ ok: true, dur: v.dur, w: v.w, h: v.h }, preset) : { w: v.w, h: v.h };
+        const entry = await KSVideo.ingest(out, { name: v.name, type: out.type, dur: v.dur, w: out.ksWidth || outDim.w, h: out.ksHeight || outDim.h, poster: v.poster, mode: 'compressed' }, {
           noteId, enc: nk,
           onProgress: (d, t) => vprepSet('Splitting into parts\u2026', 0.9 + (d / t) * 0.1, `Part ${d} of ${t}`),
           shouldStop: () => VPrep.cancelled,
@@ -3126,18 +3366,21 @@ async function attachVideoFiles(files) {
   const mode = await askMediaQuality('video', items);
   if (!mode) return 0;
 
-  let added = 0; let kept = 0; let failed = 0; const results = [];
+  let added = 0; let kept = 0; let failed = 0; let compressFailed = 0; const results = [];
   const batch = beginPhotoBatch();
-  for (let n = 0; n < items.length; n++) {
-    const outcome = await addOneVideo(items[n], mode, n, items.length, targetNoteId, batch);
-    if (outcome.cancelled) break;
-    if (outcome.added) added++;
-    if (outcome.compressionFailed) compressFailed++;
-    else if (outcome.keptOriginal) kept++;
-    if (outcome.error) { failed++; toast(outcome.error); }
-    if (outcome.result) results.push(outcome.result);
+  try {
+    for (let n = 0; n < items.length; n++) {
+      const outcome = await addOneVideo(items[n], mode, n, items.length, targetNoteId, batch);
+      if (outcome.cancelled) break;
+      if (outcome.added) added++;
+      if (outcome.compressionFailed) compressFailed++;
+      else if (outcome.keptOriginal) kept++;
+      if (outcome.error) { failed++; toast(outcome.error); }
+      if (outcome.result) results.push(outcome.result);
+    }
+  } finally {
+    vprepClose();
   }
-  vprepClose();
   if (!failed && compressFailed) toast(compressFailed === 1 ? 'Video compression failed \u2014 kept the original file instead' : `Compression failed for ${compressFailed} videos \u2014 kept the originals instead`);
   else if (!failed && kept) toast(kept === 1 ? 'Kept the original \u2014 compressing wouldn\u2019t have made it smaller' : `Kept ${kept} originals \u2014 compressing wouldn\u2019t have made them smaller`);
   if (added) {
@@ -3186,9 +3429,14 @@ async function addOneVideo(item, mode, index, count, noteId, batch) {
 
     const nk = await KSMedia.noteKey(noteId, true);
     const base = usedMode === 'compressed' ? 0.9 : 0;
+    const outSizeFn = KSVideo.outputSize || (KSVideo._test && KSVideo._test.outputSize);
+    const outDim = (usedMode === 'compressed' && outSizeFn) ? outSizeFn(info, preset) : { w: info.w, h: info.h };
     const entry = await KSVideo.ingest(source, {
       name: file.name, type: usedMode === 'compressed' ? source.type : (file.type || guessVideoType(file.name)),
-      dur: info.dur, w: info.w, h: info.h, poster: info.poster, mode: usedMode,
+      dur: info.dur,
+      w: usedMode === 'compressed' ? (source.ksWidth || outDim.w) : info.w,
+      h: usedMode === 'compressed' ? (source.ksHeight || outDim.h) : info.h,
+      poster: info.poster, mode: usedMode,
     }, {
       noteId, enc: nk,
       onProgress: (done, total) => vprepSet('Splitting into parts\u2026', base + (done / total) * (1 - base), `Part ${done} of ${total} \u00b7 each is checked and saved on this device before it uploads`),
@@ -3266,7 +3514,7 @@ function renderLightbox() {
   const targetIdx = lightboxIndex;
   const targetNoteId = editingNoteId;
   if (isLazyPhotoRef(src)) {
-    const readyFull = lazyPhotoUrls.get(src);
+    const readyFull = getLazyPhotoUrl(src);
     if (readyFull) {
       imgEl.src = readyFull;
     } else {
@@ -3282,7 +3530,11 @@ function renderLightbox() {
   } else if (thumb && thumb !== src) {
     imgEl.src = thumb;
     const fullImg = new Image();
-    fullImg.onload = () => { if (lightboxIndex === targetIdx) imgEl.src = src; };
+    fullImg.onload = () => {
+      if (lightboxIndex === targetIdx && editingNoteId === targetNoteId && !document.getElementById('overlay-lightbox').classList.contains('hidden')) {
+        imgEl.src = src;
+      }
+    };
     fullImg.src = src;
   } else {
     imgEl.src = src;
@@ -3320,23 +3572,28 @@ function setupLightbox() {
 
   document.addEventListener('keydown', (e) => {
     if (document.getElementById('overlay-lightbox').classList.contains('hidden')) return;
-    if (document.querySelector('.overlay:not(.hidden)')) return; // a dialog (e.g. "Remove this photo?") is on top of the viewer
-    if (e.key === 'Escape') closeLightbox();
-    else if (e.key === 'ArrowLeft') lightboxStep(-1);
+    if (dialogStack.length && dialogStack[dialogStack.length - 1] !== 'overlay-lightbox') return;
+    if (e.key === 'ArrowLeft') lightboxStep(-1);
     else if (e.key === 'ArrowRight') lightboxStep(1);
   });
 
   // Swipe left/right to page between photos on touch devices.
   let touchStartX = null;
+  let touchStartY = null;
   const lightbox = document.getElementById('overlay-lightbox');
   lightbox.addEventListener('touchstart', (e) => {
+    if (e.touches.length > 1) { touchStartX = null; touchStartY = null; return; }
     touchStartX = e.changedTouches[0].clientX;
+    touchStartY = e.changedTouches[0].clientY;
   }, { passive: true });
   lightbox.addEventListener('touchend', (e) => {
-    if (touchStartX === null) return;
+    if (touchStartX === null || touchStartY === null) return;
+    if (e.touches.length > 0) { touchStartX = null; touchStartY = null; return; }
     const dx = e.changedTouches[0].clientX - touchStartX;
+    const dy = e.changedTouches[0].clientY - touchStartY;
     touchStartX = null;
-    if (Math.abs(dx) < 40) return; // not a deliberate swipe
+    touchStartY = null;
+    if (Math.abs(dx) < 40 || Math.abs(dx) < Math.abs(dy) * 1.5) return; // not a deliberate horizontal swipe
     lightboxStep(dx < 0 ? 1 : -1);
   }, { passive: true });
 }
@@ -3434,6 +3691,7 @@ function setEditorContent(content) {
     bodyEl.appendChild(wrap);
   }
   hydratePhotos(bodyEl);
+  ensureTrailingEditableLine(bodyEl);
   inkLoad(content.drawing);
   updateSizeMeter();
 }
@@ -3454,8 +3712,7 @@ function openEditorWithContent(meta, content, opts) {
 
   document.getElementById('editor-heading').textContent = isExisting ? 'Edit note' : 'New note';
   setDrawMode(false);
-  allowExplicitMediaRemoval = true;
-  try { setEditorContent(content); } finally { allowExplicitMediaRemoval = false; }
+  runAllowingMediaRemoval(() => setEditorContent(content));
   if (isExisting && meta.lockType && meta.lockType !== 'none') setLockedTitle(meta.id, String(content.title || ''));
   setExistingNoteButtons(noteExistsOnServer);
 
@@ -3511,14 +3768,14 @@ async function maybeOfferDraftRestore(noteId, serverContent) {
     'This note has changes from an earlier session that never made it to the server. Restore them?',
     async () => {
       if (editingNoteId !== noteId) return;
-      allowExplicitMediaRemoval = true;
-      try { setEditorContent(draft); } finally { allowExplicitMediaRemoval = false; }
+      runAllowingMediaRemoval(() => setEditorContent(draft));
       Object.values(editorVideos).forEach((v) => { if (window.KSMedia) KSMedia.hold(v.base); });
       onEditorContentChanged();
       toast('Draft restored');
     },
     'Restore',
-    true
+    true,
+    () => { clearLocalDraft(noteId); }
   );
 }
 
@@ -3641,7 +3898,8 @@ async function buildSavePayload(snapshot, noteId, onPrepare) {
       releaseBases = ext.releaseBases || [];
       batch = await KSMedia.pendingKinds(noteId, ext.keep, ext.kinds); // what still has to be sent
     } catch (e) {
-      if (e && (e.tooBig || e.userMessage || hasVideos)) throw e; // a video can never be kept inside the note
+      const hasLazyRefs = images.some((s) => KSMedia.isRef(s)) || !!(content && content._lazyManifest);
+      if ((e && (e.tooBig || e.userMessage)) || hasVideos || hasLazyRefs) throw e; // never write raw ks-media: refs, _lazyManifest, or videos into B2
       // Couldn't move the media out (say this browser won't keep it locally): fall back to
       // keeping it inside the note, exactly as before.
       stored = content; mediaKeep = null; mediaBytes = 0;
@@ -3689,9 +3947,12 @@ function seedSyncStateImages(noteId, snapshot) {
 
 function runSync(noteId, snapshot) {
   let state = syncStateByNote.get(noteId);
-  if (!state) { state = { inFlight: false, queued: null }; syncStateByNote.set(noteId, state); }
+  if (!state) { state = { inFlight: false, queued: null, inFlightKey: '' }; syncStateByNote.set(noteId, state); }
+  flushBlockedIds.delete(noteId); // fresh user edit clears any previous auto-retry block
+  const key = snapshotKey(snapshot);
 
   if (state.inFlight) {
+    if (key && key === state.inFlightKey && !snapshot.forceOverwrite) return; // identical to what is already uploading
     state.queued = snapshot; // latest wins — picked up cooperatively right after the current file
     const activeJob = SyncJobs.get(noteId);
     if (activeJob && snapshot && typeof snapshot.title === 'string') {
@@ -3701,6 +3962,7 @@ function runSync(noteId, snapshot) {
     return;
   }
   state.inFlight = true;
+  state.inFlightKey = key;
   syncRunOne(noteId, snapshot, state);
 }
 
@@ -3761,7 +4023,7 @@ async function syncRunOne(noteId, snapshot, state, inheritedJob) {
     } catch (e) { /* handled below via savedLocally check */ }
     const savedLocally = queuedAt > 0;
     if (deletedNotes.has(noteId) || (!savedLocally && (await getOutboxItem(noteId) || {}).op === 'delete')) {
-      SyncJobs.delete(noteId);
+      syncJobDrop(noteId);
       return;
     }
     if (editing() && savedLocally) {
@@ -3789,8 +4051,8 @@ async function syncRunOne(noteId, snapshot, state, inheritedJob) {
       }
       const { note } = res;
       if (deletedNotes.has(noteId)) {
-        API.deleteNote(noteId).catch(() => {});
-        SyncJobs.delete(noteId);
+        API.deleteNote(noteId).catch(() => { queueOutbox(noteId, 'delete', null); });
+        syncJobDrop(noteId);
         return;
       }
       setOnline(true);
@@ -3840,16 +4102,21 @@ async function syncRunOne(noteId, snapshot, state, inheritedJob) {
       for (const base of releaseBases) KSMedia.release(base);
     }
     state.inFlight = false;
+    state.inFlightKey = '';
     maybeContinueQueued(noteId, state, handoffJob);
   }
 }
 
 function maybeContinueQueued(noteId, state, inheritedJob) {
-  if (state.queued) {
+  if (state.queued && !deletedNotes.has(noteId)) {
     const next = state.queued;
     state.queued = null;
     state.inFlight = true;
+    state.inFlightKey = snapshotKey(next);
     syncRunOne(noteId, next, state, inheritedJob || SyncJobs.get(noteId));
+  } else if (inheritedJob && SyncJobs.has(noteId)) {
+    // Queued edit was cancelled/deleted before handoff — close out the job cleanly so sync stops.
+    syncJobDrop(noteId);
   }
 }
 
@@ -4033,6 +4300,27 @@ function toLocalDatetimeInput(ts) {
   const d = new Date(ts);
   const pad = (n) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function updateTimeLockHint() {
+  const status = document.getElementById('time-lock-status');
+  const input = document.getElementById('time-unlock-at');
+  if (!status || !input) return;
+  const val = input.value;
+  const ts = val ? new Date(val).getTime() : NaN;
+  const offsetMs = (window.KSB2 && KSB2.clock && KSB2.clock.known()) ? KSB2.clock.offset() : 0;
+  const parts = [];
+  if (Number.isFinite(ts)) {
+    parts.push(ts > lockNow() ? `Will unlock ${fmtDateTime(ts)}.` : `Selected time (${fmtDateTime(ts)}) is in the past.`);
+  }
+  if (Math.abs(offsetMs) > 60000) {
+    const mins = Math.round(Math.abs(offsetMs) / 60000);
+    parts.push(`Note: this device\u2019s clock is ~${mins} min ${offsetMs > 0 ? 'behind' : 'ahead of'} Backblaze\u2019s clock; time locks use Backblaze\u2019s clock.`);
+  }
+  if (parts.length) {
+    status.textContent = parts.join(' ');
+    status.hidden = false;
+  }
 }
 
 // Reopening the dialog on a note that already has a lock shows that lock
@@ -4319,7 +4607,7 @@ async function handleOpenCard(id) {
       currentUnlockCreds = null;
       openEditorWithContent(meta, content);
     } catch (e) {
-      toast('Could not open note: ' + e.message);
+      if (mySeq === openSeq) toast('Could not open note: ' + e.message);
     }
     return;
   }
@@ -4377,7 +4665,8 @@ async function downloadNote(id) {
  * Confirm modal
  * ------------------------------------------------------------------- */
 
-function openConfirm(title, message, onYes, yesLabel = 'Delete', calm = false) {
+function openConfirm(title, message, onYes, yesLabel = 'Delete', calm = false, onCancel = null) {
+  confirmCancelHandler = typeof onCancel === 'function' ? onCancel : null;
   document.getElementById('confirm-title').textContent = title;
   document.getElementById('confirm-message').textContent = message;
   const yesBtn = document.getElementById('btn-confirm-yes');
@@ -4387,6 +4676,7 @@ function openConfirm(title, message, onYes, yesLabel = 'Delete', calm = false) {
   freshYes.className = 'btn ' + (calm ? 'btn-primary' : 'btn-danger');
   yesBtn.parentNode.replaceChild(freshYes, yesBtn);
   freshYes.addEventListener('click', async () => {
+    confirmCancelHandler = null;
     hide('overlay-confirm');
     await onYes();
   });
@@ -4405,16 +4695,22 @@ function openConfirmTwice(title, message, title2, message2, onYes, yesLabel = 'D
 // an edit still waiting to upload. Used by "Delete offline data" (offline.js).
 async function clearCachedNoteContents() {
   const db = await openKeepsakeDB();
-  const keep = new Set(await getOutboxIds());
-  const puts = [];
-  const dels = [];
-  for (const c of await idbGetAll(db, NOTE_CACHE_STORE)) {
-    if (keep.has(c.id)) continue;
-    dels.push([NOTE_CONTENT_STORE, c.id]);
-    puts.push([NOTE_CACHE_STORE, { ...c, hasContent: false, contentUpdatedAt: undefined, bytes: undefined, vault: undefined, vaultUpdatedAt: undefined }]);
-  }
-  if (puts.length) await idbPutMany(db, puts);
-  if (dels.length) await idbDeleteMany(db, dels);
+  await idbRun(db, [OUTBOX_STORE, NOTE_CACHE_STORE, NOTE_CONTENT_STORE], 'readwrite', (tx) => {
+    const outReq = tx.objectStore(OUTBOX_STORE).getAllKeys();
+    outReq.onsuccess = () => {
+      const keep = new Set(outReq.result || []);
+      const cacheStore = tx.objectStore(NOTE_CACHE_STORE);
+      const contentStore = tx.objectStore(NOTE_CONTENT_STORE);
+      const allReq = cacheStore.getAll();
+      allReq.onsuccess = () => {
+        for (const c of allReq.result || []) {
+          if (keep.has(c.id)) continue;
+          contentStore.delete(c.id);
+          cacheStore.put({ ...c, hasContent: false, contentUpdatedAt: undefined, bytes: undefined, vault: undefined, vaultUpdatedAt: undefined });
+        }
+      };
+    };
+  });
 }
 
 /* ---------------------------------------------------------------------
@@ -4425,6 +4721,7 @@ async function clearCachedNoteContents() {
 // in its own worker scope and can't be imported from here. Keep the two in
 // sync if the shell's file list ever changes.
 const FORCE_REFRESH_SHELL_FILES = [
+  './',
   './index.html',
   './version.js',
   './app.js',
@@ -4438,6 +4735,12 @@ const FORCE_REFRESH_SHELL_FILES = [
   './icon-192.png',
   './icon-512.png',
   './icon-512-maskable.png',
+  './font-inter-400.woff2',
+  './font-inter-500.woff2',
+  './font-inter-600.woff2',
+  './font-inter-700.woff2',
+  './font-serif-400.woff2',
+  './font-serif-700.woff2',
 ];
 
 function openSettings() {
@@ -4488,12 +4791,12 @@ async function forceRefresh() {
   btn.textContent = 'Refreshing…';
   try {
     if ('serviceWorker' in navigator) {
-      const regs = await navigator.serviceWorker.getRegistrations();
-      await Promise.all(regs.map((r) => r.unregister()));
+      const reg = await navigator.serviceWorker.getRegistration('./');
+      if (reg) await reg.unregister();
     }
     if (window.caches) {
       const keys = await caches.keys();
-      await Promise.all(keys.map((k) => caches.delete(k)));
+      await Promise.all(keys.filter((k) => k.startsWith('keepsake-shell-')).map((k) => caches.delete(k)));
     }
     // The two steps above only clear the Service Worker's own Cache
     // Storage — a separate layer from the browser's plain HTTP cache,
@@ -4556,25 +4859,56 @@ function wireStaticEvents() {
     const btn = e.target.closest('[data-close]');
     if (btn) hide(btn.dataset.close);
   });
-  document.querySelectorAll('.overlay').forEach((ov) => {
-    ov.addEventListener('click', (e) => { if (e.target === ov && !overlayIsProtected(ov.id)) hide(ov.id); });
+  document.addEventListener('click', (e) => {
+    const ov = e.target;
+    if (ov && ov.classList && ov.classList.contains('overlay') && !ov.classList.contains('hidden') && !overlayIsProtected(ov.id)) {
+      if (ov.id === 'overlay-lightbox') closeLightbox();
+      else hide(ov.id);
+    }
   });
   document.addEventListener('keydown', (e) => {
-    if (e.key !== 'Escape') return;
-    hideRevealedCards();
-    const openModals = document.querySelectorAll('.overlay:not(.hidden)');
-    if (openModals.length) {
-      // Close the top-most modal first (even if opened over the lightbox or video player).
-      const topModal = openModals[openModals.length - 1];
-      if (!overlayIsProtected(topModal.id)) hide(topModal.id);
+    if (e.key === 'Escape') {
+      hideRevealedCards();
+      if (dialogStack.length) {
+        const topId = dialogStack[dialogStack.length - 1];
+        if (topId === 'overlay-video') { if (window.KSPlayer && KSPlayer.isOpen()) KSPlayer.close(); else hide(topId); return; }
+        if (topId === 'overlay-lightbox') { closeLightbox(); return; }
+        if (topId === 'overlay-editor') {
+          if (Ink.mode) { setDrawMode(false); return; }
+          attemptCloseEditor();
+          return;
+        }
+        if (!overlayIsProtected(topId)) hide(topId);
+        return;
+      }
+      if (!document.getElementById('overlay-video').classList.contains('hidden')) {
+        if (window.KSPlayer && KSPlayer.isOpen()) KSPlayer.close();
+        return;
+      }
+      if (!document.getElementById('overlay-lightbox').classList.contains('hidden')) {
+        closeLightbox();
+        return;
+      }
+      if (!document.getElementById('overlay-editor').classList.contains('hidden')) {
+        if (Ink.mode) { setDrawMode(false); return; }
+        attemptCloseEditor();
+      }
       return;
     }
-    // The photo viewer and video player handle their own Escape when no modal is above them.
-    if (!document.getElementById('overlay-lightbox').classList.contains('hidden')) return;
-    if (!document.getElementById('overlay-video').classList.contains('hidden')) return;
-    if (!document.getElementById('overlay-editor').classList.contains('hidden')) {
-      if (Ink.mode) { setDrawMode(false); return; }
-      attemptCloseEditor();
+    if ((e.ctrlKey || e.metaKey) && !e.altKey) {
+      const edOpen = editingNoteId && !document.getElementById('overlay-editor').classList.contains('hidden');
+      if (!edOpen) return;
+      if (dialogStack.length && dialogStack[dialogStack.length - 1] !== 'overlay-editor') return;
+      const k = e.key.toLowerCase();
+      if (k === 's' && !e.shiftKey) {
+        e.preventDefault();
+        saveNote();
+        return;
+      }
+      if (Ink.mode) {
+        if (k === 'z' && !e.shiftKey) { e.preventDefault(); inkUndo(); }
+        else if (k === 'y' || (k === 'z' && e.shiftKey)) { e.preventDefault(); inkRedo(); }
+      }
     }
   });
 
@@ -4646,6 +4980,7 @@ function wireStaticEvents() {
   document.getElementById('btn-close-editor').addEventListener('click', attemptCloseEditor);
 
   document.getElementById('btn-new-note').addEventListener('click', () => {
+    openSeq++;
     currentUnlockCreds = null;
     openEditorWithContent(null, { title: '', body: '', images: [] });
   });
@@ -4679,47 +5014,50 @@ function wireStaticEvents() {
       files.push(f);
     }
 
+    const targetNoteId = editingNoteId; // capture before async quality dialog
     const mode = await askMediaQuality('photo', files);
-    if (!mode) return;
+    if (!mode || editingNoteId !== targetNoteId) return;
 
     const attachBtn = document.getElementById('btn-attach-image');
     attachBtn.disabled = true;
     let failed = 0;
     let dropped = 0;
     let refused = 0;
-    const targetNoteId = editingNoteId; // photos belong to the note they were picked for
-    const batch = beginPhotoBatch(); // they go in the text, between lines, as one grid
-
-    // Collect exact content hashes of photos already in this note so re-picking the same photo is skipped.
-    const existingHashes = await existingNotePhotoHashes(targetNoteId);
-
     const results = [];
-    for (let i = 0; i < files.length; i++) {
-      const verb = mode === 'original' ? 'Adding' : 'Compressing';
-      const what = `${verb} photo ${i + 1} of ${files.length} \u00b7 ${files[i].name} (${formatBytes(files[i].size)})`;
-      syncBarSet(`${what} \u00b7 ${Math.round(i / files.length * 100)}%`, i / files.length);
-      try {
-        const dataUrl = await fileToStoredDataURL(files[i], mode);
-        // Compression is slow; if you've since opened a different note, these
-        // must not be attached to it.
-        if (!editorShowing(targetNoteId)) { dropped++; continue; }
-        const hash = await dataUrlSha256(dataUrl);
-        if (hash && existingHashes.has(hash)) { skippedDupes++; continue; }
-        if (!canFitMedia(dataUrl.length + 4).ok) { refused++; continue; }
-        if (hash) existingHashes.add(hash);
-        results.push(`${formatBytes(files[i].size)} \u2192 ${formatBytes(estimateImageBytes(dataUrl))}`);
-        addPhotoToBatch(batch, dataUrl); // shown as soon as it's ready, not all at once at the end
-        updateSizeMeter();
-        onEditorContentChanged();
-      } catch (err) {
-        failed++;
-      }
-      syncBarSet(`${what} \u00b7 ${Math.round((i + 1) / files.length * 100)}%`, (i + 1) / files.length);
-    }
+    try {
+      const batch = beginPhotoBatch(); // they go in the text, between lines, as one grid
 
-    if (mode === 'compressed' && results.length) syncBarSuccess(results.length === 1 ? `Compressed: ${results[0]}` : `Compressed ${results.length} photos`);
-    else syncBarHideSoon(700);
-    attachBtn.disabled = false;
+      // Collect exact content hashes of photos already in this note so re-picking the same photo is skipped.
+      const existingHashes = await existingNotePhotoHashes(targetNoteId);
+
+      for (let i = 0; i < files.length; i++) {
+        const verb = mode === 'original' ? 'Adding' : 'Compressing';
+        const what = `${verb} photo ${i + 1} of ${files.length} \u00b7 ${files[i].name} (${formatBytes(files[i].size)})`;
+        syncBarSet(`${what} \u00b7 ${Math.round(i / files.length * 100)}%`, i / files.length);
+        try {
+          const dataUrl = await fileToStoredDataURL(files[i], mode);
+          // Compression is slow; if you've since opened a different note, these
+          // must not be attached to it.
+          if (!editorShowing(targetNoteId)) { dropped++; continue; }
+          const hash = await dataUrlSha256(dataUrl);
+          if (hash && existingHashes.has(hash)) { skippedDupes++; continue; }
+          if (!canFitMedia(dataUrl.length + 4).ok) { refused++; continue; }
+          if (hash) existingHashes.add(hash);
+          results.push(`${formatBytes(files[i].size)} \u2192 ${formatBytes(estimateImageBytes(dataUrl))}`);
+          addPhotoToBatch(batch, dataUrl); // shown as soon as it's ready, not all at once at the end
+          updateSizeMeter();
+          onEditorContentChanged();
+        } catch (err) {
+          failed++;
+        }
+        syncBarSet(`${what} \u00b7 ${Math.round((i + 1) / files.length * 100)}%`, (i + 1) / files.length);
+      }
+
+      if (mode === 'compressed' && results.length) syncBarSuccess(results.length === 1 ? `Compressed: ${results[0]}` : `Compressed ${results.length} photos`);
+      else syncBarHideSoon(700);
+    } finally {
+      attachBtn.disabled = false;
+    }
     if (skippedDupes) {
       toast(skippedDupes === 1 ? 'Skipped 1 duplicate photo already in this note' : `Skipped ${skippedDupes} duplicate photos already in this note`);
     }
@@ -4753,7 +5091,9 @@ function wireStaticEvents() {
     document.getElementById('choice-quick').setAttribute('aria-pressed', 'false');
     document.getElementById('time-lock-fields').style.display = '';
     document.getElementById('quick-lock-fields').style.display = 'none';
+    updateTimeLockHint();
   });
+  document.getElementById('time-unlock-at').addEventListener('input', updateTimeLockHint);
 
   document.getElementById('btn-confirm-quick-lock').addEventListener('click', () => {
     const pw = document.getElementById('quick-password').value;
@@ -6067,9 +6407,9 @@ async function compressAudioFile(file, bps, onProgress, shouldStop) {
 }
 
 async function attachAudioFiles(files) {
-  const mode = await askMediaQuality('audio', files);
-  if (!mode) return 0;
   const targetNoteId = editingNoteId;
+  const mode = await askMediaQuality('audio', files);
+  if (!mode || editingNoteId !== targetNoteId) return 0;
   let added = 0;
   let refused = 0;
   let unreadable = 0;
@@ -6149,7 +6489,7 @@ function micErrorText(e) {
   return 'Couldn\u2019t start the microphone.';
 }
 
-function overlayIsProtected(id) { return (id === 'overlay-record' && Rec.state !== 'idle') || id === 'overlay-quality' || id === 'overlay-vprep'; }
+function overlayIsProtected(id) { return id === 'ks-ov-lock' || (id === 'overlay-record' && Rec.state !== 'idle') || id === 'overlay-quality' || id === 'overlay-vprep'; }
 
 function openRecorder() {
   recorderTeardown();
@@ -6388,8 +6728,8 @@ function requestCloseRecorder() {
 function setupMedia() {
   document.querySelectorAll('[data-zone-icon]').forEach((el) => { el.innerHTML = ZONE_ICON[el.dataset.zoneIcon]; });
   const body = document.getElementById('editor-body');
-  body.addEventListener('mousedown', (e) => { if (e.target.closest('.audio-chip button')) e.preventDefault(); }); // keep the caret where it was
-  body.addEventListener('mousedown', (e) => { if (e.target.closest('.photo-tile, .video-card')) e.preventDefault(); });
+  body.addEventListener('pointerdown', (e) => { if (e.target.closest('.audio-chip button')) e.preventDefault(); }); // keep the caret where it was
+  body.addEventListener('pointerdown', (e) => { if (e.target.closest('.photo-tile, .video-card')) e.preventDefault(); });
   body.addEventListener('click', (e) => {
     const vcard = e.target.closest('.video-card[data-id]');
     if (vcard) { e.preventDefault(); openVideo(vcard.dataset.id); return; }
@@ -6532,7 +6872,7 @@ function setupRichText() {
   // drag, Ctrl+A replace) ever removes a <ks-photo> or <ks-video> without going through
   // removePhoto()/removeVideo(), immediately restore it so media can never vanish by accident.
   if (typeof MutationObserver === 'function') {
-    const mediaGuard = new MutationObserver((mutations) => {
+    mediaGuardObserver = new MutationObserver((mutations) => {
       if (allowExplicitMediaRemoval) return;
       const overlay = document.getElementById('overlay-editor');
       if (!overlay || overlay.classList.contains('hidden')) return;
@@ -6547,9 +6887,11 @@ function setupRichText() {
           }
           for (const el of mediaEls) {
             const id = el.getAttribute('data-id');
-            const stillExists = (el.tagName === 'KS-PHOTO' && editorPhotos[id]) || (el.tagName === 'KS-VIDEO' && editorVideos[id]);
-            if (!stillExists || body.contains(el)) continue;
-            // Re-insert into its original parent if still connected, otherwise into a fresh wrapper in body.
+            if (!id) continue;
+            const tag = el.tagName.toLowerCase();
+            const stillExists = (tag === 'ks-photo' && editorPhotos[id]) || (tag === 'ks-video' && editorVideos[id]);
+            // Never re-insert if this data-id is already present anywhere in #editor-body!
+            if (!stillExists || body.contains(el) || body.querySelector(`${tag}[data-id="${id}"]`)) continue;
             if (m.target && body.contains(m.target)) {
               m.target.insertBefore(el, m.nextSibling && m.target.contains(m.nextSibling) ? m.nextSibling : null);
             } else {
@@ -6566,11 +6908,33 @@ function setupRichText() {
         warnMediaProtected();
       }
     });
-    mediaGuard.observe(body, { childList: true, subtree: true });
+    mediaGuardObserver.observe(body, { childList: true, subtree: true });
+  }
+
+  // Clicking empty padding below the photos inside .editor-sheet focuses #editor-body at the end
+  // so you can always click and start typing text immediately.
+  const sheet = document.getElementById('editor-sheet');
+  if (sheet) {
+    sheet.addEventListener('click', (e) => {
+      if (Ink && Ink.mode) return;
+      if (e.target !== sheet) return;
+      ensureTrailingEditableLine(body);
+      body.focus();
+      const sel = window.getSelection();
+      if (sel) {
+        const range = document.createRange();
+        const target = body.lastElementChild || body;
+        range.selectNodeContents(target);
+        range.collapse(false);
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
+    });
   }
 
   // Paste as plain text so formatting from other apps can't sneak in.
   body.addEventListener('paste', (e) => {
+    if (selectionTouchesMedia()) { e.preventDefault(); warnMediaProtected(); return; }
     e.preventDefault();
     const text = (e.clipboardData || window.clipboardData).getData('text/plain');
     if (text) document.execCommand('insertText', false, text);
@@ -6585,7 +6949,7 @@ function setupRichText() {
 
   document.querySelectorAll('[data-fmt]').forEach((btn) => {
     // Keep focus + selection in the note while a formatting button is tapped.
-    btn.addEventListener('mousedown', (e) => e.preventDefault());
+    btn.addEventListener('pointerdown', (e) => e.preventDefault());
     btn.addEventListener('click', () => runFormat(btn.dataset.fmt));
   });
 }
@@ -6813,7 +7177,8 @@ function inkEraseAt(pt) {
 
 function inkPoint(e) {
   const r = Ink.live.getBoundingClientRect();
-  return [inkR4((e.clientX - r.left) / Ink.W), inkR4((e.clientY - r.top) / Ink.W)];
+  const w = r.width || Ink.W;
+  return [inkR4((e.clientX - r.left) / w), inkR4((e.clientY - r.top) / w)];
 }
 
 function inkEvents(e) {
@@ -6874,6 +7239,20 @@ function inkPointerEnd(e) {
   }
 }
 
+function inkPointerCancel(e) {
+  if (!e.isPrimary) return;
+  if (Ink.gestureBefore) {
+    Ink.strokes = Ink.gestureBefore;
+    Ink.gestureBefore = null;
+    Ink.erased = false;
+    inkRender();
+  }
+  if (Ink.current) {
+    Ink.current = null;
+    if (!Ink.raf) Ink.raf = requestAnimationFrame(inkDrawLive); // clears the live layer
+  }
+}
+
 /* Toolbar + mode */
 
 function inkUpdateButtons() {
@@ -6919,7 +7298,7 @@ function setupInk() {
   Ink.live.addEventListener('pointerdown', inkPointerDown);
   Ink.live.addEventListener('pointermove', inkPointerMove);
   Ink.live.addEventListener('pointerup', inkPointerEnd);
-  Ink.live.addEventListener('pointercancel', inkPointerEnd);
+  Ink.live.addEventListener('pointercancel', inkPointerCancel);
 
   document.getElementById('btn-draw').addEventListener('click', () => setDrawMode(!Ink.mode));
 
@@ -6975,6 +7354,7 @@ async function checkForRecoverableDrafts() {
   banner.classList.remove('hidden');
 
   document.getElementById('draft-banner-resume').onclick = () => {
+    openSeq++;
     banner.classList.add('hidden');
     const meta = notesCache.find((m) => m.id === id) || null;
     if (meta && meta.lockType !== 'none') {
@@ -7099,20 +7479,75 @@ function init() {
   // not actually reaching Backblaze.
   window.addEventListener('online', () => { if (window.KSDevices && KSDevices.locked()) return; setOnline(true); flushOutbox(); });
   window.addEventListener('offline', () => setOnline(false));
-  setInterval(() => { if (navigator.onLine && outboxCount > 0 && !(window.KSDevices && KSDevices.locked())) flushOutbox(); }, 30000);
+  setInterval(() => { if (navigator.onLine && outboxCount > flushBlockedIds.size && !(window.KSDevices && KSDevices.locked())) flushOutbox(); }, 30000);
   updateSyncStatusUI();
 
   // Leaving the app (switching away, closing the tab) with an edit not yet sent: for unlocked notes,
   // flush the local draft immediately before starting the background sync; locked notes skip plaintext
   // local drafts and go straight through encrypted outbox persistence in triggerAutosave().
   const editorOpen = () => editingNoteId && !document.getElementById('overlay-editor').classList.contains('hidden');
+  const hasUnsavedEditorChanges = () => {
+    if (!editorOpen()) return false;
+    try {
+      if (!noteHasContent() && !noteExistsOnServer) return false;
+      return snapshotKey(captureSnapshot()) !== lastAutosavedJSON;
+    } catch (e) { return false; }
+  };
   const flushBeforeLeave = () => {
-    if (!editorOpen()) return;
-    if (noteHasContent() && !lockIsActive()) saveDraftNow(editingNoteId);
-    triggerAutosave();
+    if (editorOpen()) {
+      if (noteHasContent() && !lockIsActive()) saveDraftNow(editingNoteId);
+      triggerAutosave();
+    }
+    if (navigator.onLine && outboxCount > flushBlockedIds.size && !(window.KSDevices && KSDevices.locked())) {
+      flushOutbox();
+    }
   };
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushBeforeLeave(); });
   window.addEventListener('pagehide', flushBeforeLeave);
+  window.addEventListener('beforeunload', (e) => {
+    if (SyncJobs.size > 0 || hasUnsavedEditorChanges()) {
+      e.preventDefault();
+      e.returnValue = '';
+    }
+  });
+
+  // Android hardware / gesture Back button closes the top-most overlay instead of exiting the app.
+  window.addEventListener('popstate', () => {
+    if (ignorePopstateCount > 0) {
+      ignorePopstateCount--;
+      return;
+    }
+    overlayHistoryDepth = Math.max(0, overlayHistoryDepth - 1);
+    if (!dialogStack.length) {
+      if (window.KSPlayer && KSPlayer.isOpen()) KSPlayer.close();
+      return;
+    }
+    const topId = dialogStack[dialogStack.length - 1];
+    if (overlayIsProtected(topId)) {
+      try {
+        history.pushState({ ksOverlay: topId }, '');
+        overlayHistoryDepth = 1;
+      } catch (e) {}
+      return;
+    }
+    if (topId === 'overlay-video') {
+      if (window.KSPlayer && KSPlayer.isOpen()) KSPlayer.close();
+      else hide(topId);
+    } else if (topId === 'overlay-lightbox') {
+      closeLightbox();
+    } else if (topId === 'overlay-editor') {
+      if (Ink.mode) setDrawMode(false);
+      else attemptCloseEditor();
+    } else {
+      hide(topId);
+    }
+    if (dialogStack.length > 0 && overlayHistoryDepth === 0) {
+      try {
+        history.pushState({ ksOverlay: dialogStack[dialogStack.length - 1] }, '');
+        overlayHistoryDepth = 1;
+      } catch (e) {}
+    }
+  });
 
   Boot.init();
   if (window.KSDevices && KSDevices.locked()) {
@@ -7211,7 +7646,11 @@ async function computeDHash(blob) {
         bit++;
       }
     }
-    return [hi, lo];
+    const ar = bitmap.height ? bitmap.width / bitmap.height : 1;
+    const ones = popcount32(hi) + popcount32(lo);
+    // Reject near-flat/blank hashes (all-0 or all-1) from visual fuzzy matching; they still match by exact SHA-256.
+    const informative = ones >= 4 && ones <= 60;
+    return { hi, lo, ar, informative };
   } finally {
     if (bitmap.close) bitmap.close();
   }
@@ -7224,8 +7663,9 @@ function popcount32(x) {
 }
 
 function dHashDistance(a, b) {
-  if (!a || !b) return 64;
-  return popcount32((a[0] ^ b[0]) >>> 0) + popcount32((a[1] ^ b[1]) >>> 0);
+  if (!a || !b || !a.informative || !b.informative) return 64;
+  if (Math.abs(a.ar - b.ar) > 0.08) return 64;
+  return popcount32((a.hi ^ b.hi) >>> 0) + popcount32((a.lo ^ b.lo) >>> 0);
 }
 
 let dupesScanToken = 0;
@@ -7524,14 +7964,14 @@ async function applyAppUpdate() {
   if (btn) { btn.disabled = true; btn.textContent = 'Refreshing\u2026'; }
   try {
     if ('serviceWorker' in navigator) {
-      const regs = await navigator.serviceWorker.getRegistrations();
-      await Promise.all(regs.map((r) => r.unregister()));
+      const reg = await navigator.serviceWorker.getRegistration('./');
+      if (reg) await reg.unregister();
     }
     if (window.caches) {
       const keys = await caches.keys();
-      await Promise.all(keys.map((k) => caches.delete(k)));
+      await Promise.all(keys.filter((k) => k.startsWith('keepsake-shell-')).map((k) => caches.delete(k)));
     }
-    await Promise.all(SHELL_FILES.map((u) => fetch(u, { cache: 'reload' }).catch(() => {})));
+    await Promise.all(FORCE_REFRESH_SHELL_FILES.map((u) => fetch(u, { cache: 'reload' }).catch(() => {})));
   } catch (e) { /* proceed to reload */ }
   const url = new URL(location.href);
   url.searchParams.set('_r', String(Date.now()));

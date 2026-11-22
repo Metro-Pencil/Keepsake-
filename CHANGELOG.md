@@ -6,6 +6,27 @@ All notable changes to this project are recorded here, following
 small — gets a version bump. If the version number hasn't moved,
 nothing changed; that's the whole point of keeping one.
 
+## v1.16.8 — 2026-11-23
+
+- **Fixed critical video upload and app-update crashes.** Declared `compressFailed` in `attachVideoFiles()` with `try/finally` modal cleanup, fixed `SHELL_FILES` -> `FORCE_REFRESH_SHELL_FILES` in `applyAppUpdate()`, and scoped Service Worker/Cache Storage cleanup strictly to Keepsake so sibling apps on the same origin stay intact.
+- **Hardened Backblaze B2 saves, downloads, and offline sync.** Added revisioned content/vault keys with `If-Match` ETag conflict protection (`cors.json` updated with `if-match` / `if-none-match`), kept `s3()` timeouts active through body reads with cancelable `AbortSignal` support, added `503`/`429`/`5xx` and `RequestTimeTooSkewed` retries, deferred partial-chunk deletion until after `cachePut()`, halted cleanly on `QuotaExceededError`, fixed stale Stage 1 metadata caching in `syncText()`, added Wake Lock during offline downloads, and parallelized `deleteMedia()`.
+- **Fixed media key loss, RAM pressure, video playback, and downloads.** Recovered `_lazyMediaKey` in `externalize()`, blocked raw `ks-media:` fallback saves in `buildSavePayload()`, stopped pinning full-res photos in `lazyPhotoUrls` during grid thumbnailing (8-entry lightbox LRU + promise deduplication), reused hashed bytes and cleared intermediate Blobs in `KSVideo.open()`, protected pending cached parts from deletion, added B2 self-heal on lock, fixed `compress()` startup/audio/stall sync and portrait poster sizing, fixed `KSPlayer` `dialogStack` focus trapping, fullscreen modal lockouts, mouse click cancellation, stuck buffering spinners, and added `showSaveFilePicker()` + safe blob-URL lifecycle in `downloadVideo()`.
+- **Fixed multi-device lock security and Windows multi-tab sync.** Protected `#ks-ov-lock` from `Escape`, unified `Escape` handling on `dialogStack`, fixed `judge()` replay unblocking and monotonic server-clock timestamps, started background polling in `afterConnect()`, kept `access.known` true on `logoutMaster()`, fixed eye-revealed password inputs in `formDialog()`, added cross-tab `storage` sync and fixed `runPendingWipe()` `onblocked` double-decrement, committed local enforcement before telemetry, and hardened `replaceMasterKey()`, `changePassword()`, `createMaster()`, and `getIdentity()`.
+- **Fixed Android, Windows, and windowed/aspect-ratio UI & navigation.** Added Android Back button (`pushState`/`popstate`) handling, `overscroll-behavior-y: contain`, `body.modal-open` scroll lock, `interactive-widget=resizes-content`, pinch-zoom guards in `applyViewportFix()`, `beforeunload` unsaved/upload protection, desktop `Ctrl+S` and Ink `Ctrl+Z`/`Ctrl+Y` shortcuts, Ink `pointercancel` discard, and fixed `.editor-toolbar` / `.vp-row` / `.vp-menu` / `.btn-row` / `.toast` overflow, landscape `env(safe-area-inset-*)` preservation, 3-row `.lightbox` grid layout, and `#update-popup` layering/ARIA.
+- Service worker cache v39.
+
+## v1.16.7 — 2026-11-23
+
+- **Fixed notes becoming infinitely scrollable and uneditable after removing duplicates or reopening.** Drained `MutationObserver.takeRecords()` synchronously during intentional photo removals and note opens, and added a `data-id` deduplication check inside the media guard so reopening a note never duplicates photo blocks at the bottom of the editor.
+- **Always allow typing below photo grids.** Automatically ensures an editable trailing line below photo/video blocks after opening or removing photos, and clicking empty space on the editor sheet focuses the cursor at the end.
+- **Tightened visual duplicate matching.** Added aspect-ratio and hash-entropy checks to `dHash` so dark or low-contrast photos never false-match.
+- Service worker cache v38.
+
+## v1.16.6 — 2026-11-22
+
+- **Fixed endless sync / stuck spinner bugs.** Added a circuit breaker (`flushBlockedIds`) so notes that fail with non-network errors (such as 409 conflicts or missing media) stop auto-retrying every 30 seconds until manually retried or edited; fixed orphaned `SyncJobs` entries leaving `.sync-bar` spinning; fixed the startup banner spinning whenever `outboxCount > 0` even while idle/offline/blocked; excluded lazy manifest fields from `snapshotKey` and deduplicated identical in-flight saves so autosave never re-triggers endlessly.
+- Service worker cache v37.
+
 ## v1.16.5 — 2026-11-22
 
 - **Duplicate photo prevention.** Adding photos now immediately resets the file picker, deduplicates repeated entries in the same selection, and skips photos whose SHA-256 hash already exists in the note (with a clear toast). Opening a note also cleans up any duplicate `<ks-photo>` DOM nodes.

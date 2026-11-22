@@ -218,6 +218,13 @@
     return err;
   }
 
+  function abortError() {
+    const err = new Error('Aborted');
+    err.name = 'AbortError';
+    err.isAbortError = true;
+    return err;
+  }
+
   function notConfiguredError() {
     const err = new Error('Backblaze isn\u2019t set up yet \u2014 open Settings and fill in your bucket details.');
     err.status = 401;
@@ -253,7 +260,7 @@
     let code = '';
     let message = '';
     try {
-      const t = await res.text();
+      const t = typeof res._errorText === 'string' ? res._errorText : await res.text();
       const c = /<Code>([\s\S]*?)<\/Code>/.exec(t);
       const m = /<Message>([\s\S]*?)<\/Message>/.exec(t);
       code = c ? xmlUnescape(c[1]) : '';
@@ -280,17 +287,66 @@
     return { host: config.endpoint(), bucket: config.bucket(), keyId: config.keyId(), secret: config.appKey(), region: config.region() };
   }
 
-  async function prepare(method, key, query, payloadHash, creds) {
+  const RETRY_STATUS = new Set([408, 429, 500, 502, 503, 504]);
+  const RETRY_DELAYS_MS = [800, 2400];
+  function sleep(ms, signal) {
+    if (!signal) return new Promise((r) => root.setTimeout(r, ms));
+    if (signal.aborted) return Promise.resolve();
+    return new Promise((resolve) => {
+      const onAbort = () => { root.clearTimeout(t); resolve(); };
+      const t = root.setTimeout(() => { signal.removeEventListener('abort', onAbort); resolve(); }, ms);
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+
+  function makeSignal(timeoutMs, callerSignal) {
+    if (typeof root.AbortController !== 'function') {
+      return { signal: callerSignal || undefined, cleanup() {} };
+    }
+    if (!callerSignal && !(timeoutMs > 0)) return { signal: undefined, cleanup() {} };
+    const ac = new root.AbortController();
+    let timer = null;
+    const onCallerAbort = () => { try { ac.abort(); } catch (e) {} };
+    if (callerSignal) {
+      if (callerSignal.aborted) onCallerAbort();
+      else callerSignal.addEventListener('abort', onCallerAbort, { once: true });
+    }
+    if (timeoutMs > 0) {
+      timer = root.setTimeout(() => { try { ac.abort(); } catch (e) {} }, timeoutMs);
+    }
+    return {
+      signal: ac.signal,
+      cleanup() {
+        if (timer) { root.clearTimeout(timer); timer = null; }
+        if (callerSignal) callerSignal.removeEventListener('abort', onCallerAbort);
+      },
+    };
+  }
+
+  async function prepare(method, key, query, payloadHash, creds, extraHeaders) {
     const c = resolveCreds(creds);
     const path = '/' + c.bucket + (key ? '/' + key : '');
+    const signHeaders = {};
+    const outHeaders = {};
+    if (extraHeaders) {
+      for (const k of Object.keys(extraHeaders)) {
+        const v = extraHeaders[k];
+        if (v !== undefined && v !== null && v !== '') {
+          signHeaders[k.toLowerCase()] = String(v);
+          outHeaders[k] = String(v);
+        }
+      }
+    }
     const signed = await signV4({
       method, host: c.host, path, query: query || {}, payloadHash,
       region: c.region, keyId: c.keyId, secret: c.secret,
       amzDate: nowAmzDate(),
+      headers: signHeaders,
     });
     return {
       url: 'https://' + c.host + signed.canonicalPath + (signed.canonicalQuery ? '?' + signed.canonicalQuery : ''),
       headers: {
+        ...outHeaders,
         'x-amz-date': signed.amzDate,
         'x-amz-content-sha256': payloadHash,
         'Authorization': signed.authorization,
@@ -309,45 +365,76 @@
   }
 
   // One signed request. `body` (Uint8Array) is optional. Resolves with the Response; throws
-  // a network error if the request never got an HTTP answer at all (or timed out).
+  // a network error if the request never got an HTTP answer at all (or timed out), or AbortError
+  // if the caller's signal aborted. When `readAs` ('bytes' | 'text') is set, the body is consumed
+  // before the timeout timer is cleared so stalled body downloads still time out.
   async function s3(method, key, opts) {
     const o = opts || {};
-    const timeoutMs = o.timeoutMs || DEFAULT_FETCH_TIMEOUT_MS;
+    const timeoutMs = o.timeoutMs !== undefined ? o.timeoutMs : DEFAULT_FETCH_TIMEOUT_MS;
+    const callerSignal = o.signal || null;
     const usePresignedGet = method === 'GET' && o.body === undefined && !o.forceHeaderSign;
-    let url, headers;
-    if (usePresignedGet) {
-      const req = await preparePresignedGet(key, o.query, o.creds);
-      url = req.url;
-      headers = o.headers ? { ...o.headers } : undefined;
-    } else {
-      const payloadHash = o.payloadHash || (o.body ? await sha256Hex(o.body) : EMPTY_SHA);
-      const req = await prepare(method, key, o.query, payloadHash, o.creds);
-      url = req.url;
-      headers = o.headers ? { ...req.headers, ...o.headers } : req.headers;
-    }
-    const init = { method, cache: 'no-store' };
-    if (headers && Object.keys(headers).length) init.headers = headers;
-    if (o.body !== undefined) init.body = o.body;
-    let ac = null, timer = null;
-    if (typeof root.AbortController === 'function' && timeoutMs > 0) {
-      ac = new root.AbortController();
-      init.signal = ac.signal;
-      timer = root.setTimeout(() => { try { ac.abort(); } catch (e) {} }, timeoutMs);
-    }
-    let res;
-    try { res = await root.fetch(url, init); }
-    catch (e) { throw networkError(); }
-    finally { if (timer) root.clearTimeout(timer); }
-    const gotDate = noteServerDate(res.headers.get('date'));
-    // If the device clock was skewed and Backblaze gave us its Date header, retry once with the corrected clock.
-    if (res.status === 403 && gotDate && !o._clockRetried) {
-      let clonedText = '';
-      try { clonedText = await res.clone().text(); } catch (e) {}
-      if (/RequestTimeTooSkewed/.test(clonedText)) {
-        return s3(method, key, { ...o, _clockRetried: true });
+    const payloadHash = usePresignedGet ? null : (o.payloadHash || (o.body ? await sha256Hex(o.body) : EMPTY_SHA));
+    const maxAttempts = RETRY_DELAYS_MS.length + 1;
+    let clockRetried = !!o._clockRetried;
+
+    for (let attempt = 0; attempt < maxAttempts; ) {
+      if (callerSignal && callerSignal.aborted) throw abortError();
+      let url, headers;
+      if (usePresignedGet) {
+        const req = await preparePresignedGet(key, o.query, o.creds);
+        url = req.url;
+        headers = o.headers ? { ...o.headers } : undefined;
+      } else {
+        const req = await prepare(method, key, o.query, payloadHash, o.creds, o.signHeaders);
+        url = req.url;
+        headers = o.headers ? { ...req.headers, ...o.headers } : req.headers;
       }
+      const init = { method, cache: 'no-store' };
+      if (headers && Object.keys(headers).length) init.headers = headers;
+      if (o.body !== undefined) init.body = o.body;
+      const { signal, cleanup } = makeSignal(timeoutMs, callerSignal);
+      if (signal) init.signal = signal;
+
+      let res;
+      try {
+        res = await root.fetch(url, init);
+        const gotDate = noteServerDate(res.headers.get('date'));
+        // If the device clock was skewed and Backblaze gave us its Date header, retry once with the corrected clock.
+        if (res.status === 403 && gotDate && !clockRetried) {
+          let errText = '';
+          try { errText = await res.text(); } catch (e) {}
+          if (/RequestTimeTooSkewed/.test(errText)) {
+            clockRetried = true;
+            continue;
+          }
+          res._errorText = errText;
+          return res;
+        }
+        if (RETRY_STATUS.has(res.status) && attempt < maxAttempts - 1) {
+          if (res.body && typeof res.body.cancel === 'function') {
+            try { res.body.cancel().catch(() => {}); } catch (e) {}
+          }
+        } else {
+          if (res.ok) {
+            if (o.readAs === 'bytes') res._data = new Uint8Array(await res.arrayBuffer());
+            else if (o.readAs === 'text') res._data = await res.text();
+          } else if (res.status !== 404) {
+            try { res._errorText = await res.text(); } catch (e) { res._errorText = ''; }
+          }
+          return res;
+        }
+      } catch (e) {
+        if (callerSignal && callerSignal.aborted) throw abortError();
+        throw networkError();
+      } finally {
+        cleanup();
+      }
+
+      if (callerSignal && callerSignal.aborted) throw abortError();
+      await sleep(RETRY_DELAYS_MS[attempt], callerSignal);
+      if (callerSignal && callerSignal.aborted) throw abortError();
+      attempt++;
     }
-    return res;
   }
 
   async function s3ok(method, key, opts) {
@@ -361,18 +448,21 @@
   // transient refusal (or one dropped connection while the device still says it is online) is
   // retried a couple of times before it is reported. Every attempt is signed afresh, and the
   // payload hash travels with the request, so Backblaze itself rejects a body that arrives damaged.
-  const RETRY_STATUS = new Set([408, 429, 500, 502, 503, 504]);
-  const RETRY_DELAYS_MS = [800, 2400];
-  const sleep = (ms) => new Promise((r) => root.setTimeout(r, ms));
-
-  async function putBytes(key, bytes, sha, onProgress) {
+  async function putBytes(key, bytes, sha, onProgress, opts) {
     const hash = sha || await sha256Hex(bytes);
     let lastErr = null;
+    let clockRetried = false;
     for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
       try {
-        return await putBytesOnce(key, bytes, hash, onProgress);
+        return await putBytesOnce(key, bytes, hash, onProgress, opts);
       } catch (e) {
         lastErr = e;
+        if (e.code === 'RequestTimeTooSkewed' && e._gotServerDate && clock.known() && !clockRetried && attempt === 0) {
+          clockRetried = true;
+          if (onProgress) onProgress(0, bytes.length);
+          attempt--;
+          continue;
+        }
         const online = !root.navigator || root.navigator.onLine !== false;
         const transient = (e.status && RETRY_STATUS.has(e.status)) || (e.isNetworkError && online && attempt === 0);
         if (!transient || attempt === RETRY_DELAYS_MS.length) throw e;
@@ -383,8 +473,11 @@
     throw lastErr;
   }
 
-  async function putBytesOnce(key, bytes, sha, onProgress) {
-    const req = await prepare('PUT', key, {}, sha);
+  async function putBytesOnce(key, bytes, sha, onProgress, opts) {
+    const extraHeaders = {};
+    if (opts && opts.ifMatch) extraHeaders['If-Match'] = opts.ifMatch;
+    if (opts && opts.ifNoneMatch) extraHeaders['If-None-Match'] = opts.ifNoneMatch;
+    const req = await prepare('PUT', key, {}, sha, null, extraHeaders);
     return new Promise((resolve, reject) => {
       const xhr = new root.XMLHttpRequest();
       xhr.open('PUT', req.url);
@@ -392,7 +485,7 @@
       for (const h of Object.keys(req.headers)) xhr.setRequestHeader(h, req.headers[h]);
       if (onProgress) xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(e.loaded, e.total); };
       xhr.onload = () => {
-        noteServerDate(xhr.getResponseHeader('Date'));
+        const gotDate = noteServerDate(xhr.getResponseHeader('Date'));
         if (xhr.status >= 200 && xhr.status < 300) { resolve(); return; }
         let code = '';
         let message = '';
@@ -402,7 +495,9 @@
           code = c ? xmlUnescape(c[1]) : '';
           message = m ? xmlUnescape(m[1]) : '';
         } catch (e) { /* no body */ }
-        reject(apiError(xhr.status, code, message));
+        const err = apiError(xhr.status, code, message);
+        err._gotServerDate = gotDate;
+        reject(err);
       };
       xhr.onerror = () => reject(networkError());
       xhr.ontimeout = () => reject(networkError());
@@ -411,29 +506,31 @@
     });
   }
 
-  async function getBytes(key) {
-    const res = await s3ok('GET', key);
-    try { return new Uint8Array(await res.arrayBuffer()); } catch (e) { throw networkError(); }
+  async function getBytes(key, opts) {
+    const res = await s3ok('GET', key, { ...(opts || {}), readAs: 'bytes' });
+    return res._data;
   }
 
   // One slice of an object: bytes start..end (inclusive). { bytes, partial } - partial is false if the server
   // ignored the range and sent the whole object. null if the object does not exist. (A single byte range is a
   // CORS-safelisted header, so it needs no change to the bucket's CORS rule.)
-  async function getRange(key, start, end) {
-    const res = await s3('GET', key, { headers: { Range: 'bytes=' + start + '-' + end } });
+  async function getRange(key, start, end, opts) {
+    const o = opts || {};
+    const headers = { ...(o.headers || {}), Range: 'bytes=' + start + '-' + end };
+    const res = await s3('GET', key, { ...o, headers, readAs: 'bytes' });
     if (res.status === 404) return null;
     if (!res.ok) throw await errorFromResponse(res);
-    try { return { bytes: new Uint8Array(await res.arrayBuffer()), partial: res.status === 206 }; } catch (e) { throw networkError(); }
+    return { bytes: res._data, partial: res.status === 206 };
   }
 
-  async function getText(key) { return dec.decode(await getBytes(key)); }
+  async function getText(key, opts) { return dec.decode(await getBytes(key, opts)); }
 
   // Resolves with the object's bytes, or null if it doesn't exist.
-  async function getBytesOrNull(key) {
-    const res = await s3('GET', key);
+  async function getBytesOrNull(key, opts) {
+    const res = await s3('GET', key, { ...(opts || {}), readAs: 'bytes' });
     if (res.status === 404) return null;
     if (!res.ok) throw await errorFromResponse(res);
-    try { return new Uint8Array(await res.arrayBuffer()); } catch (e) { throw networkError(); }
+    return res._data;
   }
 
   async function putText(key, text, onProgress) {
@@ -453,9 +550,8 @@
     for (let page = 0; page < 200; page++) {
       const query = { 'list-type': '2', prefix, 'max-keys': '1000' };
       if (token) query['continuation-token'] = token;
-      const res = await s3ok('GET', '', { query });
-      let xml;
-      try { xml = await res.text(); } catch (e) { throw networkError(); }
+      const res = await s3ok('GET', '', { query, readAs: 'text' });
+      const xml = res._data;
       for (const m of xml.matchAll(/<Contents>([\s\S]*?)<\/Contents>/g)) {
         const key = /<Key>([\s\S]*?)<\/Key>/.exec(m[1]);
         if (!key) continue;
@@ -482,9 +578,8 @@
   // How many bytes the bucket holds for exactly this key, or null if there is no such object.
   // (A listing by exact key works with the CORS rule the app has always needed - no HEAD required.)
   async function objectSize(key) {
-    const res = await s3ok('GET', '', { query: { 'list-type': '2', prefix: key, 'max-keys': '1' } });
-    let xml;
-    try { xml = await res.text(); } catch (e) { throw networkError(); }
+    const res = await s3ok('GET', '', { query: { 'list-type': '2', prefix: key, 'max-keys': '1' }, readAs: 'text' });
+    const xml = res._data;
     for (const m of xml.matchAll(/<Contents>([\s\S]*?)<\/Contents>/g)) {
       const k = /<Key>([\s\S]*?)<\/Key>/.exec(m[1]);
       if (!k || xmlUnescape(k[1]) !== key) continue;
@@ -540,8 +635,8 @@
   /* ---------------------------------------------------------------------- notes */
 
   const metaKey = (id) => 'meta/' + id + '.json';
-  const contentKey = (id) => 'content/' + id + '.json';
-  const vaultKey = (id) => 'vault/' + id + '.txt';
+  const contentKey = (id, rev) => (Number.isFinite(rev) && rev > 0 ? 'content/' + id + '.' + rev + '.json' : 'content/' + id + '.json');
+  const vaultKey = (id, rev) => (Number.isFinite(rev) && rev > 0 ? 'vault/' + id + '.' + rev + '.txt' : 'vault/' + id + '.txt');
   const mediaKey = (id, name) => 'media/' + id + '/' + name;
 
   function assertId(id) {
@@ -596,13 +691,35 @@
     };
   }
 
-  async function readMeta(id) {
-    const bytes = await getBytesOrNull(metaKey(id));
-    if (!bytes) return null;
-    try { return JSON.parse(dec.decode(bytes)); }
+  async function readMetaWithEtag(id) {
+    const res = await s3('GET', metaKey(id), { readAs: 'bytes' });
+    if (res.status === 404) return { meta: null, etag: null };
+    if (!res.ok) throw await errorFromResponse(res);
+    const etag = res.headers.get('etag') || null;
+    try { return { meta: JSON.parse(dec.decode(res._data)), etag }; }
     catch (e) {
-      return { id, createdAt: 0, updatedAt: 0, lockType: 'none', unlockAt: null, title: 'Damaged note (unreadable metadata)', preview: 'Metadata JSON in Backblaze could not be parsed.', corrupted: true };
+      return {
+        meta: { id, createdAt: 0, updatedAt: 0, lockType: 'none', unlockAt: null, title: 'Damaged note (unreadable metadata)', preview: 'Metadata JSON in Backblaze could not be parsed.', corrupted: true },
+        etag,
+      };
     }
+  }
+
+  async function readMeta(id) {
+    return (await readMetaWithEtag(id)).meta;
+  }
+
+  async function readContent(id, meta) {
+    const key = (meta && meta.contentKey) || contentKey(id);
+    const bytes = await getBytesOrNull(key);
+    if (!bytes) throw notFound('Note content missing');
+    return JSON.parse(dec.decode(bytes));
+  }
+
+  async function readVault(id, meta) {
+    const key = (meta && meta.vaultKey) || vaultKey(id);
+    const bytes = await getBytesOrNull(key);
+    return bytes ? dec.decode(bytes) : null;
   }
 
   function loadMetaCache() {
@@ -652,10 +769,11 @@
 
   async function getNote(id) {
     assertId(id);
-    const [metaBytes, contentBytes] = await Promise.all([getBytesOrNull(metaKey(id)), getBytesOrNull(contentKey(id))]);
+    const metaBytes = await getBytesOrNull(metaKey(id));
     if (!metaBytes) throw notFound('Not found');
-    if (!contentBytes) throw notFound('Note content missing');
-    return { meta: JSON.parse(dec.decode(metaBytes)), content: JSON.parse(dec.decode(contentBytes)) };
+    const meta = JSON.parse(dec.decode(metaBytes));
+    const content = await readContent(id, meta);
+    return { meta, content };
   }
 
   // Create and update are one idempotent path: the id always comes from the app (generated once,
@@ -669,7 +787,7 @@
       err.status = 400;
       throw err;
     }
-    const existing = await readMeta(id); // also refreshes the server clock
+    const { meta: existing, etag: existingEtag } = await readMetaWithEtag(id); // also refreshes the server clock
     // Optimistic concurrency check: if another device saved a newer revision since this edit began,
     // surface a 409 conflict instead of silently overwriting it (unless explicitly forced).
     if (existing && !existing.corrupted && !body.forceOverwrite) {
@@ -690,23 +808,65 @@
     const contentBytes = enc.encode(contentJSON);
     const meta = metaFromBody(existing && !existing.corrupted ? existing : null, { ...body, id }, now, contentBytes.length);
 
+    // Write immutable revisioned content/vault objects before atomically flipping meta/{id}.json,
+    // so an interrupted save or concurrent reader never sees half-updated content paired with old meta.
+    const newContentKey = contentKey(id, meta.rev);
+    meta.contentKey = newContentKey;
+    let newVaultKey = null;
+    if (meta.lockType === 'time' && body.password2) {
+      newVaultKey = vaultKey(id, meta.rev);
+      meta.vaultKey = newVaultKey;
+    } else if (meta.lockType === 'time' && existing && !existing.corrupted && existing.vaultKey) {
+      meta.vaultKey = existing.vaultKey;
+    }
+
     // Order: content -> vault (for time-locked notes) -> meta.
     // Meta goes last and every file is verified before proceeding, so a dropped connection
     // never leaves a listed note missing its content or its time-lock vault password.
-    await putBytes(contentKey(id), contentBytes, await sha256Hex(contentBytes), onProgress ? (loaded, total) => onProgress(total ? loaded / total : 1) : null);
-    await verifyStored(contentKey(id), contentBytes.length);
+    await putBytes(newContentKey, contentBytes, await sha256Hex(contentBytes), onProgress ? (loaded, total) => onProgress(total ? loaded / total : 1) : null);
+    await verifyStored(newContentKey, contentBytes.length);
 
-    if (meta.lockType === 'time' && body.password2) {
+    if (newVaultKey) {
       const vaultBytes = enc.encode(String(body.password2));
-      await putBytes(vaultKey(id), vaultBytes, await sha256Hex(vaultBytes), null);
-      await verifyStored(vaultKey(id), vaultBytes.length);
+      await putBytes(newVaultKey, vaultBytes, await sha256Hex(vaultBytes), null);
+      await verifyStored(newVaultKey, vaultBytes.length);
     }
 
     const metaBytes = enc.encode(JSON.stringify(meta));
-    await putBytes(metaKey(id), metaBytes, await sha256Hex(metaBytes), null);
+    const metaOpts = existing && existingEtag && !body.forceOverwrite ? { ifMatch: existingEtag } : null;
+    try {
+      await putBytes(metaKey(id), metaBytes, await sha256Hex(metaBytes), null, metaOpts);
+    } catch (e) {
+      if (e && e.status === 412) {
+        deleteObject(newContentKey).catch(() => {});
+        if (newVaultKey) deleteObject(newVaultKey).catch(() => {});
+        const serverMeta = await readMeta(id).catch(() => existing);
+        const err = new Error('This note was updated on another device since you opened it.');
+        err.status = 409;
+        err.conflict = true;
+        err.serverMeta = serverMeta || existing;
+        throw err;
+      }
+      throw e;
+    }
     await verifyStored(metaKey(id), metaBytes.length);
 
-    if (meta.lockType !== 'time') await deleteObject(vaultKey(id)).catch(() => {});
+    // Best-effort cleanup of superseded content/vault objects now that meta points to the new revision.
+    if (existing && !existing.corrupted) {
+      const prevContentKey = existing.contentKey || contentKey(id);
+      if (prevContentKey && prevContentKey !== newContentKey) {
+        await deleteObject(prevContentKey).catch(() => {});
+      }
+      const prevVaultKey = existing.vaultKey || vaultKey(id);
+      if (meta.lockType !== 'time') {
+        if (prevVaultKey) await deleteObject(prevVaultKey).catch(() => {});
+        if (prevVaultKey !== vaultKey(id)) await deleteObject(vaultKey(id)).catch(() => {});
+      } else if (meta.vaultKey && prevVaultKey && prevVaultKey !== meta.vaultKey) {
+        await deleteObject(prevVaultKey).catch(() => {});
+      }
+    } else if (meta.lockType !== 'time') {
+      await deleteObject(vaultKey(id)).catch(() => {});
+    }
 
     // The save lists every media file it refers to. Anything else stored for this note is an
     // orphan and is swept (after a grace period, see pruneMedia).
@@ -721,9 +881,12 @@
     assertId(id);
     // Media first, then content & vault, and meta last: an interrupted media delete never
     // leaves meta pointing at missing content, and the delete can simply be repeated.
+    const meta = await readMeta(id).catch(() => null);
     await deleteAllMedia(id);
-    await deleteObject(contentKey(id));
-    await deleteObject(vaultKey(id));
+    const keysToDelete = new Set([contentKey(id), vaultKey(id)]);
+    if (meta && meta.contentKey) keysToDelete.add(meta.contentKey);
+    if (meta && meta.vaultKey) keysToDelete.add(meta.vaultKey);
+    for (const k of keysToDelete) await deleteObject(k);
     await deleteObject(metaKey(id));
     return { deleted: true };
   }
@@ -744,8 +907,7 @@
       e.body = { error: 'Still locked' };
       throw e;
     }
-    const bytes = await getBytesOrNull(vaultKey(id));
-    return { password2: bytes ? dec.decode(bytes) : null };
+    return { password2: await readVault(id, meta) };
   }
 
   async function exportNote(id) {
@@ -753,8 +915,7 @@
     const { meta, content } = await getNote(id);
     let password2 = null;
     if (meta.lockType === 'time') {
-      const bytes = await getBytesOrNull(vaultKey(id));
-      password2 = bytes ? dec.decode(bytes) : null;
+      password2 = await readVault(id, meta);
     }
     const out = { meta, content, password2 };
     if (password2) out._hint = 'password2 is the value above. Combine it with your own password to open this note before its unlock date.';
@@ -775,7 +936,7 @@
   }
 
   async function deleteMedia(noteId, names) {
-    for (const name of names) await deleteObject(mediaKey(noteId, name));
+    await pool(names, 6, (name) => deleteObject(mediaKey(noteId, name)));
   }
 
   // Deletes uploads no saved version of the note refers to any more (a photo removed from the

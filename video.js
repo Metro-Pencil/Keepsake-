@@ -110,8 +110,9 @@
 
   function posterFrom(v, w, h) {
     try {
-      const cw = Math.min(640, w);
-      const ch = Math.max(1, Math.round(h * cw / w));
+      const scale = Math.min(1, 640 / Math.max(w, h));
+      const cw = Math.max(1, Math.round(w * scale));
+      const ch = Math.max(1, Math.round(h * scale));
       const c = root.document.createElement('canvas');
       c.width = cw; c.height = ch;
       c.getContext('2d').drawImage(v, 0, 0, cw, ch);
@@ -132,7 +133,7 @@
         if (finished) return;
         finished = true;
         clearTimeout(timer); clearTimeout(seekTimer);
-        v.onerror = v.onloadedmetadata = v.onseeked = v.ondurationchange = null;
+        v.onerror = v.onloadedmetadata = v.onloadeddata = v.onseeked = v.ondurationchange = null;
         v.removeAttribute('src');
         try { v.load(); } catch (e) { /* done anyway */ }
         root.URL.revokeObjectURL(url);
@@ -144,10 +145,25 @@
         const dur = isFinite(v.duration) ? v.duration : 0;
         const w = v.videoWidth; const h = v.videoHeight;
         if (!w || !h) { finish({ ok: false, dur: 0, w: 0, h: 0, poster: '' }); return; }
-        const done = () => finish({ ok: true, dur, w, h, poster: posterFrom(v, w, h) });
-        v.onseeked = done;
-        seekTimer = setTimeout(done, 2500); // a frame that never arrives shouldn't hold the dialog up
-        try { v.currentTime = dur > 0.2 ? Math.min(1, dur * 0.1) : 0.01; } catch (e) { done(); }
+        const capture = () => finish({ ok: true, dur, w, h, poster: posterFrom(v, w, h) });
+        const waitFrame = () => {
+          if (finished) return;
+          const afterReady = () => {
+            if (finished) return;
+            if (typeof v.requestVideoFrameCallback === 'function') {
+              try { v.requestVideoFrameCallback(capture); } catch (e) { requestAnimationFrame(capture); }
+            } else if (typeof root.requestAnimationFrame === 'function') {
+              root.requestAnimationFrame(capture);
+            } else {
+              capture();
+            }
+          };
+          if (v.readyState >= 2) afterReady();
+          else v.onloadeddata = () => { v.onloadeddata = null; afterReady(); };
+        };
+        v.onseeked = waitFrame;
+        seekTimer = setTimeout(capture, 2500); // a frame that never arrives shouldn't hold the dialog up
+        try { v.currentTime = dur > 0.2 ? Math.min(1, dur * 0.1) : 0.01; } catch (e) { waitFrame(); }
       };
       v.onloadedmetadata = () => {
         if (v.duration === Infinity) {
@@ -297,9 +313,19 @@
       let settled = false; let lastTime = -1; let lastMove = Date.now();
       const chunks = [];
 
+      const onWaiting = () => {
+        if (!settled && rec && rec.state === 'recording') { try { rec.pause(); } catch (e) {} }
+      };
+      const onPlaying = () => {
+        if (!settled && !doc.hidden && rec && rec.state === 'paused') { try { rec.resume(); } catch (e) {} }
+        lastMove = Date.now();
+      };
+
       const cleanup = () => {
         cancelAnimationFrame(raf); clearInterval(tick);
         doc.removeEventListener('visibilitychange', onVisibility);
+        v.removeEventListener('waiting', onWaiting);
+        v.removeEventListener('playing', onPlaying);
         try { if (rec && rec.state !== 'inactive') rec.stop(); } catch (e) { /* already stopped */ }
         if (stream) { try { stream.getTracks().forEach((t) => t.stop()); } catch (e) { /* done */ } stream = null; }
         try { v.pause(); } catch (e) { /* done */ }
@@ -312,8 +338,9 @@
       const fail = (err) => { if (settled) return; settled = true; cleanup(); reject(err); };
 
       const onVisibility = () => {
+        if (!rec) return;
         // A hidden page stops painting, which would record a frozen picture: wait, and carry on when it is back.
-        if (doc.hidden) { try { v.pause(); if (rec && rec.state === 'recording') rec.pause(); } catch (e) { /* ignore */ } }
+        if (doc.hidden) { try { v.pause(); if (rec.state === 'recording') rec.pause(); } catch (e) { /* ignore */ } }
         else {
           lastMove = Date.now();
           try {
@@ -325,6 +352,8 @@
         }
       };
       doc.addEventListener('visibilitychange', onVisibility);
+      v.addEventListener('waiting', onWaiting);
+      v.addEventListener('playing', onPlaying);
 
       v.onerror = () => fail(userError('This browser couldn\u2019t play that video to compress it.'));
       v.onloadedmetadata = async () => {
@@ -342,11 +371,23 @@
                 ]);
               }
               if (settled) return;
-              const src = actx.createMediaElementSource(v);
-              dest = actx.createMediaStreamDestination();
-              src.connect(dest);
-              audioTracks = dest.stream.getAudioTracks();
-            } catch (e) { if (actx) { try { actx.close(); } catch (e2) {} } actx = null; dest = null; }
+              if (actx.state === 'suspended') {
+                try { actx.close(); } catch (e2) {}
+                actx = null; dest = null;
+                v.muted = true;
+              } else {
+                const src = actx.createMediaElementSource(v);
+                dest = actx.createMediaStreamDestination();
+                src.connect(dest);
+                audioTracks = dest.stream.getAudioTracks();
+              }
+            } catch (e) {
+              if (actx) { try { actx.close(); } catch (e2) {} }
+              actx = null; dest = null;
+              v.muted = true;
+            }
+          } else {
+            v.muted = true;
           }
           if (settled) return;
           stream = canvas.captureStream(preset.fps);
@@ -360,6 +401,8 @@
             cleanup();
             let blob = new root.Blob(chunks, { type: mime.split(';')[0] });
             blob = await fixWebmDuration(blob, info.dur);
+            blob.ksWidth = out.w;
+            blob.ksHeight = out.h;
             resolve(blob);
           };
           v.onended = () => { try { rec.stop(); } catch (e) { fail(userError('Compressing stopped early.')); } };
@@ -368,8 +411,19 @@
             if (!v.paused && !v.ended && v.readyState >= 2) ctx.drawImage(v, 0, 0, out.w, out.h);
             raf = requestAnimationFrame(paint);
           };
-          rec.start(1000);
           await v.play();
+          if (settled) return;
+          if (v.readyState < 2) {
+            await new Promise((res) => {
+              const done = () => { v.removeEventListener('loadeddata', done); v.removeEventListener('canplay', done); clearTimeout(t); res(); };
+              const t = setTimeout(done, 3000);
+              v.addEventListener('loadeddata', done, { once: true });
+              v.addEventListener('canplay', done, { once: true });
+            });
+          }
+          if (settled) return;
+          if (v.readyState >= 2) ctx.drawImage(v, 0, 0, out.w, out.h);
+          rec.start(1000);
           paint();
           tick = setInterval(() => {
             if (o.shouldStop && o.shouldStop()) { fail({ cancelled: true, message: 'Cancelled' }); return; }
@@ -458,15 +512,27 @@
         const name = partName(v.base, i);
         let plain = null;
         const blob = await st.cacheGetBlob(noteId, name);
-        if (blob) plain = new Uint8Array(await st.blobBytes(blob));
-        else {
+        if (blob) {
+          plain = new Uint8Array(await st.blobBytes(blob));
+          const bad = plain.length !== v.parts[i].n || (v.parts[i].h && (await st.sha256Hex(plain)) !== v.parts[i].h);
+          if (bad) {
+            const info = await st.infoGet(noteId, name).catch(() => null);
+            if (info && info.pending) throw userError('A part of a video is damaged \u2014 the note can\u2019t be locked safely.');
+            await st.cacheDelete([{ id: noteId + '/' + name }]).catch(() => {});
+            plain = null;
+          }
+        }
+        if (!plain) {
           try { plain = await st.downloadBytes(noteId, name); }
           catch (e) {
             if (e.isNetworkError) throw userError('To lock this note, its video has to be re-encrypted, and part of it isn\u2019t on this device any more. Connect to the internet and try again.');
             throw userError('A part of a video is missing from this device and from your bucket, so the note can\u2019t be locked safely.');
           }
+          if (plain.length !== v.parts[i].n || (v.parts[i].h && (await st.sha256Hex(plain)) !== v.parts[i].h)) {
+            throw userError('A part of a video is damaged \u2014 the note can\u2019t be locked safely.');
+          }
+          await st.cachePut(noteId, name, new root.Blob([plain]), false, { kind: 'video', sha: v.parts[i].h || '' }).catch(() => {});
         }
-        if (plain.length !== v.parts[i].n || (v.parts[i].h && (await st.sha256Hex(plain)) !== v.parts[i].h)) throw userError('A part of a video is damaged \u2014 the note can\u2019t be locked safely.');
         const e = await st.encryptBytes(c.key, plain);
         const sha = await st.sha256Hex(e.bytes);
         await st.cachePut(noteId, partName(base, i), e.bytes, true, { kind: 'video', sha });
@@ -504,26 +570,52 @@
     const blobs = new Array(total);
     let next = 0; let done = 0; let bytesDone = 0; let failure = null;
 
+    const ac = typeof root.AbortController === 'function' ? new root.AbortController() : null;
+    const signal = ac ? ac.signal : undefined;
+    const cancelErr = () => Object.assign(new Error('Cancelled'), { cancelled: true });
+    const isAborted = () => !!(
+      (o.isCancelled && o.isCancelled()) ||
+      (o.signal && o.signal.aborted) ||
+      (signal && signal.aborted)
+    );
+    const abortNow = () => { if (ac && !ac.signal.aborted) ac.abort(); };
+    if (o.signal) {
+      if (o.signal.aborted) abortNow();
+      else if (o.signal.addEventListener) o.signal.addEventListener('abort', abortNow, { once: true });
+    }
+    let cancelPoll = 0;
+    if (ac && o.isCancelled) {
+      cancelPoll = setInterval(() => {
+        if (o.isCancelled()) { clearInterval(cancelPoll); cancelPoll = 0; abortNow(); }
+      }, 150);
+    }
+
     async function loadPart(i) {
       const p = v.parts[i]; const name = partName(v.base, i);
       let blob = await st.cacheGetBlob(noteId, name);
+      let cachedBytes = null;
       let fromCache = !!blob;
       if (blob) {
         let bad = blob.size !== p.n;
         if (!bad && p.h) {
-          const cachedBytes = new Uint8Array(await st.blobBytes(blob));
+          cachedBytes = new Uint8Array(await st.blobBytes(blob));
           if ((await st.sha256Hex(cachedBytes)) !== p.h) bad = true;
         }
         if (bad) {
+          const info = await st.infoGet(noteId, name).catch(() => null);
+          if (info && info.pending) throw userError('Part ' + (i + 1) + ' of this video waiting to upload is damaged on this device.');
           await st.cacheDelete([{ id: noteId + '/' + name }]).catch(() => {});
           blob = null;
+          cachedBytes = null;
           fromCache = false;
         }
       }
       const fetchPart = async () => {
+        if (isAborted()) throw cancelErr();
         let bytes;
-        try { bytes = await st.downloadBytes(noteId, name); }
+        try { bytes = await st.downloadBytes(noteId, name, signal ? { signal } : undefined); }
         catch (e) {
+          if ((e && e.name === 'AbortError') || isAborted()) throw cancelErr();
           if (e.isNetworkError) throw userError('This video isn\u2019t on this device yet, and there\u2019s no connection to fetch it.');
           throw userError('Part ' + (i + 1) + ' of this video is missing from your bucket.');
         }
@@ -531,18 +623,25 @@
         if (p.h && (await st.sha256Hex(bytes)) !== p.h) throw userError('Part ' + (i + 1) + ' of this video came back damaged \u2014 try again.');
         const b = new root.Blob([bytes]);
         await st.cachePut(noteId, name, b, false, { kind: 'video', sha: p.h || '' }).catch(() => {});
-        return b;
+        return { blob: b, bytes };
       };
-      if (!blob) blob = await fetchPart();
+      if (!blob) {
+        const f = await fetchPart();
+        blob = f.blob;
+        cachedBytes = f.bytes;
+      }
       if (v.enc) {
         try {
-          const plain = await st.decryptBytes(key, p.iv, new Uint8Array(await st.blobBytes(blob)));
+          const encBytes = cachedBytes || new Uint8Array(await st.blobBytes(blob));
+          const plain = await st.decryptBytes(key, p.iv, encBytes);
           return new root.Blob([plain]);
         } catch (decErr) {
           if (!fromCache) throw decErr;
+          const info = await st.infoGet(noteId, name).catch(() => null);
+          if (info && info.pending) throw decErr;
           await st.cacheDelete([{ id: noteId + '/' + name }]).catch(() => {});
-          blob = await fetchPart();
-          const plain = await st.decryptBytes(key, p.iv, new Uint8Array(await st.blobBytes(blob)));
+          const f = await fetchPart();
+          const plain = await st.decryptBytes(key, p.iv, f.bytes);
           return new root.Blob([plain]);
         }
       }
@@ -552,15 +651,21 @@
       while (!failure) {
         const i = next++;
         if (i >= total) return;
-        if (o.isCancelled && o.isCancelled()) { failure = Object.assign(new Error('Cancelled'), { cancelled: true }); return; }
-        try { blobs[i] = await loadPart(i); } catch (e) { failure = e; return; }
+        if (isAborted()) { failure = cancelErr(); abortNow(); return; }
+        try { blobs[i] = await loadPart(i); } catch (e) { if (!failure) failure = e; abortNow(); return; }
         done++; bytesDone += v.parts[i].n;
         if (o.onProgress) o.onProgress(done, total, bytesDone, totalBytes);
       }
     }
-    await Promise.all([worker(), worker(), worker()]);
+    try {
+      await Promise.all([worker(), worker(), worker()]);
+    } finally {
+      if (cancelPoll) clearInterval(cancelPoll);
+      if (o.signal && o.signal.removeEventListener) o.signal.removeEventListener('abort', abortNow);
+    }
     if (failure) throw failure;
     const blob = new root.Blob(blobs, { type: v.t });
+    blobs.length = 0;
     const url = root.URL.createObjectURL(blob);
     return { url, blob, revoke() { root.URL.revokeObjectURL(url); } };
   }

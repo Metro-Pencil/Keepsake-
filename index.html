@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <title>Keepsake</title>
 <meta name="theme-color" content="#21423A">
 <meta name="description" content="A private notebook with per-note quick locks and time locks.">
@@ -110,9 +110,11 @@
     color: var(--ink);
     font-family: var(--font-body);
     -webkit-font-smoothing: antialiased;
+    overscroll-behavior-y: contain;
   }
 
   body { padding-bottom: 64px; }
+  body.modal-open { overflow: hidden; }
 
   a, button, input, textarea { font-family: inherit; }
 
@@ -407,6 +409,7 @@
   }
 
   .brand-mark {
+    margin: 0;
     font-family: var(--font-display);
     font-weight: 600;
     font-size: 1.375rem;
@@ -736,7 +739,7 @@
   .dev-err { color: var(--brick); }
   .dev-check { display: flex; align-items: flex-start; gap: 8px; min-height: 44px; margin: 10px 0 4px; cursor: pointer; }
   .dev-check input { margin-top: 3px; width: 18px; height: 18px; flex: none; }
-  .ks-dev-ov textarea { width: 100%; box-sizing: border-box; font: 0.75rem/1.4 ui-monospace, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+  .ks-dev-ov textarea { width: 100%; box-sizing: border-box; font: 1rem/1.4 ui-monospace, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
   .dev-chip, .dev-row { -webkit-tap-highlight-color: transparent; }
 
   /* ---------- Modals ---------- */
@@ -746,7 +749,7 @@
     inset: 0;
     background: rgba(35,36,31,0.42);
     display: flex;
-    padding: var(--space-3);
+    padding: max(var(--space-3), env(safe-area-inset-top, 0px)) max(var(--space-3), env(safe-area-inset-right, 0px)) max(var(--space-3), env(safe-area-inset-bottom, 0px)) max(var(--space-3), env(safe-area-inset-left, 0px));
     z-index: var(--z-modal);
     overflow-y: auto;
     overscroll-behavior: contain;
@@ -774,6 +777,7 @@
     align-items: center;
     gap: 10px;
     padding: 18px 20px 4px;
+    flex-shrink: 0;
   }
 
   .modal-head h2 {
@@ -782,6 +786,7 @@
     font-weight: 600;
     margin: 0;
     flex: 1;
+    min-width: 0;
   }
 
   .modal-body {
@@ -791,7 +796,8 @@
 
   .field { margin-bottom: 14px; }
 
-  .field label {
+  .field label,
+  .field .field-label {
     display: block;
     font-size: 0.7812rem;
     font-weight: 600;
@@ -984,7 +990,7 @@
   }
 
   .editor-lock-status {
-    padding: 0 22px;
+    padding: 0 max(22px, env(safe-area-inset-right, 0px)) 0 max(22px, env(safe-area-inset-left, 0px));
     flex-shrink: 0;
   }
 
@@ -999,13 +1005,18 @@
     align-items: center;
     gap: 2px;
     padding: 8px max(12px, env(safe-area-inset-right, 0px)) 8px max(12px, env(safe-area-inset-left, 0px));
-    padding-bottom: max(8px, env(safe-area-inset-bottom));
+    padding-bottom: max(8px, env(safe-area-inset-bottom, 0px));
     border-top: 1px solid var(--line);
     flex-shrink: 0;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
   }
 
+  .editor-toolbar::-webkit-scrollbar { display: none; }
+
   .editor-topbar .icon-btn,
-  .editor-toolbar .icon-btn { width: 44px; height: 44px; }
+  .editor-toolbar .icon-btn { width: 44px; height: 44px; flex-shrink: 0; }
 
   .editor-toolbar .icon-btn[aria-pressed="true"] { background: var(--pine); color: var(--card); }
 
@@ -1014,7 +1025,7 @@
     display: flex;
     align-items: center;
     gap: var(--space-1);
-    padding: var(--space-1) var(--space-2);
+    padding: var(--space-1) max(var(--space-2), env(safe-area-inset-right, 0px)) var(--space-1) max(var(--space-2), env(safe-area-inset-left, 0px));
     border-top: 1px solid var(--line);
     flex-shrink: 0;
     overflow-x: auto;
@@ -1180,17 +1191,26 @@
     inset: 0;
     z-index: var(--z-lightbox);
     background: rgba(12,12,10,0.94);
-    display: flex;
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-rows: auto minmax(0, 1fr) auto auto;
     align-items: center;
-    justify-content: center;
+    justify-items: center;
+    gap: 10px 8px;
+    padding: max(12px, env(safe-area-inset-top, 0px)) max(12px, env(safe-area-inset-right, 0px)) max(14px, env(safe-area-inset-bottom, 0px)) max(12px, env(safe-area-inset-left, 0px));
   }
 
   .lightbox.hidden { display: none; }
 
   .lightbox-img {
-    max-width: 92vw;
-    max-height: 78vh;
-    max-height: 78dvh;
+    grid-row: 2;
+    grid-column: 2;
+    min-width: 0;
+    min-height: 0;
+    max-width: 100%;
+    max-height: 100%;
+    width: auto;
+    height: auto;
     object-fit: contain;
     border-radius: 6px;
     user-select: none;
@@ -1199,7 +1219,6 @@
 
   .lightbox-close,
   .lightbox-nav {
-    position: absolute;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1214,29 +1233,29 @@
   }
 
   .lightbox-close {
-    top: max(14px, env(safe-area-inset-top));
-    right: 14px;
+    grid-row: 1;
+    grid-column: 3;
+    justify-self: end;
     width: 44px; height: 44px;
   }
 
   .lightbox-nav {
-    top: 50%;
-    transform: translateY(-50%);
+    grid-row: 2;
     width: 46px; height: 46px;
   }
 
-  .lightbox-prev { left: 10px; }
-  .lightbox-next { right: 10px; }
-  /* button:active sets its own transform, which wiped translateY(-50%) and made the arrows jump down while pressed. */
-  .lightbox-nav:active { transform: translateY(-50%) scale(0.94); }
+  .lightbox-prev { grid-column: 1; justify-self: start; }
+  .lightbox-next { grid-column: 3; justify-self: end; }
+  .lightbox-nav:active { transform: scale(0.94); }
 
   .lightbox-caption {
-    position: absolute;
-    left: 0; right: 0;
-    bottom: max(18px, env(safe-area-inset-bottom));
+    grid-row: 4;
+    grid-column: 1 / -1;
+    justify-self: center;
     text-align: center;
     color: rgba(255,255,255,0.85);
     font-size: 0.8125rem;
+    max-width: 100%;
   }
 
   .icon-btn:disabled { opacity: 0.4; cursor: default; }
@@ -1244,6 +1263,7 @@
 
   .btn-row {
     display: flex;
+    flex-wrap: wrap;
     gap: 10px;
     align-items: center;
   }
@@ -1311,6 +1331,7 @@
     font-weight: 600;
     font-size: 0.875rem;
     margin-bottom: 3px;
+    padding-inline-end: 20px;
   }
 
   .lock-choice-desc {
@@ -1343,13 +1364,16 @@
 
   .toast {
     position: fixed;
-    bottom: max(22px, calc(env(safe-area-inset-bottom, 0px) + 12px));
+    bottom: calc(max(22px, calc(env(safe-area-inset-bottom, 0px) + 12px)) + var(--kb-offset, 0px));
     left: 50%;
     transform: translateX(-50%);
+    width: max-content;
+    max-width: calc(100% - 32px);
+    text-align: center;
     background: var(--ink);
     color: var(--card);
     padding: 10px 18px;
-    border-radius: 999px;
+    border-radius: 20px;
     font-size: 0.8438rem;
     box-shadow: var(--shadow);
     z-index: var(--z-toast);
@@ -1504,16 +1528,18 @@
   .quality-files .qf-size { flex: none; color: var(--ink-soft); font-variant-numeric: tabular-nums; }
   .quality-files .qf-more { color: var(--ink-soft); justify-content: center; }
   .lightbox-compress {
-    position: absolute; left: 50%; transform: translateX(-50%);
-    bottom: calc(max(18px, env(safe-area-inset-bottom)) + 30px);
+    grid-row: 3;
+    grid-column: 1 / -1;
+    justify-self: center;
     min-height: 44px; padding: 8px 18px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.45);
     background: rgba(0,0,0,0.45); color: #fff; font: inherit; font-size: 0.875rem; cursor: pointer;
   }
   .lightbox :focus-visible { outline-color: #fff; }
   /* Removing is deliberate: it lives only here, top-left (the far corner from Close), and still asks first. */
   .lightbox-remove {
-    position: absolute;
-    top: max(14px, env(safe-area-inset-top)); left: 14px;
+    grid-row: 1;
+    grid-column: 1 / 3;
+    justify-self: start;
     display: inline-flex; align-items: center; gap: 8px;
     min-height: 44px; padding: 8px 16px 8px 12px;
     border-radius: 999px; border: 1px solid rgba(255,255,255,0.45);
@@ -1779,7 +1805,7 @@
   }
   .vplayer.hidden { display: none; }
   .vp-stage { position: absolute; inset: 0; display: grid; place-items: center; }
-  .vp-video { width: 100%; height: 100%; object-fit: contain; background: #000; opacity: 0; transition: opacity 0.25s ease-out; }
+  .vp-video { width: 100%; height: 100%; min-width: 0; min-height: 0; max-width: 100%; max-height: 100%; object-fit: contain; background: #000; opacity: 0; transition: opacity 0.25s ease-out; }
   .vplayer.is-ready .vp-video { opacity: 1; }
   .vp-poster {
     position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover;
@@ -1874,9 +1900,13 @@
   .vp-time { display: inline-flex; gap: 4px; margin-inline-start: 6px; font-size: 0.8125rem; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--vp-text-soft); white-space: nowrap; }
   .vp-time > span:first-child { color: var(--vp-text); }
   .vp-grow { flex: 1; min-width: 4px; }
-  @media (max-width: 420px) {
+  @media (max-width: 520px) {
     #vp-pip { display: none; }                     /* picture-in-picture is a desktop habit; keep the row uncrowded */
     .vp-row { gap: 0; }
+  }
+  @media (max-width: 480px) {
+    #vp-back, #vp-fwd { display: none; }           /* double-tap left/right already skips ±10s */
+    .vp-time { margin-inline-start: 4px; gap: 2px; font-size: 0.75rem; }
   }
 
   /* double-tap feedback */
@@ -1925,6 +1955,9 @@
     inset-block-start: calc(max(10px, env(safe-area-inset-top, 0px)) + 50px);
     inset-inline-end: max(10px, env(safe-area-inset-right, 0px));
     min-width: 216px; padding: 6px;
+    max-height: calc(100% - 76px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
     border-radius: 14px; background: var(--vp-surface-solid); border: 1px solid var(--vp-edge);
     box-shadow: 0 16px 44px rgba(0,0,0,0.55);
     animation: vp-pop 0.16s var(--ease-out);
@@ -1937,8 +1970,14 @@
   @keyframes vp-pop { from { opacity: 0; transform: translateY(-6px) scale(0.97); } to { opacity: 1; transform: none; } }
 
   @media (min-width: 720px) {
-    .vp-top { padding-inline: 20px; }
-    .vp-bar { padding-inline: 24px; }
+    .vp-top {
+      padding-left: max(20px, env(safe-area-inset-left, 0px));
+      padding-right: max(20px, env(safe-area-inset-right, 0px));
+    }
+    .vp-bar {
+      padding-left: max(24px, env(safe-area-inset-left, 0px));
+      padding-right: max(24px, env(safe-area-inset-right, 0px));
+    }
     .vp-center { width: 88px; height: 88px; }
     .vp-center svg { width: 36px; height: 36px; }
   }
@@ -2093,7 +2132,7 @@
   .dev-select { display: flex; flex-direction: column; gap: var(--space-1); flex: 1 1 10rem; min-inline-size: 0; font-size: 0.8125rem; font-weight: 600; color: var(--ink-soft); }
   .dev-select select {
     min-block-size: 44px; inline-size: 100%; padding-inline: 12px; border: 1px solid var(--line-strong); border-radius: var(--radius-sm);
-    background: var(--card); color: var(--ink); font: 500 0.9375rem/1.2 var(--font-body);
+    background: var(--card); color: var(--ink); font: 500 1rem/1.2 var(--font-body);
   }
   .dev-access { margin: var(--space-2) 0 var(--space-3); padding: 0; border: 0; min-inline-size: 0; }
   .dev-access .dev-check { margin-block: 0; padding: var(--space-2) var(--space-3); border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--card); }
@@ -2183,7 +2222,8 @@
     .editor-screen { background: var(--paper); }
     .editor-topbar {
       background: var(--card);
-      padding-inline: max(22px, calc((100% - var(--editor-max)) / 2));
+      padding-left: max(22px, env(safe-area-inset-left, 0px), calc((100% - var(--editor-max)) / 2));
+      padding-right: max(22px, env(safe-area-inset-right, 0px), calc((100% - var(--editor-max)) / 2));
     }
     .editor-scroll {
       background: var(--paper);
@@ -2204,15 +2244,18 @@
     }
     .editor-lock-status {
       background: var(--card);
-      padding-inline: max(22px, calc((100% - var(--editor-max)) / 2));
+      padding-left: max(22px, env(safe-area-inset-left, 0px), calc((100% - var(--editor-max)) / 2));
+      padding-right: max(22px, env(safe-area-inset-right, 0px), calc((100% - var(--editor-max)) / 2));
     }
     .tool-row {
       background: var(--card);
-      padding-inline: max(18px, calc((100% - var(--editor-max)) / 2));
+      padding-left: max(18px, env(safe-area-inset-left, 0px), calc((100% - var(--editor-max)) / 2));
+      padding-right: max(18px, env(safe-area-inset-right, 0px), calc((100% - var(--editor-max)) / 2));
     }
     .editor-toolbar {
       background: var(--card);
-      padding-inline: max(18px, calc((100% - var(--editor-max)) / 2));
+      padding-left: max(18px, env(safe-area-inset-left, 0px), calc((100% - var(--editor-max)) / 2));
+      padding-right: max(18px, env(safe-area-inset-right, 0px), calc((100% - var(--editor-max)) / 2));
     }
   }
 
@@ -2221,11 +2264,45 @@
     .top-inner { padding-block: 10px; }
     main { padding-top: 16px; }
     .composer { margin-bottom: 18px; }
-    .editor-topbar { padding-block: 8px; }
+    .editor-topbar {
+      padding-top: max(8px, env(safe-area-inset-top, 0px));
+      padding-bottom: 8px;
+    }
     .editor-scroll { padding-block: 12px 16px; }
     .editor-sheet { padding-block: 18px 24px; }
-    .editor-toolbar { padding-block: 4px; }
+    .editor-toolbar {
+      padding-top: 4px;
+      padding-bottom: max(4px, env(safe-area-inset-bottom, 0px));
+    }
     .tool-row { padding-block: 2px; }
+  }
+
+  /* Short-landscape Android & half-height desktop panes: single scrollable draw row & compact chrome */
+  @media (max-height: 480px) {
+    .editor-topbar {
+      padding-top: max(4px, env(safe-area-inset-top, 0px));
+      padding-bottom: 4px;
+    }
+    .editor-scroll { padding-block: 8px; }
+    .editor-toolbar {
+      padding-top: 2px;
+      padding-bottom: max(2px, env(safe-area-inset-bottom, 0px));
+    }
+    .tool-row { padding-block: 2px; }
+    .draw-bar {
+      flex-direction: row;
+      align-items: center;
+      flex-wrap: nowrap;
+      overflow-x: auto;
+      overscroll-behavior-x: contain;
+      scrollbar-width: none;
+      gap: 4px;
+    }
+    .draw-bar::-webkit-scrollbar { display: none; }
+    .draw-row {
+      flex-wrap: nowrap;
+      flex-shrink: 0;
+    }
   }
 
   /* Narrow portrait phones & split-screen / tiled windows: stack detail readouts cleanly
@@ -2270,6 +2347,9 @@
     .size-rows li {
       grid-template-columns: minmax(0, 1fr) 48px auto;
       gap: 8px;
+    }
+    .lock-choice-row {
+      flex-direction: column;
     }
   }
   .version-badge, .size-figure, .size-text, .vprep-pct, .vp-time, .mp-time {
@@ -2329,7 +2409,7 @@
 
   /* Valid span-based lock-choice labels */
   .lock-choice-title, .lock-choice-desc { display: block; }
-  .lightbox-compress:active { transform: translateX(-50%) scale(0.96); }
+  .lightbox-compress:active { transform: scale(0.96); }
 
   /* Form validation & passphrase strength feedback (never color alone) */
   input:user-invalid, textarea:user-invalid, select:user-invalid {
@@ -2420,9 +2500,9 @@
   .update-popup {
     position: fixed;
     right: max(16px, env(safe-area-inset-right, 0px));
-    bottom: max(16px, env(safe-area-inset-bottom, 0px));
-    z-index: calc(var(--z-toast) - 10);
-    width: min(360px, calc(100vw - 32px));
+    bottom: calc(max(16px, env(safe-area-inset-bottom, 0px)) + var(--kb-offset, 0px));
+    z-index: 90;
+    width: min(360px, calc(100% - 32px));
     background: var(--card);
     border: 1px solid var(--line);
     border-left: 4px solid var(--pine);
@@ -2475,14 +2555,14 @@
     gap: 8px;
   }
   .update-popup-actions .btn {
-    min-height: 38px;
+    min-height: 44px;
     padding: 7px 14px;
     font-size: 0.8125rem;
   }
   @media (max-width: 520px) {
     .update-popup {
-      left: 16px;
-      right: 16px;
+      left: max(16px, env(safe-area-inset-left, 0px));
+      right: max(16px, env(safe-area-inset-right, 0px));
       width: auto;
     }
   }
@@ -2517,8 +2597,8 @@
 <header class="top">
   <div class="top-inner">
     <div class="brand">
-      <span class="brand-mark">Keepsake</span>
-      <span class="version-badge" id="version-badge">v1.16.5</span>
+      <h1 class="brand-mark">Keepsake</h1>
+      <span class="version-badge" id="version-badge">v1.16.7</span>
       <span class="sync-status hidden" id="sync-status" role="status" aria-live="polite"></span>
       <button class="storage-pill" id="storage-pill" type="button" data-zone="heavy" hidden>
         <span class="storage-pill-icon" id="storage-pill-icon" aria-hidden="true"></span>
@@ -3033,7 +3113,7 @@
       </section>
 
       <div class="field" style="margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--line);">
-        <label>App shell</label>
+        <div class="field-label" id="appshell-heading">App shell</div>
         <div class="btn-row">
           <button class="btn btn-ghost" id="btn-force-refresh">Force refresh</button>
         </div>
@@ -3165,7 +3245,7 @@
   </footer>
 </div>
 
-<div class="update-popup hidden" id="update-popup" role="dialog" aria-live="polite" aria-labelledby="update-popup-title">
+<div class="update-popup hidden" id="update-popup" role="region" aria-live="polite" aria-labelledby="update-popup-title">
   <div class="update-popup-head">
     <h3 class="update-popup-title" id="update-popup-title">Update available</h3>
     <span class="update-popup-ver" id="update-popup-ver"></span>

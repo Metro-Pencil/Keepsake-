@@ -143,15 +143,20 @@
         resolve(db);
       };
       req.onerror = () => { dbPromise = null; reject(req.error); };
+      req.onblocked = () => { dbPromise = null; reject(new Error('IndexedDB blocked')); };
     });
     return dbPromise;
   }
 
   async function run(stores, mode, fn) {
     const db = await openDB();
+    let tx;
+    try { tx = db.transaction(stores, mode); }
+    catch (e) {
+      if (e && e.name === 'InvalidStateError') { dbPromise = null; const db2 = await openDB(); tx = db2.transaction(stores, mode); }
+      else throw e;
+    }
     return new Promise((resolve, reject) => {
-      let tx;
-      try { tx = db.transaction(stores, mode); } catch (e) { reject(e); return; }
       let result;
       try { result = fn(tx); } catch (e) { try { tx.abort(); } catch (e2) { /* done */ } reject(e); return; }
       tx.oncomplete = () => resolve(result);
@@ -160,12 +165,19 @@
     });
   }
 
-  function req(store, method, arg) {
-    return openDB().then((db) => new Promise((resolve, reject) => {
-      const r = db.transaction(store, 'readonly').objectStore(store)[method](arg);
+  async function req(store, method, arg) {
+    const db = await openDB();
+    let tx;
+    try { tx = db.transaction(store, 'readonly'); }
+    catch (e) {
+      if (e && e.name === 'InvalidStateError') { dbPromise = null; const db2 = await openDB(); tx = db2.transaction(store, 'readonly'); }
+      else throw e;
+    }
+    return new Promise((resolve, reject) => {
+      const r = tx.objectStore(store)[method](arg);
       r.onsuccess = () => resolve(r.result);
       r.onerror = () => reject(r.error);
-    }));
+    });
   }
 
   const idOf = (noteId, name) => noteId + '/' + name;
@@ -212,14 +224,49 @@
       tx.objectStore(BLOB).put({ id, bytes: value });
       tx.objectStore(INFO).put(info);
     });
+    const evictForSpace = async (needBytes) => {
+      const all = ((await req(INFO, 'getAll')) || []).filter((i) => !i.pinned && !i.pending && !isKeyRecord(i) && i.id !== id);
+      if (!all.length) return 0;
+      all.sort((a, b) => a.used - b.used);
+      const drop = [];
+      let freed = 0;
+      const target = Math.max(needBytes || 0, 1);
+      for (const c of all) {
+        drop.push(c);
+        freed += c.size || 0;
+        if (freed >= target) break;
+      }
+      await cacheDelete(drop);
+      return drop.length;
+    };
+    const writeWithQuotaRetry = async (value) => {
+      try {
+        await write(value);
+      } catch (e) {
+        if (e && e.name === 'QuotaExceededError') {
+          const dropped = await evictForSpace(size).catch(() => 0);
+          if (dropped > 0) {
+            await write(value);
+            return;
+          }
+        }
+        throw e;
+      }
+    };
     if (blobIn) {
-      try { await write(bytes); }
-      catch (e) { await write(await blobBytes(bytes)); } // a browser that can't keep a Blob in IndexedDB: keep its bytes
+      try { await writeWithQuotaRetry(bytes); }
+      catch (e) {
+        if (e && (e.name === 'DataCloneError' || e.name === 'NotSupportedError')) {
+          await writeWithQuotaRetry(await blobBytes(bytes)); // a browser that can't keep a Blob in IndexedDB: keep its bytes
+        } else {
+          throw e;
+        }
+      }
     } else {
       // Structured cloning copies a typed array's whole underlying buffer, so only
       // hand over the buffer itself when the array covers all of it.
       const whole = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength;
-      await write(whole ? bytes.buffer : bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+      await writeWithQuotaRetry(whole ? bytes.buffer : bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
     }
     if (!pending && !info.pinned) scheduleEvict();
   }
@@ -371,8 +418,8 @@
 
   /* ------------------------------------------------------------ talking to the bucket */
 
-  async function downloadBytes(noteId, name) {
-    const bytes = await root.KSB2.getBytesOrNull(root.KSB2.mediaKey(noteId, name));
+  async function downloadBytes(noteId, name, opts) {
+    const bytes = await root.KSB2.getBytesOrNull(root.KSB2.mediaKey(noteId, name), opts);
     if (!bytes) {
       const err = new Error('A photo or audio clip is missing from your bucket');
       err.status = 404;
@@ -447,10 +494,15 @@
     // encrypted at rest from the start. Locking or unlocking a note later only re-writes the small
     // note JSON (wrapping or unwrapping mediaKey) and NEVER re-encrypts or re-uploads media files.
     const anyEncVideo = videoIds.some((id) => videos[id].enc);
+    const anyEncLazyPhoto = images.some((s) => isRef(s) && existingManifest && existingManifest[refName(s)] && existingManifest[refName(s)].iv);
     let keyB64 = await loadNoteKey(noteId);
+    if (!keyB64 && content._lazyMediaKey) {
+      keyB64 = content._lazyMediaKey;
+      await saveNoteKey(noteId, keyB64);
+    }
     if (!keyB64) {
-      if (!locked && anyEncVideo) {
-        throw uploadError('A video in this note is encrypted, but its key isn\u2019t on this device \u2014 close the note and open it again.', { userMessage: true });
+      if (anyEncLazyPhoto || anyEncVideo) {
+        throw uploadError('Missing encryption key for existing media \u2014 please reopen the note before saving.', { userMessage: true });
       }
       keyB64 = await genKeyB64();
       await saveNoteKey(noteId, keyB64);
@@ -1039,7 +1091,24 @@
 
   // For "Download": adds the stored bytes of every file the note has (still encrypted for a
   // locked note) next to the note, so the downloaded file is a complete backup.
-  async function attachToBundle(noteId, bundle, opts) {
+  function rawToB64(raw) {
+    if (typeof root.FileReader === 'function' && typeof root.Blob === 'function') {
+      const blob = isBlob(raw) ? raw : new root.Blob([raw], { type: 'application/octet-stream' });
+      return new Promise((resolve, reject) => {
+        const r = new root.FileReader();
+        r.onload = () => {
+          const s = String(r.result);
+          const comma = s.indexOf(',');
+          resolve(comma >= 0 ? s.slice(comma + 1) : s);
+        };
+        r.onerror = () => reject(r.error || new Error('Could not read media'));
+        r.readAsDataURL(blob);
+      });
+    }
+    return Promise.resolve(bytesToB64(raw instanceof Uint8Array ? raw : new Uint8Array(raw)));
+  }
+
+  async function attachToBundle(noteId, bundle, opts, activeNames) {
     const o = opts || {};
     let items;
     try { items = await list(noteId); } catch (e) {
@@ -1054,7 +1123,11 @@
       bundle._videoNote = 'This note has ' + Math.round(vbytes / 1048576) + ' MB of video in Backblaze, kept as ' + videoItems.length + ' parts under media/' + noteId + '/ (each part is named <video>.<part number>). They are not included here.';
       items = items.filter((i) => !isPartName(i.name));
     }
-    if (bundle && bundle.content && bundle.content.media && typeof bundle.content.media === 'object') {
+    const filterNames = activeNames || o.activeNames;
+    if (filterNames) {
+      const validNames = new Set(filterNames);
+      items = items.filter((i) => validNames.has(i.name));
+    } else if (bundle && bundle.content && bundle.content.media && typeof bundle.content.media === 'object') {
       const validNames = new Set(Object.keys(bundle.content.media));
       items = items.filter((i) => validNames.has(i.name));
     }
@@ -1068,10 +1141,11 @@
     if (o.onDownload) o.onDownload();
     const media = {};
     for (const item of items) {
-      let bytes = await cacheGet(noteId, item.name).catch(() => null);
-      if (bytes && item.size && bytes.length !== item.size) bytes = null;
-      if (!bytes) bytes = await downloadBytes(noteId, item.name);
-      media[item.name] = bytesToB64(bytes);
+      let raw = await cacheRecord(noteId, item.name).catch(() => null);
+      const rawSize = raw ? (isBlob(raw) ? raw.size : raw.byteLength) : 0;
+      if (raw && item.size && rawSize !== item.size) raw = null;
+      if (!raw) raw = await downloadBytes(noteId, item.name);
+      media[item.name] = await rawToB64(raw);
     }
     bundle.media = media;
     bundle._mediaHint = 'Each entry is a file from the note, base64-encoded. In the note, "ks-media:<name>" refers to media[<name>]. For a locked note these are encrypted: decrypt with AES-GCM using the note\u2019s mediaKey and each file\u2019s iv.';

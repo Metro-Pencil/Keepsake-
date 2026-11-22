@@ -76,11 +76,12 @@
       const r = root.indexedDB.open(DB_NAME, 1);
       r.onupgradeneeded = () => {
         const db = r.result;
-        db.createObjectStore('notes', { keyPath: 'id' });     // (no longer used; kept so existing databases still open)
-        db.createObjectStore('partial', { keyPath: 'id' });   // an unfinished big file: { id, size, next, chunks: [Blob] }
+        if (!db.objectStoreNames.contains('notes')) db.createObjectStore('notes', { keyPath: 'id' });     // (no longer used; kept so existing databases still open)
+        if (!db.objectStoreNames.contains('partial')) db.createObjectStore('partial', { keyPath: 'id' }); // an unfinished big file: { id, size, next, chunks: [Blob] }
       };
       r.onsuccess = () => { const db = r.result; db.onversionchange = () => { db.close(); dbp = null; }; db.onclose = () => { dbp = null; }; resolve(db); };
       r.onerror = () => { dbp = null; reject(r.error); };
+      r.onblocked = () => { dbp = null; reject(new Error('Offline storage is blocked by another open tab.')); };
     });
     return dbp;
   }
@@ -110,6 +111,8 @@
   const status = { phase: 'idle', reason: '', stages: blankStages(), current: '', partial: 0, problems: 0, error: '', startedAt: 0, picked: { image: false, audio: false, video: false } };
   let running = null;
   let stopFlag = false;
+  let runAbort = null;
+  const isQuotaError = (e) => !!(e && (e.name === 'QuotaExceededError' || e.code === 22));
   const emit = () => { try { root.dispatchEvent(new root.CustomEvent('ks-offline')); } catch (e) { /* UI only */ } };
   const go = () => !stopFlag;
   function stage(k, state, extra) { Object.assign(status.stages[k], { state }, extra || {}); emit(); }
@@ -123,15 +126,17 @@
     for (let i = 0; i < (count || 0); i++) await dbDel('partial', pid + '#' + i).catch(() => {});
   }
 
-  // One media file, whole or in slices. Returns bytes (Uint8Array) or a Blob, or null if told to stop.
-  async function fetchFile(noteId, name, size) {
+  // One media file, whole or in slices. Returns { data, cleanup } (data is Uint8Array or Blob;
+  // cleanup clears any partial chunks after the caller persists data), or null if told to stop.
+  async function fetchFile(noteId, name, size, signal) {
     const B = root.KSB2;
     const key = B.mediaKey(noteId, name);
+    const reqOpts = signal ? { signal } : undefined;
     const whole = async () => {
-      const bytes = await B.getBytesOrNull(key);
+      const bytes = await B.getBytesOrNull(key, reqOpts);
       if (!bytes) { const e = new Error('Missing from the bucket'); e.status = 404; throw e; }
       if (bytes.length !== size) throw new Error('Wrong size');
-      return bytes;
+      return { data: bytes, cleanup: null };
     };
     if (size <= WHOLE_MAX || rangeBrokenSession || !B.getRange) return whole();
 
@@ -146,25 +151,38 @@
       if (!go()) return null;
       const end = Math.min(part.next + CHUNK, size) - 1;
       let r;
-      try { r = await B.getRange(key, part.next, end); }
+      try { r = await B.getRange(key, part.next, end, reqOpts); }
       catch (e) {
+        if (!go() || (e && (e.name === 'AbortError' || e.isAbortError))) return null;
         if (e.isNetworkError && part.next === 0 && root.navigator.onLine) {
-          const bytes = await whole();               // throws the network error again if we really are offline
-          rangeBrokenSession = true;                 // session-only: don't lock out ranges forever
-          return bytes;
+          // Retry getRange once before assuming range requests are blocked in this session.
+          try { r = await B.getRange(key, part.next, end, reqOpts); }
+          catch (e2) {
+            if (!go() || (e2 && (e2.name === 'AbortError' || e2.isAbortError))) return null;
+            if (e2.isNetworkError && root.navigator.onLine) {
+              const res = await whole();             // throws the network error again if we really are offline
+              rangeBrokenSession = true;             // session-only: don't lock out ranges forever
+              return res;
+            }
+            throw e2;
+          }
+        } else {
+          throw e;
         }
-        throw e;
       }
       if (!r) { await clearPartial(pid, part.count); const e = new Error('Missing from the bucket'); e.status = 404; throw e; }
       if (!r.partial) {
-        if (r.bytes.length === size) { await clearPartial(pid, part.count); return r.bytes; }
+        if (r.bytes.length === size) return { data: r.bytes, cleanup: () => clearPartial(pid, part.count) };
         throw new Error('Wrong size');
       }
       if (r.bytes.length !== end - part.next + 1) throw new Error('A slice came back the wrong size');
-      await dbPut('partial', { id: pid + '#' + part.count, blob: new root.Blob([r.bytes]) });
-      part.count++;
-      part.next = end + 1;
-      await dbPut('partial', part);
+      const chunkRec = { id: pid + '#' + part.count, blob: new root.Blob([r.bytes]) };
+      const nextPart = { ...part, count: part.count + 1, next: end + 1 };
+      await dbReq('partial', 'readwrite', (s) => {
+        s.put(chunkRec);
+        s.put(nextPart);
+      });
+      part = nextPart;
       status.partial = part.next; emit();
     }
     const blobs = [];
@@ -174,9 +192,9 @@
       blobs.push(c.blob);
     }
     const blob = new root.Blob(blobs);
-    await clearPartial(pid, part.count);
-    if (blob.size !== size) throw new Error('Wrong size');
-    return blob;
+    if (blob.size !== size) { await clearPartial(pid, part.count); throw new Error('Wrong size'); }
+    const count = part.count;
+    return { data: blob, cleanup: () => clearPartial(pid, count) };
   }
 
   /* ------------------------------------------------------------ what a file is */
@@ -215,22 +233,27 @@
   async function syncText(meta) {
     const B = root.KSB2;
     let problems = 0;
+    let activeMeta = meta;
     const cached = await root.getCachedMeta(meta.id);
     if (!cached || !cached.hasContent || cached.contentUpdatedAt !== meta.updatedAt) {
-      const { content } = await B.getNote(meta.id);
+      const { meta: freshMeta, content } = await B.getNote(meta.id);
+      activeMeta = freshMeta || meta;
       // Re-check outbox right before caching so a concurrent local edit is never overwritten.
-      if (root.hasPendingChange && await root.hasPendingChange(meta.id)) return problems;
-      if (!allowed(meta)) return problems;
-      await root.cacheNote(meta, content);
-      const chk = await root.getCachedMeta(meta.id);
-      if (!chk || !chk.hasContent) problems++;
+      if (root.hasPendingChange && await root.hasPendingChange(activeMeta.id)) return problems;
+      if (!allowed(activeMeta)) return problems;
+      const latestCached = await root.getCachedMeta(activeMeta.id);
+      if (!(latestCached && latestCached.hasContent && latestCached.contentUpdatedAt >= activeMeta.updatedAt)) {
+        await root.cacheNote(activeMeta, content);
+        const chk = await root.getCachedMeta(activeMeta.id);
+        if (!chk || !chk.hasContent) problems++;
+      }
     }
-    if (meta.lockType === 'time' && meta.unlockAt && root.lockNow() >= meta.unlockAt) {
-      const c2 = await root.getCachedMeta(meta.id);
-      if (!(c2 && c2.vault && c2.vaultUpdatedAt === meta.updatedAt)) {
+    if (activeMeta.lockType === 'time' && activeMeta.unlockAt && root.lockNow() >= activeMeta.unlockAt) {
+      const c2 = await root.getCachedMeta(activeMeta.id);
+      if (!(c2 && c2.vault && c2.vaultUpdatedAt === activeMeta.updatedAt)) {
         try {
-          const { password2 } = await B.getVault(meta.id);
-          if (password2) await root.cacheVault(meta.id, password2, meta.updatedAt);
+          const { password2 } = await B.getVault(activeMeta.id);
+          if (password2) await root.cacheVault(activeMeta.id, password2, activeMeta.updatedAt);
           else problems++;
         } catch (e) {
           if (e.isNetworkError) throw e;
@@ -252,7 +275,7 @@
     emit();
   }
 
-  async function loop(picked) {
+  async function loop(picked, signal) {
     const B = root.KSB2;
     const S = root.KSMedia && root.KSMedia.store;
     Object.assign(status, { phase: 'running', reason: '', stages: blankStages(), current: '', partial: 0, problems: 0, error: '', startedAt: Date.now(), picked: { ...picked } });
@@ -291,7 +314,7 @@
     /* 3. which media files are needed, and what each one is */
     const work = { image: [], audio: [], video: [] };
     if (KINDS.some((k) => picked[k]) && S) {
-      const cand = notes.filter((m) => (m.mediaSize > 0) || !!(m.counts && ((m.counts.photos || 0) + (m.counts.clips || 0) + (m.counts.videos || 0) > 0)));
+      const cand = notes.filter((m) => (m.mediaSize > 0) || !!(m.counts && ((m.counts.photos || 0) + (m.counts.clips || 0) + (m.counts.videos || 0) > 0)) || (m.mediaSize === undefined && !m.counts));
       stage('plan', 'running', { done: 0, total: cand.length });
       const firstWanted = picked.image ? 'image' : 'audio';
       const infoByNote = new Map();                       // read the device's file list once, not once per note
@@ -339,14 +362,22 @@
           if (!have.pinned) await S.pin(w.noteId, w.name);
         } else {
           status.partial = 0;
-          let data;
-          try { data = await fetchFile(w.noteId, w.name, w.size); }
+          let fetched;
+          try { fetched = await fetchFile(w.noteId, w.name, w.size, signal); }
           catch (e) {
+            if (isQuotaError(e)) { halt('error', 'Device storage is full — free space or untick Videos.'); return; }
+            if (!go() || (e && (e.name === 'AbortError' || e.isAbortError))) { halt('stopped'); return; }
             if (e.isNetworkError || !root.navigator.onLine) { halt('offline', 'The connection dropped while downloading ' + LABEL[k].toLowerCase() + '.'); return; }
             status.partial = 0; status.problems++; st.done++; emit(); continue;       // this one file is the problem; carry on with the rest
           }
-          if (data === null) { halt('stopped'); return; }
-          await S.cachePut(w.noteId, w.name, data, false, { kind: w.mixed ? '' : STORE_KIND[k], pinned: true });
+          if (fetched === null) { halt('stopped'); return; }
+          try {
+            await S.cachePut(w.noteId, w.name, fetched.data, false, { kind: w.mixed ? '' : STORE_KIND[k], pinned: true });
+          } catch (e) {
+            if (isQuotaError(e)) { halt('error', 'Device storage is full — free space or untick Videos.'); return; }
+            throw e;
+          }
+          if (fetched.cleanup) await fetched.cleanup();
         }
         st.done++; st.bytes += w.size; status.partial = 0; emit();
       }
@@ -362,12 +393,22 @@
   function run(picked) {
     if (running) return running;
     stopFlag = false;
+    runAbort = typeof root.AbortController === 'function' ? new root.AbortController() : null;
+    if (root.KeepAwake) root.KeepAwake.acquire();
     running = (async () => {
-      try { await loop(picked); }
+      try { await loop(picked, runAbort ? runAbort.signal : undefined); }
       catch (e) {
-        if (e && (e.isNetworkError)) halt('offline', 'The connection dropped.');
+        if (isQuotaError(e)) halt('error', 'Device storage is full — free space or untick Videos.');
+        else if (!go() || (e && (e.name === 'AbortError' || e.isAbortError))) halt('stopped');
+        else if (e && (e.isNetworkError)) halt('offline', 'The connection dropped.');
         else halt('error', (e && e.message) || 'Something went wrong');
-      } finally { running = null; emit(); refreshHave(true); }
+      } finally {
+        if (root.KeepAwake) root.KeepAwake.release();
+        runAbort = null;
+        running = null;
+        emit();
+        refreshHave(true);
+      }
     })();
     return running;
   }
@@ -387,7 +428,10 @@
     askPersist().then((persisted) => patch({ persisted })).catch(() => {});
     return job;
   }
-  function stop() { stopFlag = true; }
+  function stop() {
+    stopFlag = true;
+    if (runAbort) { try { runAbort.abort(); } catch (e) {} }
+  }
 
   /* --------------------------------------------------- what is on this device */
 

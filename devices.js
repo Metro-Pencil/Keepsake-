@@ -186,6 +186,11 @@
     return { privateKey: pair.privateKey, pub: await subtle().exportKey('jwk', pair.publicKey) };
   }
 
+  async function toNonExtractable(privateKey) {
+    const raw = await subtle().exportKey('pkcs8', privateKey);
+    return subtle().importKey('pkcs8', raw, EC, false, ['sign']);
+  }
+
   // Does this private key really belong to the bucket's master public key?
   async function keyMatches(privateKey, pubJwk) {
     try { return await verify(pubJwk, 'ks-check', await sign(privateKey, 'ks-check')); } catch (e) { return false; }
@@ -225,11 +230,16 @@
     else if (/Mac OS X/.test(ua)) { os = 'macOS'; }
     else if (/Linux/.test(ua)) { os = 'Linux'; }
     if (hi && hi.platformVersion) {
-      if (os === 'Windows') osVer = parseInt(hi.platformVersion, 10) >= 13 ? '11' : '10';
+      if (os === 'Windows') {
+        const winMajor = parseInt(hi.platformVersion, 10);
+        if (winMajor >= 13) osVer = '11';
+        else if (winMajor >= 1) osVer = '10';
+      }
       else if (os === 'macOS' || os === 'Android') osVer = hi.platformVersion;
     }
     const model = (hi && hi.model) || '';
-    return { browser, browserVersion: ver.split('.')[0], os, osVersion: osVer.split('.').slice(0, 2).join('.'), model, mobile: !!(uad && uad.mobile) };
+    const mobile = (uad && typeof uad.mobile === 'boolean') ? uad.mobile : /Android|iPhone|iPad|Mobile/i.test(ua);
+    return { browser, browserVersion: ver.split('.')[0], os, osVersion: osVer.split('.').slice(0, 2).join('.'), model, mobile };
   }
 
   function summarize(env) {
@@ -276,11 +286,18 @@
     if (!bytes) return null;
     try { return JSON.parse(dec.decode(bytes)); } catch (e) { return null; }
   }
+  async function readJsonStrict(key) {
+    const bytes = await bucket().getBytesOrNull(key);
+    if (!bytes) return null;
+    try { return JSON.parse(dec.decode(bytes)); }
+    catch (e) { throw new Error('Bucket record ' + key + ' is corrupted; refusing to overwrite it.'); }
+  }
   const writeJson = (key, obj) => bucket().putText(key, JSON.stringify(obj));
 
   async function readMaster() { const m = await readJson(K.master); return m && m.pub && m.pub.kty ? m : null; }
   const masterExists = async () => !!(await bucket().getBytesOrNull(K.master));
   const readInbox = (id) => readJson(K.inbox(id));
+  const readInboxStrict = (id) => readJsonStrict(K.inbox(id));
   const readRecord = (id) => readJson(K.rec(id));
 
   // The inbox holds what the master has told this device: a command (block / sign out / allow) and, since 1.15,
@@ -294,33 +311,54 @@
   }
 
   async function appendLog(id, entries) {
-    const key = K.log(id, ym(entries[0].t));
-    const bytes = await bucket().getBytesOrNull(key);
-    let old = [];
-    if (bytes) {
-      let parsed;
-      try { parsed = JSON.parse(dec.decode(bytes)); }
-      catch (e) { throw new Error('Device activity log is corrupted; refusing to overwrite it.'); }
-      if (!Array.isArray(parsed)) throw new Error('Device activity log has an unexpected format; refusing to overwrite it.');
-      old = parsed;
+    if (!entries || !entries.length) return;
+    const byMonth = new Map();
+    for (const e of entries) {
+      const m = ym(e.t);
+      if (!byMonth.has(m)) byMonth.set(m, []);
+      byMonth.get(m).push(e);
     }
-    await writeJson(key, entries.concat(old).slice(0, LOG_CAP));
+    for (const [m, monthEntries] of byMonth) {
+      const key = K.log(id, m);
+      const bytes = await bucket().getBytesOrNull(key);
+      let old = [];
+      if (bytes) {
+        let parsed;
+        try { parsed = JSON.parse(dec.decode(bytes)); }
+        catch (e) { throw new Error('Device activity log is corrupted; refusing to overwrite it.'); }
+        if (!Array.isArray(parsed)) throw new Error('Device activity log has an unexpected format; refusing to overwrite it.');
+        old = parsed;
+      }
+      await writeJson(key, monthEntries.concat(old).slice(0, LOG_CAP));
+    }
   }
 
   /* ---------------------------------------------------------------- identity */
 
+  let identityPromise = null;
   async function getIdentity(create) {
     let me = await store().get('identity');
     if (me || !create) return me;
-    const pair = await subtle().generateKey(RSA, false, ['encrypt', 'decrypt']);
-    const env = await collectEnv();
-    me = {
-      id: randomId(), createdAt: now(),
-      name: env.browser + ' on ' + env.os + (env.model ? ' (' + env.model + ')' : ''),
-      privateKey: pair.privateKey, publicJwk: await subtle().exportKey('jwk', pair.publicKey),
+    if (identityPromise) return identityPromise;
+    const createOnce = async () => {
+      const existing = await store().get('identity');
+      if (existing) return existing;
+      const pair = await subtle().generateKey(RSA, false, ['encrypt', 'decrypt']);
+      const env = await collectEnv();
+      const created = {
+        id: randomId(), createdAt: now(),
+        name: env.browser + ' on ' + env.os + (env.model ? ' (' + env.model + ')' : ''),
+        privateKey: pair.privateKey, publicJwk: await subtle().exportKey('jwk', pair.publicKey),
+      };
+      await store().set('identity', created);
+      return created;
     };
-    await store().set('identity', me);
-    return me;
+    const locks = root.navigator && root.navigator.locks;
+    identityPromise = (locks && typeof locks.request === 'function'
+      ? locks.request('ks-device-identity', createOnce)
+      : createOnce()
+    ).finally(() => { identityPromise = null; });
+    return identityPromise;
   }
 
   // The master key this device holds, only if it still matches the bucket's master.
@@ -350,6 +388,7 @@
     if (await masterExists()) throw new Error('A master account already exists for this bucket. Log in to it instead.');
     const pair = await makeMasterPair();
     const wrapped = await wrapWithPassword(pair.privateKey, password);
+    if (await masterExists()) throw new Error('A master account already exists for this bucket. Log in to it instead.');
     const nonce = randomId();
     await writeJson(K.master, { v: 2, pub: pair.pub, wrapped, createdBy: me.id, nonce, createdAt: now(), changedAt: now(), gen: 1 });
     await sleep(raceMs);                               // two devices at once: verify twice with a wider gap
@@ -358,7 +397,7 @@
     await sleep(raceMs);
     const check = await readMaster();
     if (!check || check.nonce !== nonce) throw new Error('Another device created the master account at the same moment. Log in to it with its password instead.');
-    await startSession(me, check, await unwrapWithPassword(wrapped, password, false), 'created the master account');
+    await startSession(me, check, await toNonExtractable(pair.privateKey), 'created the master account');
     return check;
   }
 
@@ -377,7 +416,7 @@
   async function logoutMaster() {
     const me = await getIdentity(false);
     await store().del('master');
-    patchState({ masterSession: false, access: null });
+    patchState({ masterSession: false, access: { ...DEFAULT_ACCESS } });
     masterChanged();
     try { root.dispatchEvent(new root.CustomEvent('ks-access-changed', { detail: access() })); } catch (e) { /* UI only */ }
     if (!me) return;
@@ -394,7 +433,12 @@
     const { master, me } = await needMaster();
     if (!hasPassword(master)) throw new Error('Set a master password first.');
     const key = await unwrapWithPassword(master.wrapped, current, true);
-    await writeJson(K.master, { ...master, wrapped: await wrapWithPassword(key, next), changedAt: now() });
+    const wrapped = await wrapWithPassword(key, next);
+    const latest = await readMaster();
+    if (!latest || latest.gen !== master.gen || JSON.stringify(latest.pub) !== JSON.stringify(master.pub)) {
+      throw new Error('The master key was replaced on another device while changing the password. Log in again with the current master password.');
+    }
+    await writeJson(K.master, { ...latest, wrapped, changedAt: now() });
     try { const env = await collectEnv(); await appendLog(me.id, [entry(env, 'master', 'changed the master password')]); } catch (e) { /* log only */ }
   }
 
@@ -428,15 +472,17 @@
     }
     const fresh = { ...master, v: 2, pub: pair.pub, wrapped, gen: (master.gen || 1) + 1, rotatedAt: now(), changedAt: next ? now() : master.changedAt };
     await writeJson(K.master, fresh);                                // 2. the new key takes over
+    await startSession(me, fresh, await toNonExtractable(pair.privateKey), 'replaced the master key');
     for (const k of withCmd) {                                        // 3. tidy up: the new signature becomes the signature
-      const inbox = await readJson(k);
-      if (!inbox) continue;
-      let touched = false;
-      if (inbox.cmd && inbox.cmd.sig2) { inbox.cmd.sig = inbox.cmd.sig2; delete inbox.cmd.sig2; touched = true; }
-      if (inbox.policy && inbox.policy.sig2) { inbox.policy.sig = inbox.policy.sig2; delete inbox.policy.sig2; touched = true; }
-      if (touched) await writeJson(k, inbox);
+      try {
+        const inbox = await readJsonStrict(k);
+        if (!inbox) continue;
+        let touched = false;
+        if (inbox.cmd && inbox.cmd.sig2) { inbox.cmd.sig = inbox.cmd.sig2; delete inbox.cmd.sig2; touched = true; }
+        if (inbox.policy && inbox.policy.sig2) { inbox.policy.sig = inbox.policy.sig2; delete inbox.policy.sig2; touched = true; }
+        if (touched) await writeJson(k, inbox);
+      } catch (e) { /* best-effort tidy; sig2 remains valid */ }
     }
-    await startSession(me, fresh, await unwrapWithPassword(wrapped, password, false), 'replaced the master key');
     return fresh;
   }
 
@@ -450,7 +496,7 @@
     try { wrapped = await wrapWithPassword(key, password); } catch (e) { throw new Error('This device cannot read the old master key. Use the device where it was created, or paste the old key first.'); }
     const upgraded = { ...master, v: 2, wrapped, changedAt: now(), gen: master.gen || 1 };
     await writeJson(K.master, upgraded);
-    await startSession(me, upgraded, await unwrapWithPassword(wrapped, password, false), 'set the master password');
+    await startSession(me, upgraded, await toNonExtractable(key), 'set the master password');
   }
 
   /* ------------------------------------------------------------ the verdict */
@@ -462,7 +508,10 @@
     if (c.id !== me.id || !(await cmdValid(master.pub, c))) return { status: 'active', forged: true };
     const st = getState();
     const lastCmdAt = Number(st.lastCmdAt) || 0;
-    if (c.at < lastCmdAt) return { status: 'active', replayed: true };
+    if (c.at < lastCmdAt) {
+      if (st.lock) return { status: st.lock.kind, replayed: true, keepLock: true };
+      return { status: 'active', replayed: true };
+    }
     if (c.at > lastCmdAt) patchState({ lastCmdAt: c.at });
     if (c.action === 'block') return { status: 'blocked', cmd: c };
     if (c.action === 'terminate' && c.at !== st.handled) return { status: 'terminated', cmd: c };
@@ -522,7 +571,7 @@
     const rec = {
       v: 1, id: me.id, name: me.name, firstSeen: prev.firstSeen || me.createdAt, lastSeen: now(),
       logins: (prev.logins || 0) + (extra && extra.countLogin ? 1 : 0), env, pub: me.publicJwk,
-      ack: (extra && extra.ack) || prev.ack || null,
+      ack: (extra && extra.ack !== undefined) ? extra.ack : (prev.ack || null),
       access: (extra && extra.access) || prev.access || null,
       resumedAfter: (extra && extra.resumedAfter !== undefined) ? extra.resumedAfter : (prev.resumedAfter || null),
     };
@@ -556,7 +605,7 @@
         const hasMaster = !!master || await masterExists();       // the app never makes a master by itself: it only looks
         const myKey = await myMasterKey(master);
         const lost = !myKey && !!getState().masterSession;        // was logged in as master, and the key no longer matches
-        if (lost) { patchState({ masterSession: false }); masterChanged(); }
+        if (lost) { patchState({ masterSession: false }); store().del('master').catch(() => {}); masterChanged(); }
         const inbox = await readInbox(me.id);
         const verdict = await judge(me, master, inbox);
 
@@ -572,11 +621,18 @@
         const acc = await accessFor(me.id, master, hasMaster, inbox, !!myKey, Number(getState().lastPolicyAt) || 0);
         commitAccess(acc, hasMaster);
         let rec = null;
-        if (verdict.status !== 'active') {
+        if (verdict.status === 'blocked' || verdict.status === 'terminated') {
           // Commit local lock/wipe state FIRST before sending telemetry, and never let telemetry failures skip enforcement.
-          const ackObj = { kind: verdict.status, cmdAt: verdict.cmd.at, t: now() };
-          try { rec = await writeRecord(me, env, master, myKey, { countLogin: !skip, ack: ackObj, access: accessAck(acc) }); } catch (e) {}
-          if (entries.length) { try { await appendLog(me.id, entries); lsSet(LS.failed, '[]'); lsSet(LS.lastlog, String(now())); } catch (e) {} }
+          await commitLocalEnforcement(verdict);
+          const cmdAt = (verdict.cmd && verdict.cmd.at) || (getState().lock && getState().lock.at) || 0;
+          const ackObj = { kind: verdict.status, cmdAt, t: now() };
+          await Promise.race([
+            (async () => {
+              try { rec = await writeRecord(me, env, master, myKey, { countLogin: !skip, ack: ackObj, access: accessAck(acc) }); } catch (e) {}
+              if (entries.length) { try { await appendLog(me.id, entries); lsSet(LS.failed, '[]'); lsSet(LS.lastlog, String(now())); } catch (e) {} }
+            })(),
+            sleep(3000),
+          ]);
           const out = { ...verdict, me, rec, master, hasMaster, isMaster: !!myKey, access: acc };
           await apply(out);
           return out;
@@ -593,7 +649,8 @@
 
   // Quiet re-check while the app is open: no log entry unless something changed.
   async function poll() {
-    if (busy || !bucket() || !bucket().config.configured() || getState().lock) return null;
+    if (getState().lock) { showLock(); return null; }
+    if (busy || !bucket() || !bucket().config.configured()) return null;
     try {
       const me = await getIdentity(false);
       if (!me) return null;
@@ -608,14 +665,21 @@
         try { await writeRecord(me, await collectEnv(), master, myKey, { access: accessAck(acc) }); } catch (e) { /* shown at the next login */ }
       }
       if (verdict.status !== 'active' || lost) {
-        if (lost) { patchState({ masterSession: false }); masterChanged(); }
+        if (lost) { patchState({ masterSession: false }); store().del('master').catch(() => {}); masterChanged(); }
+        const lockedOut = verdict.status === 'blocked' || verdict.status === 'terminated';
+        if (lockedOut) await commitLocalEnforcement(verdict);
         const env = await collectEnv();
         let rec = null;
-        try { rec = await writeRecord(me, env, master, myKey, { ack: verdict.status !== 'active' ? { kind: verdict.status, cmdAt: verdict.cmd.at, t: now() } : null, access: accessAck(acc) }); } catch (e) {}
-        const logs = [];
-        if (lost) logs.push(entry(env, 'master', 'master login ended'));
-        if (verdict.status !== 'active') logs.push(entry(env, verdict.status === 'blocked' ? 'blocked' : 'signed-out', cmdDetail(verdict.cmd)));
-        if (logs.length) { try { await appendLog(me.id, logs); } catch (e) {} }
+        const sendTelemetry = async () => {
+          const cmdAt = (verdict.cmd && verdict.cmd.at) || (getState().lock && getState().lock.at) || 0;
+          try { rec = await writeRecord(me, env, master, myKey, { ack: lockedOut ? { kind: verdict.status, cmdAt, t: now() } : null, access: accessAck(acc) }); } catch (e) {}
+          const logs = [];
+          if (lost) logs.push(entry(env, 'master', 'master login ended'));
+          if (lockedOut) logs.push(entry(env, verdict.status === 'blocked' ? 'blocked' : 'signed-out', cmdDetail(verdict.cmd)));
+          if (logs.length) { try { await appendLog(me.id, logs); } catch (e) {} }
+        };
+        if (lockedOut) await Promise.race([sendTelemetry(), sleep(3000)]);
+        else await sendTelemetry();
         const out = { ...verdict, me, rec, master, isMaster: !!myKey };
         await apply(out);
         return out;
@@ -624,9 +688,27 @@
     } catch (e) { return null; }          // offline or Backblaze unhappy: keep going as before
   }
 
+  async function commitLocalEnforcement(v) {
+    const c = v.cmd;
+    if (!v.keepLock && c) {
+      const patch = {
+        lock: { kind: v.status, at: c.at, by: c.byName || '', note: c.note || '', wiped: !!c.wipe },
+        handled: v.status === 'terminated' ? c.at : getState().handled,
+        masterSession: false,
+      };
+      if (c.wipe) patch.wipePending = true;
+      patchState(patch);
+    } else {
+      patchState({ masterSession: false });
+    }
+    try { await store().del('master'); } catch (e) { /* the key is useless without the Backblaze key anyway */ }
+    masterChanged();
+    showLock();
+  }
+
   async function apply(v) {
     if (v.status === 'active') {
-      if (getState().lock) { patchState({ lock: null }); closeOverlay('ks-ov-lock'); }
+      if (!v.replayed && getState().lock) { patchState({ lock: null }); closeOverlay('ks-ov-lock'); }
     } else {
       await enforce(v);
     }
@@ -637,13 +719,25 @@
   // copies, and put up the full-screen notice. (The notice is remembered, so it also holds offline.)
   async function enforce(v) {
     const c = v.cmd;
-    patchState({ lock: { kind: v.status, at: c.at, by: c.byName || '', note: c.note || '', wiped: !!c.wipe }, handled: v.status === 'terminated' ? c.at : getState().handled, masterSession: false });
+    if (!v.keepLock && c) {
+      const patch = {
+        lock: { kind: v.status, at: c.at, by: c.byName || '', note: c.note || '', wiped: !!c.wipe },
+        handled: v.status === 'terminated' ? c.at : getState().handled,
+        masterSession: false,
+      };
+      if (c.wipe) patch.wipePending = true;
+      patchState(patch);
+    } else {
+      patchState({ masterSession: false });
+    }
     try { await store().del('master'); } catch (e) { /* the key is useless without the Backblaze key anyway */ }
     masterChanged();
     const B = bucket();
-    if (c.wipe) { patchState({ wipePending: true }); B.config.clear(); }
-    else B.config.set({ endpoint: B.config.endpoint(), bucket: B.config.bucket(), keyId: B.config.keyId(), appKey: '' });
-    if (c.wipe) { root.location.reload(); return; }
+    if (c && c.wipe) { patchState({ wipePending: true }); B.config.clear(); }
+    else if (B && B.config && B.config.configured && B.config.configured()) {
+      B.config.set({ endpoint: B.config.endpoint(), bucket: B.config.bucket(), keyId: B.config.keyId(), appKey: '' });
+    }
+    if (c && c.wipe) { root.location.reload(); return; }
     showLock();
   }
 
@@ -657,17 +751,27 @@
     const dbs = ['keepsake-drafts', 'keepsake-media', 'keepsake-offline'];
     let remaining = dbs.length;
     let failed = false;
-    const doneOne = (ok) => {
+    const finish = (ok) => {
       if (!ok) failed = true;
       remaining--;
       if (remaining === 0 && !failed) patchState({ wipePending: false });
     };
     for (const name of dbs) {
+      let settled = false;
+      let blockedTimer = null;
+      const doneOne = (ok) => {
+        if (settled) return;
+        settled = true;
+        if (blockedTimer) { clearTimeout(blockedTimer); blockedTimer = null; }
+        finish(ok);
+      };
       try {
         const req = root.indexedDB.deleteDatabase(name);
         req.onsuccess = () => doneOne(true);
         req.onerror = () => doneOne(false);
-        req.onblocked = () => doneOne(false);
+        req.onblocked = () => {
+          if (!blockedTimer && !settled) blockedTimer = setTimeout(() => doneOne(false), 1500);
+        };
       } catch (e) {
         doneOne(false);
       }
@@ -676,6 +780,15 @@
 
   /* ------------------------------------------------------------ public flow */
 
+  function ensurePolling() {
+    if (pollTimer) return;
+    pollTimer = setInterval(() => { if (!root.document || root.document.visibilityState === 'visible') poll(); }, POLL_MS);
+    if (root.document && root.document.addEventListener) {
+      root.document.addEventListener('visibilitychange', () => { if (root.document.visibilityState === 'visible') poll(); });
+    }
+    if (root.addEventListener) root.addEventListener('online', () => poll());
+  }
+
   // Called when the app opens with a saved connection. Resolves { allowed } quickly: a slow or absent
   // connection never keeps the notes from opening, but a remembered block does.
   function start(cb) {
@@ -683,11 +796,7 @@
     if (getState().lock) { showLock(); return Promise.resolve({ allowed: false }); }
     const first = checkIn('open').then((v) => { welcome(v); return { allowed: v.status === 'active' }; }).catch(() => ({ allowed: true }));
     const timeout = sleep(START_TIMEOUT_MS).then(() => ({ allowed: true }));
-    if (!pollTimer) {
-      pollTimer = setInterval(() => { if (root.document.visibilityState === 'visible') poll(); }, POLL_MS);
-      root.document.addEventListener('visibilitychange', () => { if (root.document.visibilityState === 'visible') poll(); });
-      root.addEventListener('online', () => poll());
-    }
+    ensurePolling();
     return Promise.race([first, timeout]);
   }
 
@@ -696,14 +805,27 @@
     try {
       const v = await checkIn('connect');
       if (v.status === 'active') {
-        patchState({ lock: null });
-        closeOverlay('ks-ov-lock');
+        if (!v.replayed) {
+          patchState({ lock: null, wipePending: false });
+          closeOverlay('ks-ov-lock');
+        } else if (getState().lock) {
+          showLock();
+          return { allowed: false };
+        }
+        ensurePolling();
         welcome(v);
         return { allowed: true };
       }
       return { allowed: false };
     } catch (e) {
-      if (getState().lock) { showLock(); return { allowed: false }; }
+      if (getState().lock) {
+        const B = bucket();
+        if (B && B.config && B.config.configured && B.config.configured()) {
+          B.config.set({ endpoint: B.config.endpoint(), bucket: B.config.bucket(), keyId: B.config.keyId(), appKey: '' });
+        }
+        showLock();
+        return { allowed: false };
+      }
       return { allowed: true };
     }
   }
@@ -740,9 +862,12 @@
     if (!ID_RE.test(targetId)) throw new Error('Bad device id');
     const { key, me, master } = await needMaster();
     if (targetId === me.id && action !== 'allow') throw new Error('Pick another device, not the one you are holding.');
-    const cmd = { v: 2, id: targetId, action, wipe: !!(opts && opts.wipe) && action !== 'allow', at: now(), by: me.id, byName: me.name, note: ((opts && opts.note) || '').slice(0, 200) };
+    const inbox = (await readInboxStrict(targetId)) || {};
+    const prevAt = inbox.cmd && Number.isFinite(inbox.cmd.at) ? inbox.cmd.at : 0;
+    const baseNow = (bucket().clock && bucket().clock.now) ? bucket().clock.now() : now();
+    const at = Math.max(baseNow, (prevAt || 0) + 1);
+    const cmd = { v: 2, id: targetId, action, wipe: !!(opts && opts.wipe) && action !== 'allow', at, by: me.id, byName: me.name, note: ((opts && opts.note) || '').slice(0, 200) };
     cmd.sig = await sign(key, cmdText(cmd));
-    const inbox = (await readInbox(targetId)) || {};
     inbox.cmd = cmd;
     await saveInbox(targetId, inbox);
     return cmd;
@@ -754,10 +879,12 @@
     if (!ID_RE.test(targetId)) throw new Error('Bad device id');
     const { key, me, master } = await needMaster();
     if (targetId === me.id) throw new Error('This device is a master, so it always opens everything.');
-
-    const policy = { v: 1, id: targetId, notes: !!(want && want.notes), locked: !!(want && want.locked), at: now(), by: me.id, byName: me.name };
+    const inbox = (await readInboxStrict(targetId)) || {};
+    const prevAt = inbox.policy && Number.isFinite(inbox.policy.at) ? inbox.policy.at : 0;
+    const baseNow = (bucket().clock && bucket().clock.now) ? bucket().clock.now() : now();
+    const at = Math.max(baseNow, (prevAt || 0) + 1);
+    const policy = { v: 1, id: targetId, notes: !!(want && want.notes), locked: !!(want && want.locked), at, by: me.id, byName: me.name };
     policy.sig = await sign(key, policyText(policy));
-    const inbox = (await readInbox(targetId)) || {};
     inbox.policy = policy;
     await saveInbox(targetId, inbox);
     return policy;
@@ -933,7 +1060,7 @@
       '<p class="hint dev-err" role="alert" hidden></p>',
       [{ label, kind: danger ? 'btn-danger' : 'btn-primary', keep: true, fn: async (b) => {
         const err = b.querySelector('.dev-err'); err.hidden = true;
-        const vals = Array.from(b.querySelectorAll('input[type=password],input.dev-pw')).map((i) => i.value);
+        const vals = Array.from(b.querySelectorAll('input[id^="' + id + '-f"]')).map((i) => i.value);
         const btn = b.querySelector('.dev-actions .btn'); btn.disabled = true;
         try { await run(vals); closeOverlay(id); }
         catch (e) { err.textContent = e.message || 'Something went wrong'; err.hidden = false; }
@@ -945,7 +1072,7 @@
       const meter = doc().createElement('p');
       meter.className = 'hint dev-strength';
       meter.setAttribute('aria-live', 'polite');
-      inputs[newPwIdx].parentNode.appendChild(meter);
+      (inputs[newPwIdx].closest('.field') || inputs[newPwIdx].parentNode).appendChild(meter);
       const updateStrength = () => {
         const val = inputs[newPwIdx].value || '';
         if (!val) { meter.textContent = 'Use a long passphrase (' + PW_MIN + '+ characters, e.g. 4 unrelated words).'; meter.dataset.level = ''; return; }
@@ -1025,12 +1152,17 @@
     const me = await getIdentity(false).catch(() => null);
     if (!me) { slot.innerHTML = '<p class="hint">This device registers itself the first time it connects to your bucket.</p>'; return; }
     slot.innerHTML = '<p class="hint">Looking for a master account…</p>';
-    let master = null, isMaster = false, unreachable = false;
-    try { master = await readMaster(); isMaster = !!(await myMasterKey(master)); } catch (e) { unreachable = true; }
+    let master = null, isMaster = false, unreachable = false, masterDamaged = false;
+    try {
+      master = await readMaster();
+      if (!master) masterDamaged = await masterExists();
+      else isMaster = !!(await myMasterKey(master));
+    } catch (e) { unreachable = true; }
     const pw = hasPassword(master);
     const btn = (k, label, cls) => '<button class="btn ' + (cls || 'btn-ghost') + '" data-d="' + k + '">' + label + '</button>';
     let buttons, hint;
     if (unreachable) { buttons = btn('retry', 'Try again'); hint = 'Could not reach your bucket to look for a master account.'; }
+    else if (masterDamaged) { buttons = btn('retry', 'Try again') + btn('mine', 'This device’s info'); hint = 'The master account file (devices/_master.json) in your bucket is damaged and cannot be read. Restore it from a backup or delete devices/_master.json in Backblaze before creating a new master account.'; }
     else if (!master) { buttons = btn('create', 'Create master account', 'btn-primary'); hint = 'There is no master account yet. Create one to see every device and sign out or block devices from any device, with one password.'; }
     else if (isMaster && pw) {
       buttons = btn('manage', 'Manage devices', 'btn-primary') + btn('change', 'Change password') + btn('replace', 'Replace master key') + btn('logout', 'Log out of master');
@@ -1216,14 +1348,40 @@
       const dirty = () => { saveBtn.disabled = nBox.checked === !!acc.notes && lBox.checked === !!acc.locked; };
       nBox.onchange = dirty; lBox.onchange = dirty;
     }
+    let inFlight = false;
+    const setBusy = (busyNow) => {
+      inFlight = busyNow;
+      body.querySelectorAll('[data-a]').forEach((el) => {
+        if (el.dataset.a === 'log') return;
+        if (busyNow) {
+          el.dataset.prevDisabled = el.disabled ? '1' : '';
+          el.disabled = true;
+        } else if (el.id === 'ks-acc-save') {
+          const nBox = body.querySelector('#ks-acc-notes'), lBox = body.querySelector('#ks-acc-locked');
+          el.disabled = !!(nBox && lBox && nBox.checked === !!acc.notes && lBox.checked === !!acc.locked);
+        } else {
+          el.disabled = el.dataset.prevDisabled === '1';
+        }
+      });
+    };
     body.onclick = (e) => {
       const b = e.target.closest('[data-a]'); if (!b) return;
       const a = b.dataset.a, nm = rec.name || 'this device';
-      const run = (fn, msg) => async () => { try { await fn(); await done(msg); } catch (err) { say(err.message); } };
+      if (inFlight && a !== 'log') return;
+      const run = (fn, msg) => async () => {
+        if (inFlight) return;
+        setBusy(true);
+        try { await fn(); await done(msg); } catch (err) { say(err.message); } finally { setBusy(false); }
+      };
       if (a === 'log') openLog(id).catch((err) => say(err.message));
       else if (a === 'access') {
         const want = { notes: body.querySelector('#ks-acc-notes').checked, locked: body.querySelector('#ks-acc-locked').checked };
-        const apply = async () => { try { await setAccess(id, want); await done('Saved: ' + nm + ' opens ' + (want.notes && want.locked ? 'notes and locked notes' : want.notes ? 'notes only' : want.locked ? 'locked notes only' : 'nothing')); } catch (err) { say(err.message); } };
+        const apply = async () => {
+          if (inFlight) return;
+          setBusy(true);
+          try { await setAccess(id, want); await done('Saved: ' + nm + ' opens ' + (want.notes && want.locked ? 'notes and locked notes' : want.notes ? 'notes only' : want.locked ? 'locked notes only' : 'nothing')); }
+          catch (err) { say(err.message); } finally { setBusy(false); }
+        };
         if (!want.notes && !want.locked) ask('Switch off everything for ' + nm + '?', 'It will show no notes at all until you switch something back on. Its saved copies of them are removed from that device.', apply, 'Switch off', true);
         else apply();
       }
@@ -1268,19 +1426,27 @@
     openOverlay('ks-ov-lock');
   }
 
-  function wireEscape() {
-    doc().addEventListener('keydown', (e) => {
-      if (e.key !== 'Escape') return;
-      const open = Array.from(doc().querySelectorAll('.ks-dev-ov:not(.hidden):not(#ks-ov-lock)')).pop();
-      if (open) closeOverlay(open.id);
-    });
-  }
-
   /* --------------------------------------------------------------- start-up */
 
   runPendingWipe();
+  if (root.addEventListener) {
+    root.addEventListener('storage', (e) => {
+      if (e.key !== LS.state) return;
+      let prev = {}, next = {};
+      try { prev = JSON.parse(e.oldValue || '{}') || {}; } catch (_) {}
+      try { next = JSON.parse(e.newValue || '{}') || {}; } catch (_) {}
+      if (next.lock) showLock();
+      else if (prev.lock && !next.lock) closeOverlay('ks-ov-lock');
+      if (!!prev.masterSession !== !!next.masterSession) masterChanged();
+      const pAcc = prev.access || null, nAcc = next.access || null;
+      const accChanged = (!!pAcc !== !!nAcc) || (pAcc && nAcc && (!!pAcc.notes !== !!nAcc.notes || !!pAcc.locked !== !!nAcc.locked)) || prev.hasMaster !== next.hasMaster || (!!prev.masterSession !== !!next.masterSession);
+      if (accChanged) {
+        try { root.dispatchEvent(new root.CustomEvent('ks-access-changed', { detail: access() })); } catch (_) { /* UI only */ }
+      }
+    });
+  }
   if (root.document) {
-    const ready = () => { wireEscape(); if (getState().lock) showLock(); };
+    const ready = () => { if (getState().lock) showLock(); };
     if (root.document.readyState === 'loading') root.document.addEventListener('DOMContentLoaded', ready); else ready();
   }
 
