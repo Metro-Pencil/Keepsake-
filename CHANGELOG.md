@@ -6,6 +6,12 @@ All notable changes to this project are recorded here, following
 small — gets a version bump. If the version number hasn't moved,
 nothing changed; that's the whole point of keeping one.
 
+## v1.16.5 — 2026-11-22
+
+- **Duplicate photo prevention.** Adding photos now immediately resets the file picker, deduplicates repeated entries in the same selection, and skips photos whose SHA-256 hash already exists in the note (with a clear toast). Opening a note also cleans up any duplicate `<ks-photo>` DOM nodes.
+- **Find & remove duplicate photos in existing notes.** Added a "Find duplicate photos" tool (in both the editor toolbar and the Note Size dialog) that scans all photos in a note (including lazy-loaded locked photos) using both exact SHA-256 hashing and 64-bit perceptual hashing (`dHash`) to catch exact and re-compressed duplicates, pre-selecting extra copies while keeping the highest-quality copy for one-tap removal.
+- Service worker cache v36.
+
 ## v1.16.4 — 2026-11-20
 
 - **Fixed vertical single-letter text wrapping across all screen sizes and aspect ratios.** Replaced fragile `auto 1fr` + `overflow-wrap: anywhere` grid tracks in Offline Copy steps (`.off-step`), device details (`.dev-facts`), storage inventory (`.off-have`), startup steps (`.boot-step`), and upload progress rows (`.sync-step`) with safe `minmax(0, 1fr)` tracks and clean 2-line stacking on narrow portrait/split windows.

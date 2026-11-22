@@ -3419,9 +3419,13 @@ function setEditorContent(content) {
     editorPhotos[id] = s;
     loose.push(id);
   });
-  // A photo element whose picture is gone is dropped; a picture with no element yet (notes from before
-  // photos could sit in the text kept them in a row under it) goes in one grid at the end.
-  bodyEl.querySelectorAll('ks-photo').forEach((el) => { if (!editorPhotos[el.getAttribute('data-id')]) el.remove(); });
+  // Drop any orphaned or duplicate <ks-photo data-id> DOM nodes so one id never renders twice.
+  const seenPhotoDomIds = new Set();
+  bodyEl.querySelectorAll('ks-photo').forEach((el) => {
+    const id = el.getAttribute('data-id');
+    if (!editorPhotos[id] || seenPhotoDomIds.has(id)) { el.remove(); return; }
+    seenPhotoDomIds.add(id);
+  });
   const placed = new Set(Array.from(bodyEl.querySelectorAll('ks-photo')).map((el) => el.getAttribute('data-id')));
   const unplaced = loose.filter((id) => !placed.has(id));
   if (unplaced.length) {
@@ -4660,11 +4664,23 @@ function wireStaticEvents() {
     document.getElementById('input-image').click();
   });
   document.getElementById('input-image').addEventListener('change', async (e) => {
-    const files = Array.from(e.target.files || []);
-    if (!files.length) return;
+    const rawFiles = Array.from(e.target.files || []);
+    e.target.value = ''; // reset immediately so a browser quirk can never fire the same batch twice
+    if (!rawFiles.length) return;
+
+    // Deduplicate identical File entries within the same picker selection first.
+    const seenFileKeys = new Set();
+    const files = [];
+    let skippedDupes = 0;
+    for (const f of rawFiles) {
+      const fk = `${f.name}|${f.size}|${f.lastModified}`;
+      if (seenFileKeys.has(fk)) { skippedDupes++; continue; }
+      seenFileKeys.add(fk);
+      files.push(f);
+    }
 
     const mode = await askMediaQuality('photo', files);
-    if (!mode) { e.target.value = ''; return; }
+    if (!mode) return;
 
     const attachBtn = document.getElementById('btn-attach-image');
     attachBtn.disabled = true;
@@ -4674,6 +4690,9 @@ function wireStaticEvents() {
     const targetNoteId = editingNoteId; // photos belong to the note they were picked for
     const batch = beginPhotoBatch(); // they go in the text, between lines, as one grid
 
+    // Collect exact content hashes of photos already in this note so re-picking the same photo is skipped.
+    const existingHashes = await existingNotePhotoHashes(targetNoteId);
+
     const results = [];
     for (let i = 0; i < files.length; i++) {
       const verb = mode === 'original' ? 'Adding' : 'Compressing';
@@ -4681,11 +4700,14 @@ function wireStaticEvents() {
       syncBarSet(`${what} \u00b7 ${Math.round(i / files.length * 100)}%`, i / files.length);
       try {
         const dataUrl = await fileToStoredDataURL(files[i], mode);
-        results.push(`${formatBytes(files[i].size)} \u2192 ${formatBytes(estimateImageBytes(dataUrl))}`);
         // Compression is slow; if you've since opened a different note, these
         // must not be attached to it.
         if (!editorShowing(targetNoteId)) { dropped++; continue; }
+        const hash = await dataUrlSha256(dataUrl);
+        if (hash && existingHashes.has(hash)) { skippedDupes++; continue; }
         if (!canFitMedia(dataUrl.length + 4).ok) { refused++; continue; }
+        if (hash) existingHashes.add(hash);
+        results.push(`${formatBytes(files[i].size)} \u2192 ${formatBytes(estimateImageBytes(dataUrl))}`);
         addPhotoToBatch(batch, dataUrl); // shown as soon as it's ready, not all at once at the end
         updateSizeMeter();
         onEditorContentChanged();
@@ -4698,8 +4720,9 @@ function wireStaticEvents() {
     if (mode === 'compressed' && results.length) syncBarSuccess(results.length === 1 ? `Compressed: ${results[0]}` : `Compressed ${results.length} photos`);
     else syncBarHideSoon(700);
     attachBtn.disabled = false;
-    e.target.value = '';
-
+    if (skippedDupes) {
+      toast(skippedDupes === 1 ? 'Skipped 1 duplicate photo already in this note' : `Skipped ${skippedDupes} duplicate photos already in this note`);
+    }
     if (dropped) {
       toast(dropped === 1 ? 'A photo wasn\u2019t added \u2014 you left that note first' : `${dropped} photos weren\u2019t added \u2014 you left that note first`);
     }
@@ -5004,6 +5027,8 @@ function updateSizeMeter() {
   document.getElementById('size-text').textContent = `${formatBytes(b.total)} / ${NOTE_LIMIT_LABEL}`;
   document.getElementById('size-fill').style.transform = `scaleX(${Math.min(1, b.total / NOTE_TOTAL_LIMIT).toFixed(4)})`;
   btn.setAttribute('aria-label', `Note size: ${formatBytes(b.total)} of 150 megabytes. ${ZONE_WORD[zone]}. Open details.`);
+  const dupToolbarBtn = document.getElementById('btn-find-dupes');
+  if (dupToolbarBtn) dupToolbarBtn.style.display = b.photoCount >= 2 ? '' : 'none';
   if (!document.getElementById('overlay-size').classList.contains('hidden')) renderSizeDialog(b);
 }
 
@@ -5036,6 +5061,8 @@ function renderSizeDialog(b) {
   if (b.clips) rows.push([`Audio (${b.clips} clip${b.clips === 1 ? '' : 's'})`, b.audio]);
   if (b.drawing) rows.push(['Drawing', b.drawing]);
   if (b.locked) rows.push(['Lock encryption', b.lockExtra]);
+  const sizeDupBtn = document.getElementById('btn-size-find-dupes');
+  if (sizeDupBtn) sizeDupBtn.hidden = b.photoCount < 2;
   document.getElementById('size-rows').innerHTML = rows.map(([label, bytes]) =>
     `<li><span class="size-row-label">${escapeHTML(label)}</span>` +
     `<span class="size-row-bar" aria-hidden="true"><span style="transform:scaleX(${Math.min(1, bytes / Math.max(1, b.total)).toFixed(3)})"></span></span>` +
@@ -7103,6 +7130,330 @@ function init() {
     navigator.serviceWorker.register('sw.js').catch(() => { /* offline shell is a nice-to-have */ });
   }
   setupVersionChecker();
+  setupDuplicateFinder();
+}
+
+/* ---------------------------------------------------------------------
+ * Duplicate photo prevention & existing-note duplicate finder
+ *
+ * Uses TWO signals:
+ *   1. Exact SHA-256 hash of the photo bytes (catches 100% identical copies)
+ *   2. 64-bit perceptual difference hash (dHash on a 9x8 grayscale grid,
+ *      Hamming distance <= 4) to also catch re-compressed / near-identical
+ *      copies (e.g. the same photo saved twice at 146 KB and 147 KB).
+ * ------------------------------------------------------------------- */
+
+async function sha256HexBytes(bytes) {
+  if (!crypto || !crypto.subtle) return '';
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function dataUrlSha256(dataUrl) {
+  try {
+    const comma = String(dataUrl || '').indexOf(',');
+    if (comma < 0) return '';
+    const bin = atob(dataUrl.slice(comma + 1));
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return await sha256HexBytes(bytes);
+  } catch (e) { return ''; }
+}
+
+async function existingNotePhotoHashes(noteId) {
+  const hashes = new Set();
+  const ids = photoIdsInBody();
+  // Fast lookup from IndexedDB plainSha metadata for lazy ks-media: photos
+  const plainByName = new Map();
+  if (window.KSMedia && KSMedia.store && KSMedia.store.infoForNote && noteId) {
+    try {
+      const infos = await KSMedia.store.infoForNote(noteId);
+      for (const inf of infos) if (inf && inf.name && inf.plainSha) plainByName.set(inf.name, inf.plainSha);
+    } catch (e) { /* best-effort */ }
+  }
+  for (const id of ids) {
+    const src = editorPhotos[id];
+    if (!src) continue;
+    if (isLazyPhotoRef(src)) {
+      const name = KSMedia.refName(src);
+      const h = plainByName.get(name);
+      if (h) hashes.add(h);
+    } else if (/^data:image\//.test(src)) {
+      const h = await dataUrlSha256(src);
+      if (h) hashes.add(h);
+    }
+  }
+  return hashes;
+}
+
+// Computes a 64-bit dHash (returned as two 32-bit unsigned ints [hi, lo]) from a Blob.
+async function computeDHash(blob) {
+  let bitmap;
+  try { bitmap = await createImageBitmap(blob); } catch (e) { return null; }
+  try {
+    const canvas = document.createElement('canvas');
+    canvas.width = 9;
+    canvas.height = 8;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(bitmap, 0, 0, 9, 8);
+    const data = ctx.getImageData(0, 0, 9, 8).data;
+    let hi = 0, lo = 0, bit = 0;
+    for (let y = 0; y < 8; y++) {
+      for (let x = 0; x < 8; x++) {
+        const i1 = (y * 9 + x) * 4;
+        const i2 = (y * 9 + x + 1) * 4;
+        const g1 = data[i1] * 0.299 + data[i1 + 1] * 0.587 + data[i1 + 2] * 0.114;
+        const g2 = data[i2] * 0.299 + data[i2 + 1] * 0.587 + data[i2 + 2] * 0.114;
+        if (g1 > g2) {
+          if (bit < 32) hi = (hi | (1 << bit)) >>> 0;
+          else lo = (lo | (1 << (bit - 32))) >>> 0;
+        }
+        bit++;
+      }
+    }
+    return [hi, lo];
+  } finally {
+    if (bitmap.close) bitmap.close();
+  }
+}
+
+function popcount32(x) {
+  x = x - ((x >>> 1) & 0x55555555);
+  x = (x & 0x33333333) + ((x >>> 2) & 0x33333333);
+  return (((x + (x >>> 4)) & 0x0f0f0f0f) * 0x01010101) >>> 24;
+}
+
+function dHashDistance(a, b) {
+  if (!a || !b) return 64;
+  return popcount32((a[0] ^ b[0]) >>> 0) + popcount32((a[1] ^ b[1]) >>> 0);
+}
+
+let dupesScanToken = 0;
+let dupesSelectedIds = new Set();
+
+function closeDuplicateFinder() {
+  dupesScanToken++;
+  hide('overlay-dupes');
+}
+
+function updateDupesRemoveButton() {
+  const btn = document.getElementById('btn-dupes-remove');
+  if (!btn) return;
+  const n = dupesSelectedIds.size;
+  if (n > 0) {
+    let bytes = 0;
+    for (const id of dupesSelectedIds) bytes += estimateImageBytes(editorPhotos[id]);
+    btn.hidden = false;
+    btn.disabled = false;
+    btn.textContent = `Remove ${n} ${n === 1 ? 'photo' : 'photos'} (${formatBytes(bytes)})`;
+  } else {
+    btn.hidden = true;
+  }
+}
+
+async function openDuplicateFinder() {
+  const noteId = editingNoteId;
+  const ids = photoIdsInBody();
+  if (ids.length < 2) { toast('Need at least 2 photos to check for duplicates'); return; }
+
+  hide('overlay-size');
+  const myToken = ++dupesScanToken;
+  dupesSelectedIds = new Set();
+
+  const prog = document.getElementById('dupes-prog');
+  const progLabel = document.getElementById('dupes-prog-label');
+  const fill = document.getElementById('dupes-fill');
+  const track = document.getElementById('dupes-track');
+  const summary = document.getElementById('dupes-summary');
+  const groupsEl = document.getElementById('dupes-groups');
+  const removeBtn = document.getElementById('btn-dupes-remove');
+
+  prog.hidden = false;
+  fill.style.transform = 'scaleX(0)';
+  track.setAttribute('aria-valuenow', '0');
+  progLabel.textContent = `Scanning 0 of ${ids.length} photos\u2026`;
+  summary.textContent = 'Checking for exact and visually identical duplicate photos in this note.';
+  groupsEl.textContent = '';
+  removeBtn.hidden = true;
+  show('overlay-dupes');
+
+  const records = [];
+  for (let i = 0; i < ids.length; i++) {
+    if (myToken !== dupesScanToken || editingNoteId !== noteId) return;
+    const id = ids[i];
+    const src = editorPhotos[id];
+    const pct = Math.round(((i + 1) / ids.length) * 100);
+    progLabel.textContent = `Scanning photo ${i + 1} of ${ids.length}\u2026 (${pct}%)`;
+    fill.style.transform = `scaleX(${((i + 1) / ids.length).toFixed(3)})`;
+    track.setAttribute('aria-valuenow', String(pct));
+
+    try {
+      let blob = null;
+      let thumbUrl = thumbUrls.get(mediaSig(src)) || '';
+      if (isLazyPhotoRef(src)) {
+        const resolved = await resolveLazyBlob(src, noteId);
+        blob = resolved.blob;
+        if (!thumbUrl) thumbUrl = resolved.fullUrl;
+      } else {
+        blob = await (await fetch(src)).blob();
+        if (!thumbUrl) thumbUrl = src;
+      }
+      const ab = await blob.arrayBuffer();
+      const sha = await sha256HexBytes(new Uint8Array(ab));
+      const dhash = await computeDHash(blob);
+      records.push({ id, index: i + 1, size: blob.size || estimateImageBytes(src), sha, dhash, thumbUrl, ref: isLazyPhotoRef(src) ? src : '' });
+    } catch (e) { /* skip unreadable/offline photo */ }
+  }
+
+  if (myToken !== dupesScanToken || editingNoteId !== noteId) return;
+  prog.hidden = true;
+
+  // Union-Find grouping: exact match (same ref or same SHA-256) OR visual match (dHash Hamming distance <= 4)
+  const parent = records.map((_, i) => i);
+  const groupKind = new Map(); // root -> 'exact' | 'visual'
+  const find = (x) => { while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
+  const unite = (a, b, kind) => {
+    const ra = find(a), rb = find(b);
+    if (ra === rb) {
+      if (kind === 'visual' && groupKind.get(ra) !== 'exact') groupKind.set(ra, 'visual');
+      return;
+    }
+    parent[rb] = ra;
+    const prev = groupKind.get(ra) || groupKind.get(rb);
+    groupKind.set(ra, (prev === 'visual' || kind === 'visual') ? 'visual' : 'exact');
+  };
+
+  const bySha = new Map();
+  for (let i = 0; i < records.length; i++) {
+    const r = records[i];
+    if (r.sha) {
+      if (bySha.has(r.sha)) unite(bySha.get(r.sha), i, 'exact');
+      else bySha.set(r.sha, i);
+    }
+    for (let j = 0; j < i; j++) {
+      if (find(i) === find(j)) continue;
+      if (r.ref && r.ref === records[j].ref) { unite(j, i, 'exact'); continue; }
+      if (dHashDistance(r.dhash, records[j].dhash) <= 4) unite(j, i, 'visual');
+    }
+  }
+
+  const buckets = new Map();
+  for (let i = 0; i < records.length; i++) {
+    const root = find(i);
+    if (!buckets.has(root)) buckets.set(root, []);
+    buckets.get(root).push(records[i]);
+  }
+
+  const dupeGroups = [];
+  for (const [root, items] of buckets.entries()) {
+    if (items.length > 1) dupeGroups.push({ kind: groupKind.get(root) || 'exact', items });
+  }
+
+  if (!dupeGroups.length) {
+    summary.textContent = `Checked all ${records.length} photos — no duplicates found.`;
+    updateDupesRemoveButton();
+    return;
+  }
+
+  let totalExtra = 0;
+  let totalFreed = 0;
+  groupsEl.textContent = '';
+
+  dupeGroups.forEach((g, gi) => {
+    // Keep the largest (highest quality) copy by default; pre-select the extra copies for removal.
+    let keepIdx = 0;
+    for (let k = 1; k < g.items.length; k++) {
+      if (g.items[k].size > g.items[keepIdx].size) keepIdx = k;
+    }
+
+    const card = document.createElement('div');
+    card.className = 'dupes-group';
+    const head = document.createElement('div');
+    head.className = 'dupes-group-head';
+    const title = document.createElement('span');
+    title.className = 'dupes-group-title';
+    title.textContent = `Group ${gi + 1} · ${g.items.length} copies`;
+    const badge = document.createElement('span');
+    badge.className = 'dupes-badge';
+    badge.dataset.kind = g.kind;
+    badge.textContent = g.kind === 'exact' ? 'Exact duplicate' : 'Visual match';
+    head.append(title, badge);
+    card.appendChild(head);
+
+    const grid = document.createElement('div');
+    grid.className = 'dupes-items';
+
+    g.items.forEach((item, idx) => {
+      const checked = idx !== keepIdx;
+      if (checked) { dupesSelectedIds.add(item.id); totalExtra++; totalFreed += item.size; }
+
+      const label = document.createElement('label');
+      label.className = 'dupes-item' + (checked ? ' is-selected' : '');
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = checked;
+      cb.setAttribute('aria-label', `Remove photo #${item.index} (${formatBytes(item.size)})`);
+
+      const img = document.createElement('img');
+      img.alt = `Photo #${item.index}`;
+      img.src = item.thumbUrl;
+
+      const meta = document.createElement('div');
+      meta.className = 'dupes-item-meta';
+      const pos = document.createElement('span');
+      pos.textContent = `#${item.index} · ${formatBytes(item.size)}`;
+      const tag = document.createElement('span');
+      tag.className = 'dupes-item-tag';
+      tag.textContent = checked ? 'Remove' : 'Keep';
+      meta.append(pos, tag);
+
+      cb.addEventListener('change', () => {
+        if (cb.checked) dupesSelectedIds.add(item.id);
+        else dupesSelectedIds.delete(item.id);
+        label.classList.toggle('is-selected', cb.checked);
+        tag.textContent = cb.checked ? 'Remove' : 'Keep';
+        updateDupesRemoveButton();
+      });
+
+      label.append(cb, img, meta);
+      grid.appendChild(label);
+    });
+
+    card.appendChild(grid);
+    groupsEl.appendChild(card);
+  });
+
+  summary.textContent = `Found ${totalExtra} duplicate ${totalExtra === 1 ? 'photo' : 'photos'} across ${dupeGroups.length} ${dupeGroups.length === 1 ? 'group' : 'groups'} (${formatBytes(totalFreed)} can be freed). Review and tap Remove below.`;
+  updateDupesRemoveButton();
+}
+
+function setupDuplicateFinder() {
+  const tbBtn = document.getElementById('btn-find-dupes');
+  const szBtn = document.getElementById('btn-size-find-dupes');
+  const closeBtn = document.getElementById('btn-dupes-close');
+  const cancelBtn = document.getElementById('btn-dupes-cancel');
+  const removeBtn = document.getElementById('btn-dupes-remove');
+
+  if (tbBtn) tbBtn.addEventListener('click', openDuplicateFinder);
+  if (szBtn) szBtn.addEventListener('click', openDuplicateFinder);
+  if (closeBtn) closeBtn.addEventListener('click', closeDuplicateFinder);
+  if (cancelBtn) cancelBtn.addEventListener('click', closeDuplicateFinder);
+  if (removeBtn) {
+    removeBtn.addEventListener('click', () => {
+      const toRemove = Array.from(dupesSelectedIds);
+      if (!toRemove.length) return;
+      openConfirm(
+        `Remove ${toRemove.length} duplicate ${toRemove.length === 1 ? 'photo' : 'photos'}?`,
+        'The kept copies stay in your note. This can\u2019t be undone once the note is saved.',
+        () => {
+          for (const id of toRemove) removePhoto(id);
+          closeDuplicateFinder();
+          toast(`Removed ${toRemove.length} duplicate ${toRemove.length === 1 ? 'photo' : 'photos'}`);
+        },
+        'Remove duplicates'
+      );
+    });
+  }
 }
 
 /* ---------------------------------------------------------------------

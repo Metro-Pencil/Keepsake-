@@ -2487,6 +2487,28 @@
     }
   }
 
+  /* ---------- Duplicate photo finder modal ---------- */
+  .dupes-summary { margin: 0 0 12px; font-size: 0.875rem; color: var(--ink-soft); line-height: 1.45; }
+  .dupes-prog { margin: 8px 0 14px; }
+  .dupes-prog-label { font-size: 0.8125rem; font-weight: 500; color: var(--ink-soft); margin: 0 0 6px; font-variant-numeric: tabular-nums; }
+  .dupes-track { height: 6px; border-radius: 999px; background: var(--line); overflow: hidden; }
+  .dupes-fill { display: block; height: 100%; width: 100%; background: var(--pine); transform-origin: left; transform: scaleX(0); transition: transform 0.15s ease-out; }
+  .dupes-groups { display: grid; gap: 12px; margin-bottom: 14px; }
+  .dupes-group { border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--card-2); padding: 10px 12px; }
+  .dupes-group-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; font-size: 0.7812rem; }
+  .dupes-group-title { font-weight: 600; color: var(--ink); }
+  .dupes-badge { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 999px; font-size: 0.72rem; font-weight: 600; background: var(--card); border: 1px solid var(--line); color: var(--ink-soft); }
+  .dupes-badge[data-kind="exact"] { background: var(--amber-bg); color: var(--amber); border-color: #e6d3ae; }
+  .dupes-badge[data-kind="visual"] { background: var(--violet-bg); color: var(--violet); border-color: #d6ceea; }
+  .dupes-items { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 8px; }
+  .dupes-item { position: relative; display: flex; flex-direction: column; gap: 4px; padding: 6px; border-radius: 8px; background: var(--card); border: 1.5px solid var(--line); cursor: pointer; font-size: 0.72rem; color: var(--ink-soft); }
+  .dupes-item.is-selected { border-color: var(--brick); background: var(--danger-bg); }
+  .dupes-item img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 6px; display: block; background: var(--card-2); }
+  .dupes-item-meta { display: flex; align-items: center; justify-content: space-between; gap: 4px; font-variant-numeric: tabular-nums; }
+  .dupes-item-tag { font-weight: 600; color: var(--pine); }
+  .dupes-item.is-selected .dupes-item-tag { color: var(--brick); }
+  .dupes-item input[type="checkbox"] { position: absolute; top: 10px; right: 10px; width: 18px; height: 18px; accent-color: var(--brick); cursor: pointer; }
+  .size-dupes-btn { width: 100%; margin-bottom: 12px; }
 </style>
 </head>
 <body>
@@ -2496,7 +2518,7 @@
   <div class="top-inner">
     <div class="brand">
       <span class="brand-mark">Keepsake</span>
-      <span class="version-badge" id="version-badge">v1.16.4</span>
+      <span class="version-badge" id="version-badge">v1.16.5</span>
       <span class="sync-status hidden" id="sync-status" role="status" aria-live="polite"></span>
       <button class="storage-pill" id="storage-pill" type="button" data-zone="heavy" hidden>
         <span class="storage-pill-icon" id="storage-pill-icon" aria-hidden="true"></span>
@@ -2661,6 +2683,9 @@
     </button>
     <button class="icon-btn" id="btn-remove-lock" style="display:none;" title="Remove lock" aria-label="Remove lock">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-2.6"/></svg>
+    </button>
+    <button class="icon-btn" id="btn-find-dupes" style="display:none;" title="Find duplicate photos" aria-label="Find duplicate photos">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>
     </button>
     <button class="icon-btn" id="btn-download-note" style="display:none;" title="Download" aria-label="Download">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 4v11m0 0-4-4m4 4 4-4"/><path d="M4 18v1a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-1"/></svg>
@@ -2838,6 +2863,28 @@
   </div>
 </div>
 
+<!-- Duplicate photos finder & cleaner -->
+<div class="overlay hidden" id="overlay-dupes">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="dupes-heading">
+    <div class="modal-head">
+      <h2 id="dupes-heading">Duplicate photos</h2>
+      <button class="icon-btn" id="btn-dupes-close" type="button" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <div class="dupes-prog" id="dupes-prog" hidden>
+        <p class="dupes-prog-label" id="dupes-prog-label">Scanning photos…</p>
+        <div class="dupes-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="dupes-track"><span class="dupes-fill" id="dupes-fill"></span></div>
+      </div>
+      <p class="dupes-summary" id="dupes-summary"></p>
+      <div class="dupes-groups" id="dupes-groups"></div>
+      <div class="btn-row" id="dupes-actions">
+        <button type="button" class="btn btn-ghost" id="btn-dupes-cancel">Close</button>
+        <button type="button" class="btn btn-danger" id="btn-dupes-remove" hidden>Remove selected</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- This note's size against the limits -->
 <div class="overlay hidden" id="overlay-size">
   <div class="modal narrow" role="dialog" aria-modal="true" aria-labelledby="size-heading">
@@ -2853,6 +2900,7 @@
         <span class="meter-tick" style="left:66.7%"></span>
       </div>
       <ul class="size-rows" id="size-rows"></ul>
+      <button type="button" class="btn btn-ghost size-dupes-btn" id="btn-size-find-dupes" hidden>Find duplicate photos</button>
       <div class="size-advice" id="size-advice-box" data-zone="ok">
         <span class="size-advice-icon" id="size-advice-icon" aria-hidden="true"></span>
         <p id="size-advice"></p>

@@ -4,7 +4,7 @@
 // stuck on an old cached version forever. See the "Force refresh" button
 // in Settings for a manual way out of that if a deploy forgets to.
 const CACHE_PREFIX = 'keepsake-shell-';
-const CACHE_NAME = CACHE_PREFIX + 'v35';
+const CACHE_NAME = CACHE_PREFIX + 'v36';
 const CRITICAL_FILES = [
   './',
   './index.html',
