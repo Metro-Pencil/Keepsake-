@@ -6,6 +6,11 @@ All notable changes to this project are recorded here, following
 small — gets a version bump. If the version number hasn't moved,
 nothing changed; that's the whole point of keeping one.
 
+## v1.16.9 — 2026-11-27
+
+- **Fixed Backblaze B2 `501 NotImplemented` save failure.** Removed the `If-Match` conditional header on `PutObject` in `b2.js` (which Backblaze B2's S3 API rejects with *"A header you provided implies functionality that is not implemented"*), keeping immutable revisioned content/vault writes and adding a final pre-commit revision check right before updating `meta/{id}.json`.
+- Service worker cache v40.
+
 ## v1.16.8 — 2026-11-23
 
 - **Fixed critical video upload and app-update crashes.** Declared `compressFailed` in `attachVideoFiles()` with `try/finally` modal cleanup, fixed `SHELL_FILES` -> `FORCE_REFRESH_SHELL_FILES` in `applyAppUpdate()`, and scoped Service Worker/Cache Storage cleanup strictly to Keepsake so sibling apps on the same origin stay intact.

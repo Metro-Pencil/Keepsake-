@@ -832,23 +832,23 @@
       await verifyStored(newVaultKey, vaultBytes.length);
     }
 
-    const metaBytes = enc.encode(JSON.stringify(meta));
-    const metaOpts = existing && existingEtag && !body.forceOverwrite ? { ifMatch: existingEtag } : null;
-    try {
-      await putBytes(metaKey(id), metaBytes, await sha256Hex(metaBytes), null, metaOpts);
-    } catch (e) {
-      if (e && e.status === 412) {
+    // Backblaze B2's S3-compatible PutObject API does not implement If-Match / If-None-Match
+    // (returns 501 NotImplemented), so do a final pre-commit rev check right before flipping meta.
+    if (existing && !existing.corrupted && !body.forceOverwrite && typeof body.baseRev === 'number') {
+      const latestMeta = await readMeta(id).catch(() => null);
+      if (latestMeta && !latestMeta.corrupted && typeof latestMeta.rev === 'number' && latestMeta.rev > body.baseRev) {
         deleteObject(newContentKey).catch(() => {});
         if (newVaultKey) deleteObject(newVaultKey).catch(() => {});
-        const serverMeta = await readMeta(id).catch(() => existing);
         const err = new Error('This note was updated on another device since you opened it.');
         err.status = 409;
         err.conflict = true;
-        err.serverMeta = serverMeta || existing;
+        err.serverMeta = latestMeta;
         throw err;
       }
-      throw e;
     }
+
+    const metaBytes = enc.encode(JSON.stringify(meta));
+    await putBytes(metaKey(id), metaBytes, await sha256Hex(metaBytes), null);
     await verifyStored(metaKey(id), metaBytes.length);
 
     // Best-effort cleanup of superseded content/vault objects now that meta points to the new revision.
